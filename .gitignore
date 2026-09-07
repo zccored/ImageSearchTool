@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- ImageSearch 项目追加 ----
+perf_reports/
+*.pyc
