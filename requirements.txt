@@ -1,0 +1,12 @@
+# 核心（CPU 即可跑粗筛 + 二值法检索）
+numpy>=1.26
+opencv-python>=4.11.0.86
+Pillow>=10.0
+tqdm
+
+# ResNet 精排（可选，跑精排前安装）
+# CPU 版:     pip install torch torchvision
+# CUDA 版:    到 https://pytorch.org/get-started/locally/ 生成对应命令（如 cu121/cu124）
+
+# 大规模向量加速（可选；200 万张量级再考虑）
+# faiss-cpu
