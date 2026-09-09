@@ -45,6 +45,7 @@ class CoarseRecord:
     md5: str = ""
     hu: Optional[np.ndarray] = None          # (7,) 对数变换后的 Hu 矩
     fp: Optional[np.ndarray] = None          # (bytes,) 打包后的二值指纹
+    box: Optional[Tuple[float, float, float, float]] = None  # 瓦片框(x0,y0,x1,y1)，整图条目为 None
     ok: bool = True
     err: str = ""
 
@@ -140,6 +141,18 @@ def _fp_of_binary(binary: np.ndarray, cfg: Config) -> np.ndarray:
     return np.packbits(bits.astype(np.uint8))
 
 
+def _mapped(arr) -> bool:
+    """数组（或其视图的 base 链）是否来自 mmap。"""
+    a = arr
+    for _ in range(8):
+        if isinstance(a, np.memmap):
+            return True
+        a = getattr(a, "base", None)
+        if not isinstance(a, np.ndarray):
+            return False
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 索引集合：构建 / 追加 / 检索
 # ---------------------------------------------------------------------------
@@ -150,6 +163,10 @@ class CoarseIndex:
         self.cfg = cfg
         self.paths: List[str] = []
         self.md5s: List[str] = []
+        self.boxes: List[Optional[tuple]] = []   # 瓦片框；整图/旧索引条目为 None
+        # 从磁盘恢复的框矩阵（可 mmap）：不预先转成 Python 元组列表 ——
+        # 444k 行元组化要 ~0.4s 且常驻 ~100MB，改为按需解析（box_at）。
+        self._boxes_arr: Optional[np.ndarray] = None
         # hu 每维按库内均值/方差做 z-score，避免量纲差异主导距离
         self.hu_mean: np.ndarray = np.zeros(7, dtype=np.float32)
         self.hu_std: np.ndarray = np.ones(7, dtype=np.float32)
@@ -158,6 +175,10 @@ class CoarseIndex:
         self._hu: Optional[np.ndarray] = None      # (N,7)
         self._fp: Optional[np.ndarray] = None      # (N,bytes)
         self.n_bytes = (cfg.coarse_size * cfg.coarse_size + 7) // 8
+        # 增量去重缓存：避免每批 add 都 O(N) 重建集合（实测万级瓦片时
+        # 主线程每批耗时随库二次方增长，堵死流水线 → “后期性能下降”）
+        self._md5_set: set = set()
+        self._path_set: set = set()
 
     # -- 只读 ----------------------------------------------------------
     @property
@@ -191,8 +212,8 @@ class CoarseIndex:
         """
         if not paths:
             return 0
-        known_md5s = set(self.md5s)
-        existing = {os.path.normcase(os.path.abspath(x)) for x in self.paths}
+        known_md5s = self._md5_set
+        existing = self._path_set
         todo = [p for p in paths
                 if os.path.normcase(os.path.abspath(p)) not in existing]
         LOGGER.info("粗筛：扫描到 %d 张，待处理 %d 张", len(paths), len(todo))
@@ -224,6 +245,8 @@ class CoarseIndex:
                 known_md5s.add(rec.md5)
             self.paths.append(rec.path)
             self.md5s.append(rec.md5)
+            self._path_set.add(os.path.normcase(os.path.abspath(rec.path)))
+            self.boxes.append(rec.box)
             if rec.hu is not None:
                 self._hu_parts.append(rec.hu.reshape(1, 7))
             if rec.fp is not None:
@@ -231,8 +254,6 @@ class CoarseIndex:
             added += 1
             if progress:
                 progress(done, len(todo))
-        if added:
-            self.finalize()
         LOGGER.info("粗筛：新增 %d 张，库内总计 %d 张", added, self.size)
         return added
 
@@ -248,13 +269,16 @@ class CoarseIndex:
         """
         if not paths:
             return []
-        known_md5s = set(self.md5s)
-        existing = {os.path.normcase(os.path.abspath(x)) for x in self.paths}
+        known_md5s = self._md5_set
+        existing = self._path_set
         accepted: List[bool] = []
         added = 0
         for done, (p, rec) in enumerate(zip(paths, records), 1):
             ok = rec is not None
-            if ok and os.path.normcase(os.path.abspath(p)) in existing:
+            # 路径去重只对“整图条目”生效（每路径至多 1 条）；
+            # 瓦片条目同一原图有多块同路径，重复性由 md5(含框坐标)判定。
+            if ok and rec.box is None and \
+                    os.path.normcase(os.path.abspath(p)) in existing:
                 ok = False
             if ok and self.cfg.dedup and rec.md5 and rec.md5 in known_md5s:
                 ok = False
@@ -262,6 +286,8 @@ class CoarseIndex:
                 known_md5s.add(rec.md5)
                 self.paths.append(p)
                 self.md5s.append(rec.md5)
+                self._path_set.add(os.path.normcase(os.path.abspath(p)))
+                self.boxes.append(rec.box)
                 if rec.hu is not None:
                     self._hu_parts.append(rec.hu.reshape(1, 7))
                 if rec.fp is not None:
@@ -272,8 +298,6 @@ class CoarseIndex:
             accepted.append(ok)
             if progress:
                 progress(done, len(paths))
-        if added:
-            self.finalize()
         return accepted
 
     def finalize(self) -> None:
@@ -300,15 +324,60 @@ class CoarseIndex:
     # -- 从磁盘恢复 / 导出 ----------------------------------------------
     def load_state(self, paths: List[str], md5s: List[str],
                    hu: Optional[np.ndarray], fp: Optional[np.ndarray],
-                   hu_mean: np.ndarray, hu_std: np.ndarray) -> None:
+                   hu_mean: np.ndarray, hu_std: np.ndarray,
+                   boxes: Optional[np.ndarray] = None) -> None:
         self.paths = list(paths)
         self.md5s = list(md5s)
+        self.boxes = []
+        self._boxes_arr = None
+        if boxes is not None and len(boxes) == len(paths):
+            if isinstance(boxes, np.ndarray):
+                # 懒解析：保留数组（可能是 mmap），用 box_at() 取单个框
+                self._boxes_arr = np.asarray(boxes, dtype=np.float32)
+            else:
+                self.boxes = [tuple(float(v) for v in b) for b in boxes]
         self._hu = hu
         self._fp = fp
         self.hu_mean = hu_mean
         self.hu_std = hu_std
+        self._md5_set = set(m for m in self.md5s if m)
+        self._path_set = {os.path.normcase(os.path.abspath(x))
+                          for x in self.paths}
+        self._hu_parts = []
+        self._fp_parts = []
+
+    # -- 瓦片框（数组懒解析 / 列表增量混合）-----------------------------
+    def _boxes_n(self) -> int:
+        return len(self._boxes_arr) if self._boxes_arr is not None else 0
+
+    def has_boxes(self) -> bool:
+        """是否存在瓦片框（整图索引为 False）。"""
+        return self._boxes_arr is not None or any(
+            b is not None for b in self.boxes)
+
+    def box_at(self, i: int) -> Optional[tuple]:
+        n = self._boxes_n()
+        if i < n:
+            return tuple(float(v) for v in self._boxes_arr[i])
+        j = i - n
+        if 0 <= j < len(self.boxes):
+            return self.boxes[j]
+        return None
+
+    def detach_memmaps(self) -> None:
+        """把 mmap 恢复态转为内存数组。
+
+        Windows 下被映射的文件无法被替换/删除，落盘（save_coarse）前必须
+        先解除映射，否则增量写盘会 PermissionError。
+        注意：np.asarray(memmap) 得到的是“视图”而不是 memmap 实例，但视图
+        的 .base 链仍持有映射 —— 必须顺着 base 链判断。"""
+        for name in ("_hu", "_fp", "_boxes_arr"):
+            arr = getattr(self, name)
+            if _mapped(arr):
+                setattr(self, name, np.array(arr))
 
     def export_state(self) -> dict:
+        self.detach_memmaps()          # 落盘前解除映射（见上）
         self.ensure_finalized()
         n = len(self.paths)
         if self._hu is not None and self._hu.shape[0] != n:
@@ -317,10 +386,23 @@ class CoarseIndex:
         if self._fp is not None and self._fp.shape[0] != n:
             raise RuntimeError(
                 f"内部状态不一致：paths={n} vs 指纹矩阵={self._fp.shape[0]} 行")
+        boxes = None
+        if not self.boxes:                  # 纯加载态：直接复用数组
+            if self._boxes_arr is not None:
+                boxes = np.asarray(self._boxes_arr, dtype=np.float32)
+        elif self._boxes_arr is None:
+            if any(b is not None for b in self.boxes):
+                boxes = np.asarray([(b if b is not None else (0, 0, 0, 0))
+                                    for b in self.boxes], dtype=np.float32)
+        else:                               # 加载后又增量追加：合并
+            rows = [self.box_at(i) or (0.0, 0.0, 0.0, 0.0)
+                    for i in range(n)]
+            boxes = np.asarray(rows, dtype=np.float32)
         return {
             "paths": self.paths, "md5s": self.md5s,
             "hu": self._hu, "fp": self._fp,
             "hu_mean": self.hu_mean, "hu_std": self.hu_std,
+            "boxes": boxes,
         }
 
     # -- 并行 ----------------------------------------------------------

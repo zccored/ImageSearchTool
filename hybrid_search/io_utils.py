@@ -34,9 +34,33 @@ LOGGER = logging.getLogger("hybrid_search")
 # 像素（RGB 全解码约 1GB，属可承受峰值）；再大视为异常文件跳过。
 Image.MAX_IMAGE_PIXELS = 256 * 1024 * 1024
 warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
-# 巨型图解码并发钳制：同一时刻最多 2 张“大图”在解码，避免 8 线程叠加爆内存
+# 巨型图解码并发钳制：阈值 12MP 之上的大图同时解码数上限（默认 16）。
+# 经验值：>12MP 图片 RGB 峰值 ~36MB/张、34MP ~100MB/张；
+# 14 物理核/20 线程、16GB 内存机（建库时可用 ≥5GB）取 16~20。
+# 运行期可经 set_big_decode_limit() 调整（GUI/CLI 的“大图解码并发”参数）。
 _BIG_IMAGE_PX = 12_000_000          # 约 3500×3500
-_BIG_DECODE_LOCK = threading.Semaphore(2)
+_big_decode_limit = [16]
+_big_decode_active = [0]
+_big_decode_cond = threading.Condition()
+
+
+def set_big_decode_limit(n: int) -> None:
+    """动态调整大图解码并发上限（引擎按 Config.big_decode_conc 调用）。"""
+    with _big_decode_cond:
+        _big_decode_limit[0] = max(1, int(n))
+
+
+def _big_decode_enter() -> None:
+    with _big_decode_cond:
+        while _big_decode_active[0] >= _big_decode_limit[0]:
+            _big_decode_cond.wait()
+        _big_decode_active[0] += 1
+
+
+def _big_decode_exit() -> None:
+    with _big_decode_cond:
+        _big_decode_active[0] -= 1
+        _big_decode_cond.notify()
 # 顺带把 OpenCV 自家日志提到 ERROR 级，压掉残余的 C 层杂音
 try:
     cv2.setLogLevel(0)  # cv2.logging.LOG_LEVEL_ERROR
@@ -203,8 +227,11 @@ def _decode_png(data: bytes, gray: bool,
     """
     w, h = probe[1]
     if w * h > _BIG_IMAGE_PX:
-        with _BIG_DECODE_LOCK:
+        _big_decode_enter()
+        try:
             return _pil_decoded(data, gray)
+        finally:
+            _big_decode_exit()
     return _pil_decoded(data, gray)
 
 
@@ -260,8 +287,11 @@ def _decode_png_cv2(data: bytes, gray: bool,
     flag = cv2.IMREAD_GRAYSCALE if gray else cv2.IMREAD_COLOR
     try:
         if w * h > _BIG_IMAGE_PX:
-            with _BIG_DECODE_LOCK:
+            _big_decode_enter()
+            try:
                 arr = cv2.imdecode(np.frombuffer(data, np.uint8), flag)
+            finally:
+                _big_decode_exit()
         else:
             arr = cv2.imdecode(np.frombuffer(data, np.uint8), flag)
     except Exception:                    # noqa: BLE001 —— 解码异常走 Pillow 兜底

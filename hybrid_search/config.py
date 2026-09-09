@@ -73,6 +73,19 @@ class Config:
     # PNG 解码器："cv2"（默认，libpng 全尺寸，比 Pillow 快 ~1.3x；
     # 个别坏 iCCP 文件会有零星 stderr 警告）/ "pillow"（安静、较慢）
     png_decoder: str = "cv2"
+    # 大图(>12MP)解码并发上限：这类图 RGB 峰值 36MB~100MB+/张，
+    # 过高并发会推高内存(页回收反而降速)。14 物理核/16GB 内存机建议 16~20
+    big_decode_conc: int = 16
+    # 瓦片(局部)建库：第一级“同时解码的原图数”上限(大图还受上面并发门约束)
+    tile_decode_slots: int = 18
+    # 瓦片(局部)建库：瓦片不足一批时的最长等待毫秒(批发送间隔)。
+    # 越小 GPU 批越碎(1-2 行小批唤醒多)，越大批越整但延迟略高
+    tile_flush_ms: int = 20
+    # 索引存储格式：False=npz（旧，读取时整体解压进内存）；
+    # True=侧车 .npy（可 mmap 懒加载：444k 瓦片库实测加载 3.6s-><1s、
+    # 常驻内存 1.3GB->约 0.3GB）。仅影响“新建/重建”索引的写盘格式，
+    # 已有索引可用 compact 命令就地转换。
+    fast_load: bool = False
     # torch 推理线程数（0=保持 torch 默认；CPU 单线程前向通常最优，
     # GPU 场景该值无影响，由 CUDA 流自动调度）
     torch_threads: int = 0

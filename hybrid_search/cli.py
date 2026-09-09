@@ -23,7 +23,7 @@ import time
 from typing import List, Optional
 
 from .config import Config
-from .engine import HybridEngine, Outcome
+from .engine import Hit, HybridEngine, Outcome
 from .io_utils import LOGGER, setup_logging
 from .visuals import save_contact_sheet
 
@@ -73,6 +73,16 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--png-decoder", choices=["cv2", "pillow"], default="cv2",
                     help="PNG 解码器：cv2=libpng 全尺寸(快~1.3x；坏 iCCP 文件"
                          "零星 stderr 警告)；pillow=安静较慢")
+    sp.add_argument("--big-decode-conc", type=int, default=16,
+                    help="大图(>12MP)解码并发上限（受内存约束，14核/16GB 建议 "
+                         "16~20；1=串行）")
+    sp.add_argument("--tile-decode-slots", type=int, default=18,
+                    help="瓦片建库同时解码的原图数上限（配合上面并发门）")
+    sp.add_argument("--tile-flush-ms", type=int, default=20,
+                    help="瓦片建库 GPU 批最长等待毫秒（小=批碎，大=批整）")
+    sp.add_argument("--fast-load", action="store_true",
+                    help="新索引用侧车 .npy 存储（可 mmap：加载更快、常驻内存"
+                         "更省；已有索引可用 compact 就地转换）")
     sp.add_argument("--ext", action="append", default=None,
                     help="额外支持的图片扩展名（可多次，如 .gif）")
     sp.add_argument("--coarse-k", type=int, default=300,
@@ -102,6 +112,11 @@ def _apply_feature_args(cfg: Config, a: argparse.Namespace) -> None:
     cfg.decode_workers = int(_val(a, "decode_workers", cfg.decode_workers))
     cfg.torch_threads = int(_val(a, "torch_threads", cfg.torch_threads))
     cfg.png_decoder = _val(a, "png_decoder", cfg.png_decoder)
+    cfg.big_decode_conc = int(_val(a, "big_decode_conc", cfg.big_decode_conc))
+    cfg.tile_decode_slots = int(_val(a, "tile_decode_slots",
+                                     cfg.tile_decode_slots))
+    cfg.tile_flush_ms = int(_val(a, "tile_flush_ms", cfg.tile_flush_ms))
+    cfg.fast_load = bool(_flag(a, "fast_load", cfg.fast_load))
     cfg.coarse_k = int(_val(a, "coarse_k", cfg.coarse_k))
     cfg.exclude_self = not _flag(a, "no_exclude_self")
     ext = _val(a, "ext")
@@ -169,22 +184,133 @@ def cmd_build_fine(cfg: Config, a: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# build-tiles / add-tiles：瓦片（局部）索引
+# ---------------------------------------------------------------------------
+def cmd_build_tiles(cfg: Config, a: argparse.Namespace) -> int:
+    from .tile_index import build_tiles
+
+    eng = HybridEngine(cfg)
+    p = _mk_progress(a, 1)
+    prog = (lambda d, t: p(d, t, "tiles")) if p else None
+    try:
+        from .io_utils import collect_images
+        paths = collect_images(os.path.abspath(a.img_dir), cfg.extensions,
+                               limit=_val(a, "limit", None))
+        n = build_tiles(eng, os.path.abspath(a.prefix), paths=paths,
+                        force=a.force, progress=prog,
+                        tile=int(_val(a, "tile", 512)),
+                        overlap=float(_val(a, "overlap", 0.25)),
+                        min_side=int(_val(a, "min_side", 768)))
+    except FileExistsError as e:
+        LOGGER.error("%s", e)
+        if p:
+            p.finish()
+        return 2
+    finally:
+        if p:
+            p.finish()
+    LOGGER.info("build-tiles 完成：%d 个瓦片 -> %s.*", n, a.prefix)
+    return 0
+
+
+def cmd_add_tiles(cfg: Config, a: argparse.Namespace) -> int:
+    from .tile_index import add_tiles
+
+    eng = HybridEngine(cfg)
+    p = _mk_progress(a, 1)
+    prog = (lambda d, t: p(d, t, "tiles")) if p else None
+    try:
+        prefix = os.path.abspath(a.prefix)
+        eng.open(prefix)
+        n = add_tiles(eng, prefix, img_dir=os.path.abspath(a.img_dir),
+                      progress=prog)
+    finally:
+        if p:
+            p.finish()
+    LOGGER.info("add-tiles 完成：+%d 个瓦片 -> %s.*", n, a.prefix)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # search
 # ---------------------------------------------------------------------------
 def cmd_search(cfg: Config, a: argparse.Namespace) -> int:
     if not os.path.exists(a.query):
         LOGGER.error("查询图不存在: %s", a.query)
         return 2
-    eng = HybridEngine(cfg)
-    eng.open(a.prefix)
-    out = eng.search(a.query, coarse_k=a.coarse_k, top_k=a.top_k)
-    _print_outcome(out)
-    if out.hits:
-        if a.save:
-            save_contact_sheet([h.path for h in out.hits], a.save)
+    mode = _val(a, "mode", "full")
+    if mode == "full":
+        eng = HybridEngine(cfg)
+        eng.open(a.prefix)
+        out = eng.search(a.query, coarse_k=a.coarse_k, top_k=a.top_k)
+        _print_outcome(out)
+        _dump_json(out, a.json) if a.json else None
+        return 0
+    tiles_prefix = os.path.abspath(_val(a, "tiles_prefix", "./gallery_tiles"))
+    cand = _val(a, "cand", "lsh")
+    if mode == "tiles":
+        eng = HybridEngine(cfg)
+        eng.open(tiles_prefix)
+        out = _search_tiles_mode(eng, a, tiles_prefix)
+        _print_tiles_outcome(out, cand)
+    else:  # hybrid：全图 + 瓦片两套检索，按原图去重取最高分
+        from .tile_index import merge_hybrid
+
+        eng_full = HybridEngine(cfg)
+        eng_full.open(a.prefix)
+        eng_t = HybridEngine(cfg)
+        eng_t.open(tiles_prefix)
+        out_full = eng_full.search(a.query, coarse_k=a.coarse_k,
+                                   top_k=a.top_k)
+        out_t = _search_tiles_mode(eng_t, a, tiles_prefix)
+        out = merge_hybrid(out_full, out_t, a.query, top_k=a.top_k)
+        _print_outcome(out)
+        for h in out.hits:
+            tag = "局部命中" if h.match_kind == "tile" else (
+                "双命中" if h.match_kind == "both" else "整图命中")
+            box = "" if h.box is None else \
+                f" 框=({int(h.box[0])},{int(h.box[1])})-({int(h.box[2])},{int(h.box[3])})"
+            print(f"    [{tag}]{box}")
+    if a.save and out.hits:
+        save_contact_sheet([h.path for h in out.hits], a.save)
     if a.json:
         _dump_json(out, a.json)
     return 0
+
+
+def _search_tiles_mode(eng, a: argparse.Namespace, tiles_prefix: str) -> Outcome:
+    """在瓦片索引上检索（tiles 模式 / hybrid 的一路）：
+    查询图自动按瓦片协议切块(大局部图可命中原图)，小图回退单块。"""
+    from .tile_index import search_tiles_tiled
+
+    return search_tiles_tiled(
+        eng, a.query, top_k=a.top_k, coarse_k=a.coarse_k,
+        method=_val(a, "cand", "lsh"),
+        lsh_bits=int(_val(a, "lsh_bits", 12)),
+        lsh_tables=int(_val(a, "lsh_tables", 8)))
+
+
+def _print_tiles_outcome(out: Outcome, cand: str) -> None:
+    print(f"\n查询图: {out.query}")
+    print(f"瓦片库规模: {out.db_size} 块 | 复核候选: {out.coarse_kept} 块"
+          + ("（已剔除查询图自身）" if out.self_excluded else ""))
+    parts = []
+    for k, v in out.times.items():
+        if k != "total":
+            parts.append(f"{k} {v * 1000:.1f} ms")
+    print("耗时: " + " | ".join(parts) + f" | 合计 {out.times.get('total', 0) * 1000:.1f} ms"
+          if parts else f"耗时: 合计 {out.times.get('total', 0) * 1000:.1f} ms")
+    if not out.hits:
+        print("（无结果）")
+        return
+    print(f"{'#':>3} {'ResNet相似度':>12} {'候选法':>6}  原图文件           命中框")
+    for h in out.hits:
+        fine = "        n/a" if h.fine_score != h.fine_score \
+            else f"{h.fine_score:12.4f}"
+        box = "" if h.box is None else \
+            f"({int(h.box[0])},{int(h.box[1])})-({int(h.box[2])},{int(h.box[3])})"
+        print(f"{h.rank:>3} {fine} {cand:>6}  {os.path.basename(h.path):<24} {box}"
+              f"   {h.path}")
 
 
 def _print_outcome(out: Outcome) -> None:
@@ -218,7 +344,9 @@ def _dump_json(out: Outcome, path: str) -> None:
         "times": {k: round(v, 4) for k, v in out.times.items()},
         "results": [
             {"rank": h.rank, "path": h.path, "fine_score": h.fine_score,
-             "coarse_score": h.coarse_score, "d_hu": h.d_hu, "d_fp": h.d_fp}
+             "coarse_score": h.coarse_score, "d_hu": h.d_hu, "d_fp": h.d_fp,
+             "box": list(h.box) if h.box is not None else None,
+             "match_kind": h.match_kind}
             for h in out.hits
         ],
     }
@@ -393,6 +521,25 @@ def cmd_stats(cfg: Config, a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_compact(cfg: Config, a: argparse.Namespace) -> int:
+    """旧 npz 索引 -> 侧车 .npy（可 mmap）快载格式。"""
+    from .store import compact
+
+    def prog(done, total, phase):
+        print(f"  [{done}/{total}] {phase}", flush=True)
+
+    r = compact(a.prefix, delete_legacy=bool(a.delete_legacy), progress=prog)
+    if r.get("already"):
+        print(f"已是侧车格式，无需转换：{r['prefix']}.*（{r['n']} 行）")
+        return 0
+    freed = (f"，已删除旧 npz {r['deleted_bytes'] / 2**20:.0f} MB"
+             if r.get("deleted_bytes") else "（旧 npz 保留，可手动删除）")
+    print(f"转换完成：{r['prefix']}.* {r['n']} 行"
+          f"{'（含精排 ' + str(r['fine_rows']) + ' 行）' if r['has_fine'] else ''}"
+          f"，耗时 {r['sec']:.1f}s{freed}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # ingest：跨进程交接（img_server 按钮 → request JSON → 增量建库）
 # ---------------------------------------------------------------------------
@@ -462,6 +609,33 @@ def build_parser() -> argparse.ArgumentParser:
     _add_feature_args(sp)
     sp.set_defaults(func=cmd_build_fine)
 
+    # ---- build-tiles（瓦片局部索引）
+    sp = sub.add_parser("build-tiles",
+                        help="从零构建瓦片(局部)索引：大图按 512px+25%% 重叠切块"
+                             "（小图整块入库）")
+    sp.add_argument("img_dir", help="图库目录（递归扫描）")
+    sp.add_argument("--prefix", default="./gallery_tiles",
+                    help="瓦片索引前缀（建议 <图库根>/.gallery_index/gallery_tiles）")
+    _add_feature_args(sp)
+    sp.add_argument("--tile", type=int, default=512, help="瓦片边长")
+    sp.add_argument("--overlap", type=float, default=0.25,
+                    help="相邻瓦片重叠比例")
+    sp.add_argument("--min-side", type=int, default=768,
+                    help="较短边低于该值的图不切块（整图 1 块）")
+    sp.add_argument("--force", action="store_true",
+                    help="索引已存在时覆盖重建")
+    sp.add_argument("--limit", type=int, default=None, help="只处理前 N 张")
+    sp.set_defaults(func=cmd_build_tiles)
+
+    # ---- add-tiles（瓦片索引增量）
+    sp = sub.add_parser("add-tiles", help="瓦片(局部)索引增量入库（参数从 meta 恢复）")
+    sp.add_argument("img_dir", help="新增图片目录")
+    sp.add_argument("--prefix", default="./gallery_tiles",
+                    help="瓦片索引前缀")
+    _add_feature_args(sp)
+    sp.add_argument("--limit", type=int, default=None)
+    sp.set_defaults(func=cmd_add_tiles)
+
     # ---- search
     sp = sub.add_parser("search", help="以图搜图")
     _add_prefix(sp)
@@ -470,6 +644,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--top-k", type=int, default=10, help="返回结果数")
     sp.add_argument("--save", default=None, help="把 Top-K 总览图存为 PNG")
     sp.add_argument("--json", default=None, help="把结果存为 JSON")
+    sp.add_argument("--mode", choices=["full", "tiles", "hybrid"],
+                    default="full",
+                    help="full=整图索引；tiles=局部(瓦片)索引；hybrid=两者并搜"
+                         "（按原图去重取最高分）")
+    sp.add_argument("--tiles-prefix", default="./gallery_tiles",
+                    help="瓦片索引前缀（--mode tiles/hybrid 时使用）")
+    sp.add_argument("--cand", choices=["lsh", "coarse"], default="lsh",
+                    help="tiles 候选获取：lsh=多表 LSH 近似(默认)；"
+                         "coarse=全库指纹线性扫描对照")
+    sp.add_argument("--lsh-bits", type=int, default=12, help="LSH 桶位数")
+    sp.add_argument("--lsh-tables", type=int, default=8, help="LSH 表数")
     sp.set_defaults(func=cmd_search)
 
     # ---- eval
@@ -502,6 +687,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("stats", help="索引统计")
     _add_prefix(sp)
     sp.set_defaults(func=cmd_stats)
+
+    # ---- compact（旧 npz -> 侧车 .npy 快载格式）
+    sp = sub.add_parser(
+        "compact", help="把旧 npz 索引转成侧车 .npy 快载格式（可 mmap）")
+    _add_prefix(sp)
+    sp.add_argument("--delete-legacy", action="store_true",
+                    help="转换成功后删除旧 .npz（默认保留，可回退）")
+    sp.set_defaults(func=cmd_compact)
     return p
 
 

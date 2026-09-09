@@ -48,6 +48,8 @@ class Hit:
     coarse_score: float             # 粗筛综合分（1 - 融合距离，越大越相似）
     d_hu: float                     # 原始 Hu 标准化距离
     d_fp: float                     # 原始二值指纹汉明比例
+    box: Optional[Tuple[float, float, float, float]] = None  # 瓦片命中框(原图像素)，整图命中为 None
+    match_kind: str = "full"        # full / tile（命中类型，混合检索展示用）
 
 
 @dataclass
@@ -59,6 +61,7 @@ class Outcome:
     coarse_only: bool = False
     self_excluded: bool = False
     times: dict = field(default_factory=dict)   # 各阶段耗时（秒）
+    method: str = "full"            # full / tiles / hybrid（检索模式）
 
 
 # ---------------------------------------------------------------------------
@@ -69,11 +72,16 @@ class HybridEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         # 让解码层跟随配置的 PNG 解码器（cv2 全尺寸 / pillow）
-        from .io_utils import set_png_decoder
+        from .io_utils import set_png_decoder, set_big_decode_limit
         set_png_decoder(getattr(cfg, "png_decoder", "cv2"))
+        set_big_decode_limit(getattr(cfg, "big_decode_conc", 16))
         self.coarse = CoarseIndex(cfg)
         self.prefix: Optional[str] = None
         self.meta: dict = {}
+        # 存储格式：npz（旧，整体读入）或 sidecar（可 mmap 的 .npy，快且省内存）。
+        # 新建索引用 cfg.fast_load 决定；已有索引以 meta 标记为准（open 时覆盖）。
+        self._storage: str = ("sidecar" if getattr(cfg, "fast_load", False)
+                              else "npz")
         # 精排索引（懒加载 mmap）
         self._fine_feats = None          # (N,D) ndarray / memmap（L2 归一化）
         self._fine_npz = None
@@ -124,7 +132,8 @@ class HybridEngine:
             if ok != self.coarse.paths:
                 raise RuntimeError(
                     "融合建库内部顺序不一致（粗筛与精排结果集错位），请联系排查")
-            files.save_fine(self.coarse.paths, feats)
+            files.save_fine(self.coarse.paths, feats,
+                            sidecar=self._storage == "sidecar")
             self._keep_fine(feats)
             has_fine = True
             feat_dim = feats.shape[1]
@@ -180,8 +189,10 @@ class HybridEngine:
             if old_has_fine:
                 new_feats = np.concatenate(
                     [np.asarray(self._fine_feats), new_feats], axis=0)
+            self.release_fine()            # 解除旧 mmap（Windows 无法替换被映射文件）
             self._keep_fine(new_feats)
-            IndexFiles(prefix).save_fine(self.coarse.paths, new_feats)
+            IndexFiles(prefix).save_fine(self.coarse.paths, new_feats,
+                                         sidecar=self._storage == "sidecar")
             self._save_all(IndexFiles(prefix), has_fine=True,
                            feature_dim=new_feats.shape[1])
         else:
@@ -320,10 +331,14 @@ class HybridEngine:
         if limit is not None:
             # 只允许在“全量重建”语义下使用 limit（写回仍按全库顺序，只重建子集需谨慎）
             raise RuntimeError("build-fine 暂不支持 --limit（会破坏顺序一致性）")
-        IndexFiles(prefix).save_fine(self.coarse.paths, feats)
+        # 释放旧 fine 的 mmap（Windows 下被映射的 .npy 无法被替换）
+        self.release_fine()
+        IndexFiles(prefix).save_fine(self.coarse.paths, feats,
+                                     sidecar=self._storage == "sidecar")
         self._keep_fine(feats)
         meta = self.meta
         meta["fine"] = {"exists": True, "feature_dim": feats.shape[1]}
+        meta["storage"] = self._storage
         IndexFiles(prefix).save_meta(meta)
         LOGGER.info("精排索引已保存：%d 张 × %d 维 -> %s",
                     feats.shape[0], feats.shape[1],
@@ -357,13 +372,27 @@ class HybridEngine:
         self._fine_feats = feats
         self._fine_npz = None
 
+    def release_fine(self) -> None:
+        """解除精排特征的 mmap 引用（含 LSH 表缓存里的引用）。
+
+        Windows 下被映射的 .npy 无法被替换/删除，落盘前必须调用；
+        粗筛侧由 CoarseIndex.detach_memmaps() 负责。"""
+        self._fine_feats = None
+        self._fine_npz = None
+        cache = getattr(self, "_lsh_cache", None)
+        if cache:
+            cache.clear()
+
     def _save_all(self, files: IndexFiles, has_fine: bool,
                   feature_dim: Optional[int] = None) -> None:
         st = self.coarse.export_state()
+        side = self._storage == "sidecar"
         files.save_coarse(st["paths"], st["md5s"], st["hu"], st["fp"],
-                          st["hu_mean"], st["hu_std"])
+                          st["hu_mean"], st["hu_std"], boxes=st.get("boxes"),
+                          sidecar=side)
         meta = meta_of(self.cfg, self.coarse.size,
-                       os.path.dirname(files.coarse_path), has_fine, feature_dim)
+                       os.path.dirname(files.coarse_path), has_fine, feature_dim,
+                       storage=self._storage)
         files.save_meta(meta)
         fine_txt = (f"，精排 {human_bytes(files.fine_size())}"
                     if has_fine and files.fine_exists() else "")
@@ -380,8 +409,10 @@ class HybridEngine:
         self.prefix = prefix
         self.meta = files.load_meta()
         self._check_cfg_compat(self.meta.get("cfg", {}))
+        # 存储格式以索引自身标记为准（旧 npz 索引照常可读）
+        self._storage = files.storage_of(self.meta)
 
-        st = files.load_coarse()
+        st = files.load_coarse(sidecar=self._storage == "sidecar")
         n_paths = len(st["paths"])
         if (st["hu"] is not None and st["hu"].shape[0] != n_paths) or \
                 (st["fp"] is not None and st["fp"].shape[0] != n_paths):
@@ -389,14 +420,15 @@ class HybridEngine:
                 "粗筛索引文件损坏或来自旧版本（路径与特征行数不一致）；"
                 "请重新 build")
         self.coarse.load_state(st["paths"], st["md5s"], st["hu"], st["fp"],
-                               st["hu_mean"], st["hu_std"])
+                               st["hu_mean"], st["hu_std"],
+                               boxes=st.get("boxes"))
         self._fine_feats = None
         self._fine_npz = None
-        if files.fine_exists():
-            self._fine_npz = np.load(files.fine_path, allow_pickle=True,
-                                     mmap_mode="r")
-            feats = self._fine_npz["features"]
-            fine_paths = list(self._fine_npz["paths"])
+        if files.fine_exists(sidecar=self._storage == "sidecar"):
+            fine = files.load_fine(mmap=True,
+                                   sidecar=self._storage == "sidecar")
+            feats = fine["features"]
+            fine_paths = list(fine["paths"])
             if fine_paths != self.coarse.paths:
                 raise RuntimeError(
                     "粗筛与精排索引路径不一致（历史损坏/被手动改动？），"
@@ -404,7 +436,8 @@ class HybridEngine:
             if fine_paths and feats.shape[0] == 0:
                 raise RuntimeError("精排索引为空文件，请执行 build-fine 重建")
             self._fine_feats = feats
-        LOGGER.info("索引已加载：%d 张 <- %s.*", self.coarse.size, prefix)
+        LOGGER.info("索引已加载：%d 张 <- %s.*（存储 %s）",
+                    self.coarse.size, prefix, self._storage)
 
     def _check_cfg_compat(self, stored: dict) -> None:
         """

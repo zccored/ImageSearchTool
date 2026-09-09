@@ -1,4 +1,4 @@
-# Byte-compiled / optimized / DLL files
+﻿# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
@@ -220,3 +220,4 @@ __marimo__/
 # ---- ImageSearch 项目追加 ----
 perf_reports/
 *.pyc
+.gallery_index/

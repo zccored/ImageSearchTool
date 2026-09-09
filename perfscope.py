@@ -28,12 +28,15 @@ import io as _io
 import json
 import os
 import random
+import shutil
 import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
+
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -252,6 +255,12 @@ class HardwareSampler:
         self._img_per_s = img_per_s or (lambda: 0.0)
         self.rows: List[dict] = []
         self._stop = threading.Event()
+        self._io0 = None            # (读字节, 写字节) 基准
+        self._last_io_t = time.time()
+        try:
+            self._io0 = self.proc.io_counters()
+        except Exception:            # noqa: BLE001
+            self._io0 = None
 
         self._nv = None
         self._handle = None
@@ -306,6 +315,26 @@ class HardwareSampler:
                 except Exception:           # noqa: BLE001
                     row["gpu"] = None
             row["imgps"] = self._img_per_s()
+            # 进程内存（RSS）：用于判断“任务结束后是否回落/是否存在泄漏”
+            try:
+                mi = self.proc.memory_info()
+                row["rssMB"] = mi.rss / 2 ** 20
+                row["peakMB"] = getattr(mi, "peak_wset", 0) / 2 ** 20
+            except Exception:       # noqa: BLE001
+                row["rssMB"] = row["peakMB"] = None
+            # 进程级磁盘读写速率（验证“IO 等待”假说：SSD 上应远高于瓶颈值）
+            try:
+                io = self.proc.io_counters()
+                if self._io0 is not None:
+                    dt = max(now - self._last_io_t, 1e-6)
+                    row["rdMBps"] = (io.read_bytes - self._io0[0]) / 2 ** 20 / dt
+                    row["wrMBps"] = (io.write_bytes - self._io0[1]) / 2 ** 20 / dt
+                    self._io0 = (io.read_bytes, io.write_bytes)
+                    self._last_io_t = now
+                else:
+                    self._last_io_t = now
+            except Exception:       # noqa: BLE001
+                row["rdMBps"] = row["wrMBps"] = None
             self.rows.append(row)
 
 
@@ -355,6 +384,224 @@ def run_fused_bench(samples: List[dict], max_imgs: int = 60):
 
 
 # ---------------------------------------------------------------------------
+# 瓦片（局部）索引性能档：合成图集 建库+检索 全链路硬件画像
+# ---------------------------------------------------------------------------
+def _make_tiles_dataset(work: str, n_big: int, n_small: int,
+                        big_w: int = 1600, big_h: int = 1000, seed: int = 7):
+    """生成可区分内容的大图/小图，返回 (big_paths, small_paths, origins)。
+    每张大图内容 = 纯色底 + 若干几何 + 大字编号，保证瓦片可判别。"""
+    import cv2
+    os.makedirs(os.path.join(work, "db", "big"), exist_ok=True)
+    os.makedirs(os.path.join(work, "db", "small"), exist_ok=True)
+    rng = np.random.RandomState(seed)
+    big_paths, small_paths, big_anchors = [], [], []
+
+    def enc(path, img):
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        assert ok
+        with open(path, "wb") as f:
+            f.write(buf.tobytes())
+
+    for i in range(n_big):
+        import colorsys
+        # 24° 色相步长(15 档一轮)；同色相轮次用左右分区避免同构混淆。
+        # 背景用中高饱和/亮度：24° 色相在 RGB 上有 ~60/255 差异，保证可判别。
+        round_no = i // 15
+        hue = ((i % 15) * 24.0) % 360.0
+        bg = colorsys.hsv_to_rgb(hue / 360.0, 0.72, 0.55)
+        bg = tuple(int(v * 255) for v in bg)
+        fg = colorsys.hsv_to_rgb(((hue + 150.0) % 360.0) / 360.0, 0.95, 0.97)
+        fg = tuple(int(v * 255) for v in fg)
+        img = np.zeros((big_h, big_w, 3), dtype=np.uint8)
+        img[:] = bg
+        anchor = None
+        zone = (round_no % 4) * 360           # 同色相轮次分 4 个横向区域
+        for k in range(4 + i % 3):
+            if k == 0:
+                cx = int(rng.randint(120, 260)) + zone
+                cy = int(rng.randint(200, 500))
+            else:
+                cx, cy = rng.randint(150, big_w - 150), rng.randint(150, big_h - 150)
+            cv2.circle(img, (cx, cy),
+                       int(rng.randint(200, 300)) if k == 0
+                       else int(rng.randint(90, 240)), fg, -1)
+            cv2.rectangle(img, (cx - 70, cy + 60), (cx + 70, cy + 150),
+                          (12, 12, 12), -1)
+            if k == 0:
+                anchor = (cx, cy)
+                # 锚点圆内画超大唯一编号：为裁切查询提供强判别细节
+                cv2.putText(img, f"{i:03d}", (cx - 150, cy + 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 3.6, (255, 255, 255), 14)
+                cv2.putText(img, f"{i:03d}", (cx - 150, cy + 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 3.6, (10, 10, 10), 3)
+        cv2.putText(img, f"B{i:03d}", (40, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.6, (255, 255, 255), 8)
+        p = os.path.join(work, "db", "big", f"b{i:03d}.jpg")
+        enc(p, img)
+        big_paths.append(p)
+        big_anchors.append(anchor)
+    for i in range(n_small):
+        img = rng.randint(0, 256, (420, 420, 3), dtype=np.uint8)
+        cv2.putText(img, f"S{i:03d}", (60, 250),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.2, (255, 255, 255), 7)
+        p = os.path.join(work, "db", "small", f"s{i:03d}.jpg")
+        enc(p, img)
+        small_paths.append(p)
+    return big_paths, small_paths, big_anchors
+
+
+def run_tiles_bench(work: str, n_big: int = 80, n_small: int = 80,
+                    seed: int = 7, tile: int = 512, overlap: float = 0.25,
+                    min_side: int = 768, lsh_bits: int = 12,
+                    lsh_tables: int = 8, n_queries: int = 20,
+                    cand_methods=("lsh", "coarse"),
+                    real_big: Optional[List[str]] = None,
+                    real_small: Optional[List[str]] = None,
+                    source: str = "synthetic",
+                    order: str = "mixed"):
+    """瓦片索引建库（全程 CPU/GPU 采样 + 文件/批次 trace）+ 检索延迟分解/召回率。
+    real_big/real_small：真实图库抽样（只读）。
+    order: mixed=大小图混合随机(默认)；layer=大图在前小图在后(旧行为,对照)。"""
+    import random as _random
+    from hybrid_search.config import Config
+    from hybrid_search.engine import HybridEngine
+    from hybrid_search import tile_index as T
+    from hybrid_search.io_utils import LOGGER as _LOG
+    import logging as _logging
+    _logging.getLogger("hybrid_search").setLevel(_logging.WARNING)
+
+    if real_big is None:
+        big_paths, small_paths, big_anchors = _make_tiles_dataset(
+            work, n_big, n_small, seed=seed)
+        n_big = len(big_paths)
+    else:
+        big_paths, small_paths, big_anchors = \
+            list(real_big), list(real_small or []), []
+        for p in real_big:
+            try:
+                import cv2 as _cv2
+                im = _imread_unicode(p)
+                h, w = im.shape[:2]
+                big_anchors.append((w // 2, h // 2))
+            except Exception:            # noqa: BLE001
+                big_anchors.append((0, 0))
+    all_paths = big_paths + small_paths
+    if order == "mixed":
+        _random.Random(seed + 11).shuffle(all_paths)   # 消除“大前小后”结构
+    prefix = os.path.join(work, "gallery_tiles")
+
+    # ---- 查询集：每张大图取一个 512x512 裁切（真实局部检索） -------------
+    import cv2
+    qdir = os.path.join(work, "queries")
+    os.makedirs(qdir, exist_ok=True)
+    queries = []
+    rng = np.random.RandomState(seed + 1)
+    n_q = min(n_queries, len(big_paths))
+    for qi in range(n_q):
+        img = _imread_unicode(big_paths[qi % len(big_paths)])
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        ax, ay = big_anchors[qi % len(big_paths)]
+        ax += int(rng.randint(-120, 121))
+        ay += int(rng.randint(-120, 121))
+        x0 = min(max(0, ax - 256), max(0, w - 512))
+        y0 = min(max(0, ay - 256), max(0, h - 512))
+        crop = img[y0:y0 + 512, x0:x0 + 512]
+        qp = os.path.join(qdir, f"q{qi:03d}.jpg")
+        cv2.imwrite(qp, crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        queries.append((qp, big_paths[qi % len(big_paths)]))
+
+    cfg = Config()
+    cfg.device = "auto"
+    cfg.exclude_self = False
+    eng = HybridEngine(cfg)
+
+    # ============ A. 建库（采样 CPU/GPU/显存/瓦片吞吐 + 处理轨迹） ========
+    state = {"done": 0, "last_t": None, "last_done": 0}
+
+    def tiles_per_s():
+        now = time.time()
+        if state["last_t"] is None:
+            state["last_t"], state["last_done"] = now, state["done"]
+            return 0.0
+        dt = now - state["last_t"]
+        d = state["done"] - state["last_done"]
+        state["last_t"], state["last_done"] = now, state["done"]
+        return d / dt if dt > 0 else 0.0
+
+    def cb(done, _total):
+        state["done"] = done
+
+    trace = T.BuildTrace()
+    sampler = HardwareSampler(img_per_s=tiles_per_s)
+    sampler.start()
+    t0 = time.time()
+    n_tiles = T.build_tiles(eng, prefix, paths=all_paths, progress=cb,
+                            tile=tile, overlap=overlap, min_side=min_side,
+                            trace=trace)
+    build_sec = time.time() - t0
+    build_rows = sampler.stop()
+    trace_snap = trace.snapshot()
+    _LOG.info("tiles build done")            # noqa: E800
+    n_images = len(all_paths)
+
+    # ============ B. 检索：候选法 × 查询集 ==============================
+    eng2 = HybridEngine(cfg)
+    eng2.open(prefix)
+    # 首次查询（含 LSH 建表 / 模型加载）单独计时
+    warm = T.search_tiles(eng2, queries[0][0], top_k=5, coarse_k=200,
+                          method="lsh", lsh_bits=lsh_bits,
+                          lsh_tables=lsh_tables)
+    warm_sec = warm.times.get("total", 0.0)
+    results = {}
+    for method in cand_methods:
+        lat = []
+        hits_top1 = 0
+        hits_top5 = 0
+        stage_agg: dict = {}
+        for qp, origin in queries:
+            o = T.search_tiles(eng2, qp, top_k=5, coarse_k=200,
+                               method=method, lsh_bits=lsh_bits,
+                               lsh_tables=lsh_tables)
+            paths5 = [os.path.normcase(h.path) for h in o.hits[:5]]
+            if o.hits and os.path.normcase(o.hits[0].path) == \
+                    os.path.normcase(origin):
+                hits_top1 += 1
+            if os.path.normcase(origin) in paths5:
+                hits_top5 += 1
+            for k, v in o.times.items():
+                if k != "total":
+                    stage_agg[k] = stage_agg.get(k, 0.0) + v
+            lat.append(o.times.get("total", 0.0))
+        results[method] = {
+            "lat": lat,
+            "stage": {k: v / max(len(queries), 1)
+                      for k, v in stage_agg.items()},
+            "top1": hits_top1, "top5": hits_top5,
+            "n_q": len(queries),
+        }
+    decoders = None
+    if real_big is not None:
+        pool = (big_paths[:7] + small_paths[:7]
+                if small_paths else big_paths[:12])
+        try:
+            decoders = _bench_decoders(pool)
+        except Exception as e:            # noqa: BLE001 —— 对照失败不阻断主报告
+            decoders = {"error": repr(e)}
+    return {
+        "n_images": n_images, "n_tiles": n_tiles, "build_sec": build_sec,
+        "build_rows": build_rows,
+        "avg_tiles_per_img": n_tiles / max(n_images, 1),
+        "warm_sec": warm_sec, "results": results,
+        "trace": trace_snap, "source": source, "decoders": decoders,
+        "params": {"tile": tile, "overlap": overlap, "min_side": min_side,
+                   "lsh_bits": lsh_bits, "lsh_tables": lsh_tables,
+                   "n_big": n_big, "n_small": n_small, "order": order},
+    }
+
+
+# ---------------------------------------------------------------------------
 # D. HTML 报告（纯内嵌 CSS/SVG，零依赖）
 # ---------------------------------------------------------------------------
 def esc(s) -> str:
@@ -370,11 +617,19 @@ def bar_cell(v: float, vmax: float, color: str = "#3d8fd1") -> str:
 def svg_line(series: List[dict], keys: List[Tuple[str, str, str]],
              w: int = 900, h: int = 240) -> str:
     """keys: (key, 颜色, 名称)。各序列独立归一化到 0..100 后再同图显示，
-    图例标注各自峰值；用于把 %（CPU/GPU）与 img/s（不同量纲）画在一起。"""
+    图例标注各自峰值；用于把 %（CPU/GPU）与 img/s（不同量纲）画在一起。
+    注意：series[].t 是采样间隔(dt)，这里先做累计 -> x 轴为真实时间轴，
+    点从左到右按时间均匀分布。"""
     if not series:
         return "<p>（无采样数据）</p>"
-    xs = [r["t"] for r in series]
-    total_t = max(xs[-1], 1e-6)
+    # t 为每行间隔：累计成真实时间轴（修复：不能拿单个 dt 当总时长，
+    # 否则所有点被除成同一坐标，折线全部缩到一侧/出界）
+    cum = 0.0
+    ts = []
+    for r in series:
+        cum += max(float(r.get("t") or 0.0), 0.0)
+        ts.append(cum)
+    total_t = max(ts[-1], 1e-6)
     pad_l, pad_b, pad_t, pad_r = 46, 24, 12, 10
     inner_w, inner_h = w - pad_l - pad_r, h - pad_t - pad_b
     parts = [f'<svg viewBox="0 0 {w} {h}" width="100%" '
@@ -389,8 +644,8 @@ def svg_line(series: List[dict], keys: List[Tuple[str, str, str]],
     parts.append(f'<text x="{pad_l}" y="{h - 4}" fill="#7d8b96" '
                  f'font-size="10">时间 → 总 {total_t:.1f}s</text>')
 
-    def t_of(sec):
-        return pad_l + inner_w * (sec / total_t)
+    def t_of(idx):
+        return pad_l + inner_w * (ts[idx] / total_t)
 
     legend_x = pad_l + 110
     for key, color, name in keys:
@@ -399,12 +654,12 @@ def svg_line(series: List[dict], keys: List[Tuple[str, str, str]],
             continue
         peak = max(max(float(v) for v in vals), 1e-6)
         pts = []
-        for r in series:
+        for ri, r in enumerate(series):
             v = r.get(key)
             if v is None:
                 continue
             y = pad_t + inner_h * (1 - min(max(float(v) / peak, 0), 1.0))
-            pts.append(f"{t_of(r['t']):.1f},{y:.1f}")
+            pts.append(f"{t_of(ri):.1f},{y:.1f}")
         parts.append(f'<polyline points="{" ".join(pts)}" fill="none" '
                      f'stroke="{color}" stroke-width="1.6" opacity="0.9"/>')
         parts.append(f'<rect x="{legend_x}" y="{pad_t + 4}" width="10" '
@@ -609,7 +864,566 @@ def _save_cache(path: str, items, counter, other, video_bytes) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# 瓦片（局部）索引性能图纸（HTML）
+# ---------------------------------------------------------------------------
+def _tiles_html(report: dict) -> str:
+    import statistics
+    p = report["params"]
+    rows = report["build_rows"]
+    out = ["<!doctype html><html lang='zh'><head><meta charset='utf-8'>"
+           "<title>局部(瓦片)索引性能报告</title><style>"
+           "body{font-family:'Microsoft YaHei UI',sans-serif;background:#10141a;"
+           "color:#d7dee4;margin:0;padding:20px}h1{font-size:20px}"
+           "h2{font-size:15px;color:#9fd0ff;margin-top:26px;"
+           "border-bottom:1px solid #26323d;padding-bottom:6px}"
+           "table{border-collapse:collapse;width:100%;margin:8px 0;"
+           "font-size:12.5px}th,td{border:1px solid #26323d;padding:4px 8px;"
+           "text-align:left}th{background:#1a222b}td.num{text-align:right;"
+           "font-variant-numeric:tabular-nums}.muted{color:#7d8b96}"
+           ".warn{color:#ffd28f}.good{color:#7fdb9a}code{background:#1a222b;"
+           "padding:1px 5px}svg{background:#121820;border:1px solid #26323d}"
+           "</style></head><body>"]
+    out.append(f"<h1>局部(瓦片)索引性能 · 图纸报告</h1>")
+    out.append(f"<p class='muted'>生成 {report['ts']} · 工作目录 "
+               f"<code>{esc(report['work'])}</code></p>")
+
+    out.append("<h2>1. 建库规模与参数</h2><table>"
+               "<tr><th>原图数</th><th>瓦片总数</th><th>平均瓦片/图</th>"
+               "<th>tile</th><th>overlap</th><th>min_side</th>"
+               "<th>LSH bits/表</th></tr>")
+    out.append(f"<tr><td class='num'>{report['n_images']}</td>"
+               f"<td class='num'>{report['n_tiles']:,}</td>"
+               f"<td class='num'>{report['avg_tiles_per_img']:.1f}</td>"
+               f"<td class='num'>{p['tile']}</td><td class='num'>{p['overlap']}</td>"
+               f"<td class='num'>{p['min_side']}</td>"
+               f"<td class='num'>{p['lsh_bits']}/{p['lsh_tables']}</td></tr></table>")
+
+    out.append("<h2>2. 建库全程硬件时间轴（0.4s 采样）</h2>")
+    if rows:
+        keys = [("cpu_sys", "#e0a458", "CPU 系统%"),
+                ("cpu_proc", "#d17a6f", "CPU 进程%"),
+                ("gpu", "#4da3d6", "GPU SM%"),
+                ("rdMBps", "#63c9a2", "读MB/s"),
+                ("wrMBps", "#e08a5a", "写MB/s"),
+                ("mem%", "#7fdb9a", "显存%")]
+        out.append(svg_line(rows, keys, w=960, h=260))
+        out.append("<table><tr><th>指标</th><th>均值</th><th>峰值</th></tr>")
+        for k, name in (("cpu_sys", "CPU 系统%"), ("cpu_proc", "CPU 进程%"),
+                        ("gpu", "GPU SM%"), ("rdMBps", "读 MB/s"),
+                        ("wrMBps", "写 MB/s"), ("mem%", "显存%")):
+            vals = [r.get(k) for r in rows if r.get(k) is not None]
+            if vals:
+                out.append(f"<tr><td>{name}</td>"
+                           f"<td class='num'>{statistics.mean(vals):.0f}</td>"
+                           f"<td class='num'>{max(vals):.0f}</td></tr>")
+        tps = [r.get("imgps") for r in rows if r.get("imgps")]
+        if tps:
+            out.append(f"<tr><td>瓦片/秒(采样)</td>"
+                       f"<td class='num'>{statistics.mean(tps):.0f}</td>"
+                       f"<td class='num'>{max(tps):.0f}</td></tr>")
+        out.append("</table>")
+    order_txt = {"mixed": "大小图混合随机顺序", "layer": "大图在前小图在后"}
+    out.append(f"<p>建库总耗时 <b>{report['build_sec']:.1f}s</b>（"
+               f"{report['n_images']} 张原图 → {report['n_tiles']:,} 瓦片，"
+               f"吞吐 {report['n_tiles'] / max(report['build_sec'], 1e-6):.0f} 瓦片/s）"
+               f" · 抽样顺序：{order_txt.get(report.get('params', {}).get('order'), '?')}"
+               f" · 首查暖机(建LSH表+模型加载) {report['warm_sec'] * 1000:.0f}ms</p>")
+
+    out.append("<h2>2.5 文件处理过程 × 利用率（锯齿诊断）</h2>")
+    out.append(_trace_chart(report))
+    out.append(_segment_trend(report))
+    if report.get("decoders"):
+        out.append("<h2>2.6 解码工具对照（同批真实文件，CPU vs GPU）</h2>")
+        out.append(_decoder_table(report["decoders"]))
+
+    out.append("<h2>3. 检索延迟分解与召回（Top1 命中率）</h2>")
+    for method, r in report["results"].items():
+        lat = sorted(r["lat"])
+        n = len(lat)
+        p50 = lat[n // 2] if n else 0
+        p95 = lat[min(n - 1, int(n * 0.95))] if n else 0
+        tag = "LSH 近似候选+指纹复核" if method == "lsh" else "全库指纹线性扫描(对照)"
+        out.append(f"<h2 style='margin-top:14px'>3.{1 if method == 'lsh' else 2} "
+                   f"{method} —— {tag}</h2>")
+        out.append(
+            f"<p>Top1 命中 <b>{r['top1']}/{r['n_q']}</b> "
+            f"({r['top1'] / max(r['n_q'], 1) * 100:.0f}%) · "
+            f"<b>Recall@5</b> <b>{r['top5']}/{r['n_q']}</b> "
+            f"({r['top5'] / max(r['n_q'], 1) * 100:.0f}%) · "
+            f"单次检索 min {min(lat) * 1000:.1f}ms / "
+            f"中位 {p50 * 1000:.1f}ms / p95 {p95 * 1000:.1f}ms "
+            f"<span class='muted'>（Top1 受近邻歧义影响，Recall@5 反映"
+            f"正确项是否被管线保留）</span></p>")
+        if r["stage"]:
+            out.append("<table><tr><th>阶段(平均)</th><th>耗时</th></tr>")
+            for k, v in sorted(r["stage"].items(), key=lambda kv: -kv[1]):
+                out.append(f"<tr><td>{esc(k)}</td>"
+                           f"<td class='num'>{v * 1000:.2f} ms</td></tr>")
+            out.append("</table>")
+    return "".join(out) + "</body></html>"
+
+
+def _trace_chart(report: dict) -> str:
+    """文件/批次处理过程甘特 + GPU 利用率对齐 + 空窗统计（锯齿诊断）。
+    时间轴统一为 0..T 秒；蓝条=每张原图的解码窗口(高 2px,完成序排列)，
+    顶部红/橙=每次 GPU 前向批(宽=耗时,高=行数/峰值)，与 GPU% 曲线同框。"""
+    import statistics
+    trace = report.get("trace") or {}
+    files = trace.get("files") or []
+    batches = trace.get("batches") or []
+    build_sec = max(report.get("build_sec", 0.0), 1e-6)
+    parts = []
+    if not files:
+        return "<p class='muted'>（无轨迹数据）</p>"
+    w, h = 960, 340
+    pad_l, pad_r, pad_t, pad_b = 52, 12, 14, 20
+    iw, ih = w - pad_l - pad_r, h - pad_t - pad_b
+    # 三区：上 55% GPU 利用率曲线；中 30% 文件解码条；下 12% 批条
+    y_gpu = pad_t
+    h_gpu = ih * 0.40
+    y_files = pad_t + h_gpu + 10
+    h_files = ih * 0.34
+    y_batch = pad_t + h_gpu + h_files + 18
+    h_batch = ih * 0.16
+
+    def X(sec):
+        return pad_l + iw * (sec / build_sec)
+
+    parts.append(f'<svg viewBox="0 0 {w} {h}" width="100%" '
+                 f'style="background:#0d1117;border-radius:6px">')
+    # 网格（时间刻度，按时长自动分 6~12 段）
+    n_ticks = min(12, max(6, int(build_sec // 1) + 2))
+    for i in range(n_ticks + 1):
+        sec = build_sec * i / n_ticks
+        x = X(sec)
+        parts.append(f'<line x1="{x:.0f}" y1="{pad_t}" x2="{x:.0f}" '
+                     f'y2="{h - pad_b}" stroke="#1c242e" stroke-width="1"/>')
+        parts.append(f'<text x="{x:.0f}" y="{h - 6}" fill="#7d8b96" '
+                     f'font-size="9" text-anchor="middle">{sec:.1f}s</text>')
+    # GPU% 曲线（合并 0.4s 采样）
+    rows = report.get("build_rows") or []
+    if rows:
+        cum = 0.0
+        pts = []
+        for r in rows:
+            cum += max(float(r.get("t") or 0), 0.0)
+            g = r.get("gpu")
+            if g is not None:
+                pts.append((pad_l + iw * (cum / build_sec),
+                            y_gpu + h_gpu * (1 - min(max(g / 100.0, 0), 1))))
+        if len(pts) > 1:
+            parts.append('<polyline points="' + " ".join(
+                f"{x:.1f},{y:.1f}" for x, y in pts) + '" fill="none" '
+                'stroke="#4da3d6" stroke-width="1.8" opacity="0.95"/>')
+        parts.append(f'<text x="{pad_l}" y="{y_gpu + 8}" fill="#4da3d6" '
+                     f'font-size="10">GPU SM% (0.4s 采样)</text>')
+    # 文件解码窗（按完成顺序排行）
+    fmax_tiles = max([f["tiles"] for f in files] + [1])
+    y_row = y_files
+    row_step = min(h_files / max(len(files), 1), 3.0)
+    for i, f in enumerate(sorted(files, key=lambda x: x["t1"])):
+        x0 = X(max(0.0, f["t0"]))
+        x1 = X(min(max(f["t1"], f["t0"] + 1e-4), build_sec))
+        if x1 - x0 < 0.6:
+            x1 = x0 + 0.6
+        frac = f["tiles"] / fmax_tiles
+        col = f"rgb({int(70 + frac * 150)},{int(140 + frac * 60)},{255})"
+        yy = y_files + i * row_step
+        parts.append(f'<rect x="{x0:.1f}" y="{yy:.1f}" width="{x1 - x0:.1f}" '
+                     f'height="{max(1.0, row_step - 0.6):.1f}" fill="{col}" '
+                     f'opacity="0.85"><title>{esc(f["path"])} '
+                     f'{f["tiles"]} 块</title></rect>')
+    parts.append(f'<text x="{pad_l}" y="{y_files + 8}" fill="#8ab4ff" '
+                 f'font-size="10">逐文件解码窗(每张 1 条; 色越亮瓦片越多)</text>')
+    # GPU 前向批
+    brow_max = max([b["rows"] for b in batches] + [1])
+    for b in batches:
+        x0 = X(max(0.0, b["t0"]))
+        x1 = X(min(max(b["t1"], b["t0"] + 1e-4), build_sec))
+        if x1 - x0 < 0.6:
+            x1 = x0 + 0.6
+        bh = max(1.5, h_batch * b["rows"] / brow_max)
+        parts.append(f'<rect x="{x0:.1f}" y="{y_batch + h_batch - bh:.1f}" '
+                     f'width="{x1 - x0:.1f}" height="{bh:.1f}" fill="#ff7b4a" '
+                     f'opacity="0.9"><title>批 {b["rows"]} 行</title></rect>')
+    parts.append(f'<text x="{pad_l}" y="{y_batch + 8}" fill="#ff7b4a" '
+                 f'font-size="10">GPU 前向批(橙, 高=行数/峰值)</text>')
+    parts.append("</svg>")
+
+    # ---- 空窗统计：批间 gap、GPU 低占用占比 -----------------------------
+    gaps = []
+    if len(batches) > 1:
+        prev_end = None
+        for b in sorted(batches, key=lambda x: x["t0"]):
+            if prev_end is not None:
+                g = b["t0"] - prev_end
+                if g > 0.001:
+                    gaps.append(g)
+            prev_end = max(prev_end or 0.0, b["t1"])
+    gpu_low = [r.get("gpu") for r in rows
+               if r.get("gpu") is not None and r["gpu"] < 25]
+    gpu_all = [r.get("gpu") for r in rows if r.get("gpu") is not None]
+    dec_dur = [f["t1"] - f["t0"] for f in files]
+    parts.append("<table><tr><th>指标</th><th>数值</th><th>说明</th></tr>")
+    parts.append(f"<tr><td>文件数 / 解码窗口</td><td class='num'>{len(files)} 张"
+                 f"（中位 {statistics.median(dec_dur) * 1000:.0f} ms，"
+                 f"最长 {max(dec_dur) * 1000:.0f} ms）</td>"
+                 f"<td class='muted'>解码长尾图会拖慢瓦片供给</td></tr>")
+    parts.append(f"<tr><td>GPU 前向批次数</td><td class='num'>{len(batches)}"
+                 f"（平均 {sum(b['rows'] for b in batches) / max(len(batches), 1):.0f}"
+                 f" 行/批）</td><td class='muted'>流式批：不足批时 10ms tick 发出</td></tr>")
+    if gaps:
+        parts.append(f"<tr><td>批间空窗(gap&gt;1ms)</td><td class='num'>"
+                     f"{len(gaps)} 次，中位 {statistics.median(gaps) * 1000:.1f} ms，"
+                     f"最大 {max(gaps) * 1000:.1f} ms，累计 "
+                     f"{sum(gaps):.2f} s</td>"
+                     f"<td class='muted'>GPU 无活可干的累计时长（锯齿谷）</td></tr>")
+    else:
+        parts.append("<tr><td>批间空窗</td><td class='num'>0</td>"
+                     "<td class='muted'>无（GPU 恒有活干）</td></tr>")
+    if gpu_all:
+        parts.append(f"<tr><td>GPU 利用率分布</td><td class='num'>均值 "
+                     f"{statistics.mean(gpu_all):.0f}%，峰值 {max(gpu_all):.0f}%，"
+                     f"&lt;25% 采样 {len(gpu_low)}/"
+                     f"{len(gpu_all)} ({len(gpu_low) / len(gpu_all) * 100:.0f}%)</td>"
+                     f"<td class='muted'>低占用占比高=空窗/启动占主导</td></tr>")
+    parts.append("</table>")
+    return "".join(parts)
+
+
+def _segment_trend(report: dict) -> str:
+    """把建库时间轴均分 4 段，统计各段 CPU/GPU/显存/吞吐均值，
+    暴露“后半段性能下降”（缓存/IO/资源退化），并给出 GPU 过闲判定。"""
+    import statistics
+    rows = report.get("build_rows") or []
+    if len(rows) < 8:
+        return ""
+    parts = ["<table><tr><th>时间分段</th><th>CPU 系统%</th><th>GPU SM%</th>"
+             "<th>显存%</th><th>瓦片/s</th></tr>"]
+    n = len(rows)
+    segs = 4
+    stats_rows = []
+    for s in range(segs):
+        seg = rows[s * n // segs:(s + 1) * n // segs] or rows[-1:]
+        def avg(key):
+            vs = [r.get(key) for r in seg if r.get(key) is not None]
+            return statistics.mean(vs) if vs else float("nan")
+        stats_rows.append((s, avg("cpu_sys"), avg("gpu"),
+                           avg("mem%"), avg("imgps")))
+        lab = ["前 25%", "25-50%", "50-75%", "后 25%"][s]
+        parts.append(f"<tr><td>{lab}</td><td class='num'>"
+                     f"{stats_rows[-1][1]:.0f}</td><td class='num'>"
+                     f"{stats_rows[-1][2]:.0f}</td><td class='num'>"
+                     f"{stats_rows[-1][3]:.0f}</td><td class='num'>"
+                     f"{stats_rows[-1][4]:.0f}</td></tr>")
+    parts.append("</table>")
+    # 趋势诊断
+    g_first, g_last = stats_rows[0][2], stats_rows[-1][2]
+    c_first, c_last = stats_rows[0][1], stats_rows[-1][1]
+    t_first, t_last = stats_rows[0][4], stats_rows[-1][4]
+    notes = []
+    if g_last < 20 and c_last > 55 and g_first > 30:
+        notes.append(f"尾段 GPU 过闲({g_last:.0f}%)而 CPU 满载"
+                     f"({c_last:.0f}%)：解码/预处理供给退化——若可用 GPU 解码器"
+                     f"(nvImageCodec/nvJPEG)可把熵解码卸载到 GPU；本机实测 JPEG "
+                     f"nvJPEG 因全尺寸输出反而更慢、PNG 无可用 GPU 硬解包，"
+                     f"优先排查解码/IO 队列")
+    if g_last < 20 and c_last < 30 and g_first > 30:
+        notes.append(f"尾段 CPU/GPU 双低({c_last:.0f}%/{g_last:.0f}%)且吞吐 "
+                     f"{t_first:.0f}→{t_last:.0f} 瓦片/s：读写/等待占主导"
+                     f"（磁盘缓存耗尽/页交换/锁），先查 IO 层")
+    if t_first > t_last * 1.5:
+        notes.append(f"吞吐从 {t_first:.0f} 降至 {t_last:.0f} 瓦片/s"
+                     f"（-{(1 - t_last / max(t_first, 1e-6)) * 100:.0f}%）")
+    if notes:
+        parts.append("<p class='warn'>趋势诊断：<br>· "
+                     + "<br>· ".join(notes) + "</p>")
+    return "".join(parts)
+
+
+def _bench_decoders(paths: List[str]) -> dict:
+    """同批真实文件 × 各解码工具（当前可用）的逐样本耗时：
+      cpu_cv2   : io_utils.decode_rgb（JPEG 域缩放 / PNG libpng，建库现状）
+      gpu_nvjpeg: torchvision nvJPEG（仅 JPEG，GPU 全尺寸）
+      pillow    : PIL 全尺寸（对照）
+    返回 {samples: [{name, fmt, w, h, ms:{tool:..}}]} 供 HTML 与决策。"""
+    import cv2 as _cv2
+    from hybrid_search.io_utils import decode_rgb, set_png_decoder
+    set_png_decoder("cv2")
+    jpeg_ok = False
+    try:
+        from torchvision.io import decode_jpeg  # noqa: PLC0415
+        _ = decode_jpeg
+        jpeg_ok = True
+    except Exception:            # noqa: BLE001
+        jpeg_ok = False
+    import torch
+    samples = []
+    for p in paths[:14]:
+        data = open(p, "rb").read()
+        fmt = "PNG" if p.lower().endswith(".png") else "JPEG"
+        ms = {}
+        for r in range(2):       # 预热
+            decode_rgb(data)
+        ts = []
+        for r in range(3):
+            t0 = time.perf_counter()
+            arr = decode_rgb(data)
+            ts.append(time.perf_counter() - t0)
+        ms["cpu_cv2(现状)"] = sorted(ts)[1] * 1000
+        if fmt == "JPEG" and jpeg_ok and torch.cuda.is_available():
+            ts = []
+            for r in range(3):
+                t0 = time.perf_counter()
+                j = torch.tensor(np.frombuffer(data, dtype=np.uint8))
+                out = decode_jpeg(j, device="cuda")
+                _ = out.cpu()
+                torch.cuda.synchronize()
+                ts.append(time.perf_counter() - t0)
+            ms["gpu_nvJPEG"] = sorted(ts)[1] * 1000
+        ts = []
+        for r in range(3):
+            from PIL import Image as _Im
+            import io as _io
+            t0 = time.perf_counter()
+            with _Im.open(_io.BytesIO(data)) as im:
+                _ = im.convert("RGB")
+            ts.append(time.perf_counter() - t0)
+        ms["pillow"] = sorted(ts)[1] * 1000
+        h, w = arr.shape[:2]
+        samples.append({"name": os.path.basename(p)[:26], "fmt": fmt,
+                        "w": w, "h": h, "mb": len(data) / 1e6, "ms": ms})
+    return {"samples": samples,
+            "gpu_jpeg_available": bool(jpeg_ok and torch.cuda.is_available()),
+            "png_gpu_available": False,
+            "png_gpu_note": "nvImageCodec 无 Windows wheel 可装(上游 v0.9.0 无资产)，"
+                            "PNG GPU 硬解码本机不可用"}
+
+
+def _decoder_table(dec: dict) -> str:
+    samples = dec["samples"]
+    tools = ["cpu_cv2(现状)", "gpu_nvJPEG", "pillow"]
+    parts = ["<table><tr><th>样本</th><th>格式</th><th>尺寸</th><th>MB</th>"]
+    for t in tools:
+        parts.append(f"<th>{t}</th>")
+    parts.append("</tr>")
+    for s in samples:
+        parts.append(f"<tr><td>{esc(s['name'])}</td><td>{s['fmt']}</td>"
+                     f"<td class='num'>{s['w']}x{s['h']}</td>"
+                     f"<td class='num'>{s['mb']:.1f}</td>")
+        for t in tools:
+            v = s["ms"].get(t)
+            parts.append(f"<td class='num'>{v:.1f} ms"
+                         f"</td>" if v is not None else "<td>n/a</td>")
+        parts.append("</tr>")
+    parts.append("</table>")
+    note = ("<p class='muted'>结论：JPEG 硬解码 GPU 需全尺寸输出+回传"
+            "（12MP≈40MB），实测不优于 CPU 域缩放(输出≤2048 省 3× 带宽)；"
+            + ("PNG：" + dec["png_gpu_note"] if dec.get("png_gpu_note")
+               else "") + "</p>")
+    parts.append(note)
+    return "".join(parts)
+
+
+def _make_tiles_suggestions(report: dict) -> List[str]:
+    import statistics
+    out: List[str] = []
+    rows = report["build_rows"]
+    cpu = [r.get("cpu_sys") for r in rows if r.get("cpu_sys") is not None]
+    gpu = [r.get("gpu") for r in rows if r.get("gpu") is not None]
+    if gpu:
+        g_avg = statistics.mean(gpu)
+        c_avg = statistics.mean(cpu) if cpu else 0
+        tr = report.get("trace") or {}
+        tfiles = tr.get("files") or []
+        if tfiles:
+            durs = sorted(f["t1"] - f["t0"] for f in tfiles)
+            med = durs[len(durs) // 2] if durs else 0
+            if med > 0.3:
+                out.append(f"CPU/GPU 未饱和（均值 {c_avg:.0f}%/{g_avg:.0f}%）："
+                           f"供给受大图解码长尾约束（单图窗中位 "
+                           f"{med * 1000:.0f}ms），见 2.5 节空窗统计")
+            else:
+                out.append(f"解码供给正常（单图窗中位 {med * 1000:.0f}ms），"
+                           f"CPU/GPU 均值 {c_avg:.0f}%/{g_avg:.0f}%："
+                           "图集规模小或 IO 等待，增大规模再测")
+        elif g_avg < 55 and c_avg < 40:
+            out.append("建库期间 CPU/GPU 均空闲：图太小或 IO 等待，检查磁盘；"
+                       "增大图集规模再测")
+        out.append(f"建库平均 CPU {c_avg:.0f}% / GPU {g_avg:.0f}%"
+                   f"（峰值 {max(gpu):.0f}%）")
+    res = report["results"]
+    if "lsh" in res and "coarse" in res:
+        ml = min(res["lsh"]["lat"]) if res["lsh"]["lat"] else 0
+        mc = min(res["coarse"]["lat"]) if res["coarse"]["lat"] else 0
+        if mc > 0 and ml > 0:
+            ratio = mc / ml
+            if ratio > 3:
+                out.append(f"LSH 相对全库扫描快 {ratio:.0f}×")
+            elif ratio < 1.2:
+                out.append("本库规模下 LSH 与线性扫描同速：库较小，可直用"
+                           "线性(--cand coarse)简化，规模扩大后再启用 LSH")
+        # 漏召判断：LSH 相对精确扫描的 Top5 缺口才是 LSH 漏召
+        d5 = res["coarse"]["top5"] - res["lsh"]["top5"]
+        if d5 > 0:
+            out.append(f"LSH 相对精确扫描漏召 {d5} 个(Top5 缺口)：提高表数"
+                       f"(--lsh-tables 12~16)、桶位数或 recheck-hits")
+        miss = res["coarse"]["n_q"] - res["coarse"]["top5"]
+        if miss > 0:
+            if str(report.get("source", "")).startswith("real"):
+                out.append(f"精确扫描 Top5 也缺失 {miss} 个：裁切到低判别区/"
+                           f"构图近邻时 ResNet 会判相近（真实库命中已高于"
+                           f"合成压力集），可调大 top_k 观察")
+            else:
+                out.append(f"精确扫描 Top5 也缺失 {miss} 个：属合成压力集近邻"
+                           f"歧义（ResNet 层面判相近），非 LSH 引入；真实内容"
+                           f"差异大时命中率会更高（几何图形 smoke 集为 100%）")
+    # 解码/特征构成提示（真实模式）：单图处理窗偏大时给出分段建议
+    tr = report.get("trace") or {}
+    files = tr.get("files") or []
+    if files and str(report.get("source", "")).startswith("real"):
+        import statistics as _st
+        durs = sorted(f["t1"] - f["t0"] for f in files)
+        med = _st.median(durs)
+        if med > 0.4:
+            out.append(f"单图解码窗中位 {med * 1000:.0f}ms：大 PNG 全尺寸解码"
+                       f"与瓦片特征(≈4ms/块)是供给瓶颈；JPEG 已走域缩放。"
+                       f"下一步可做瓦片特征 cv2 直通 transform 或 PNG 抽样降档")
+    return out
+
+
+def _cmd_tiles_profile(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(description="局部(瓦片)索引性能画像："
+                                             "合成图集或真实图库(只读抽样)"
+                                             "建库+检索全链路")
+    ap.add_argument("--work", default=None,
+                    help="工作目录（默认系统临时目录；含生成的合成图与索引）")
+    ap.add_argument("--root", default=None,
+                    help="真实图库根目录（只读抽样；不写图库任何内容）")
+    ap.add_argument("--root-big", type=int, default=40,
+                    help="真实模式：抽取的大图(>1.5MB)张数")
+    ap.add_argument("--root-small", type=int, default=20,
+                    help="真实模式：抽取的小图(<=1.5MB)张数")
+    ap.add_argument("--n-big", type=int, default=80, help="合成模式：大图张数")
+    ap.add_argument("--n-small", type=int, default=80, help="合成模式：小图张数")
+    ap.add_argument("--queries", type=int, default=20, help="裁切查询数")
+    ap.add_argument("--tile", type=int, default=512)
+    ap.add_argument("--overlap", type=float, default=0.25)
+    ap.add_argument("--min-side", type=int, default=768)
+    ap.add_argument("--lsh-bits", type=int, default=12)
+    ap.add_argument("--lsh-tables", type=int, default=8)
+    ap.add_argument("--cands", default="lsh,coarse",
+                    help="候选法列表(逗号分隔)：lsh,coarse")
+    ap.add_argument("--order", choices=["mixed", "layer"], default="mixed",
+                    help="真实抽样建库顺序：mixed=大小图混合随机(默认)；"
+                         "layer=大图在前小图在后(旧行为，用于对照尾段下降)")
+    ap.add_argument("--out", default="perf_reports")
+    ap.add_argument("--keep", action="store_true", help="保留工作目录不清理")
+    a = ap.parse_args(argv)
+
+    work = a.work or tempfile.mkdtemp(prefix="perfscope_tiles_")
+    os.makedirs(a.out, exist_ok=True)
+    try:
+        kwargs = dict(seed=7, tile=a.tile, overlap=a.overlap,
+                      min_side=a.min_side, lsh_bits=a.lsh_bits,
+                      lsh_tables=a.lsh_tables, n_queries=a.queries,
+                      order=a.order,
+                      cand_methods=tuple(x.strip()
+                                         for x in a.cands.split(",")))
+        if a.root:
+            root = os.path.abspath(a.root)
+            if not os.path.isdir(root):
+                print(f"目录不存在: {root}")
+                return 2
+            big, small = _sample_real_files(root, a.root_big, a.root_small,
+                                            seed=7)
+            if not big:
+                print("真实模式未抽到大图（>1.5MB），请检查目录")
+                return 2
+            print(f"真实图库抽样：{root} -> 大图 {len(big)} 张、"
+                  f"小图 {len(small)} 张（原图只读）", flush=True)
+            report = run_tiles_bench(work, real_big=big, real_small=small,
+                                     source=f"real:{root}", **kwargs)
+        else:
+            report = run_tiles_bench(
+                work, n_big=a.n_big, n_small=a.n_small, **kwargs)
+    except Exception as e:            # noqa: BLE001
+        import traceback as _tb
+        print(f"tiles-profile 失败：{e}\n{_tb.format_exc()}", flush=True)
+        return 1
+    report["ts"] = time.strftime("%Y%m%d-%H%M%S")
+    report["work"] = work
+    report["suggestions"] = _make_tiles_suggestions(report)
+    ts = report["ts"]
+    html_path = os.path.join(a.out, f"perf_tiles_{ts}.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(_tiles_html(report))
+
+    print("\n========== 局部索引性能摘要 ==========", flush=True)
+    print(f"原图 {report['n_images']} 张 -> 瓦片 {report['n_tiles']:,} 块 "
+          f"({report['avg_tiles_per_img']:.1f} 块/图) "
+          f"建库 {report['build_sec']:.1f}s "
+          f"({report['n_tiles'] / max(report['build_sec'], 1e-6):.0f} 瓦片/s)",
+          flush=True)
+    for method, r in report["results"].items():
+        lat = sorted(r["lat"])
+        n = len(lat)
+        print(f"  [{method}] Top1 {r['top1']}/{r['n_q']} · "
+              f"Recall@5 {r['top5']}/{r['n_q']} · "
+              f"单查中位 {lat[n // 2] * 1000:.1f}ms · "
+              f"p95 {lat[min(n - 1, int(n * 0.95))] * 1000:.1f}ms",
+              flush=True)
+    print("\n调控建议：", flush=True)
+    for s in report["suggestions"]:
+        print(f"  - {s}", flush=True)
+    print(f"\nHTML 图纸报告：{os.path.abspath(html_path)}", flush=True)
+    if not a.keep and work != a.work:
+        shutil.rmtree(work, ignore_errors=True)
+    return 0
+
+
+def _imread_unicode(path: str):
+    """cv2.imread 不支持中文路径 -> np.fromfile + imdecode（BGR）。"""
+    import cv2 as _cv2
+    try:
+        buf = np.fromfile(path, dtype=np.uint8)
+        if buf.size == 0:
+            return None
+        return _cv2.imdecode(buf, _cv2.IMREAD_COLOR)
+    except Exception:            # noqa: BLE001
+        return None
+
+
+def _sample_real_files(root: str, n_big: int, n_small: int,
+                       seed: int = 7) -> Tuple[List[str], List[str]]:
+    """真实图库只读抽样：按文件大小分大(>1.5MB)/小(<=1.5MB)两层随机抽，
+    只读 stat + 路径（不做任何解码/写入）。返回 (big, small) 路径列表。"""
+    import random
+    big_pool, small_pool = [], []
+    exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jfif")
+    for dirpath, _dirs, fnames in os.walk(root):
+        for fn in fnames:
+            if not fn.lower().endswith(exts):
+                continue
+            p = os.path.join(dirpath, fn)
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                continue
+            if sz > 1_500_000:
+                big_pool.append(p)
+            else:
+                small_pool.append(p)
+    rng = random.Random(seed)
+    rng.shuffle(big_pool)
+    rng.shuffle(small_pool)
+    return big_pool[:n_big], small_pool[:n_small]
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "tiles-profile":
+        return _cmd_tiles_profile(sys.argv[2:])
     ap = argparse.ArgumentParser(description="图库只读效能观测（不写图库）")
     ap.add_argument("root", help="图库根目录（只读）")
     ap.add_argument("--scan-only", action="store_true", help="只做档案扫描")
