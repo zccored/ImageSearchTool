@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
-# ImageSearchTool · 图库检索管理器（二值法粗筛 + ResNet 精排）
+# ImageSearchTool · 图库检索管理器 — 探针：找出真正含 iCCP/cHRM 块的 PNG，并测量噪音输出代价
 # Copyright (C) 2026 zccored
 #
 # 本程序是自由软件：你可以再发布和/或修改它，但必须遵守 GNU Affero 通用公共
