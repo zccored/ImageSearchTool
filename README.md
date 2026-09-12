@@ -3,8 +3,9 @@
 针对“相似性图像对比为主要判别依据”的本地图库，实现 **两级漏斗式检索**。
 提供两种使用方式：**可视化界面 `gui.py`**（推荐日常使用）与命令行 `main.py`。
 
-> 许可证：**AGPL-3.0**（GNU Affero General Public License v3.0）——见 [LICENSE](LICENSE)
-> 与文末「开源协议」（2026-09-12 由 MIT 变更）。
+> 许可证：**AGPL-3.0-only**（GNU Affero General Public License v3.0）——见 [LICENSE](LICENSE)；
+> 全部源文件头均带版权与许可声明（SPDX: `AGPL-3.0-only`），详见文末「开源协议」
+> （2026-09-12 由 MIT 变更）。
 
 ```
 查询图片
@@ -707,7 +708,9 @@ image-search/
   并在 README 中渲染。
 - **新增 `devtools/verify_tile_index.py`**：瓦片索引体检（行数/范数/框合法性/内容复核/
   去重账/命中框坐标系），据此记录上面「已知问题」三条。
-- **开源协议由 MIT 变更为 AGPL-3.0**（`LICENSE` 已整体替换，见下节）。
+- **开源协议由 MIT 变更为 AGPL-3.0**（`LICENSE` 已整体替换，见下节）；**52 个源文件
+  统一插入 AGPL-3.0-only 声明头**（保留 BOM/换行风格，纯新增 520 行，`compileall` 全绿、
+  CLI 与包导入冒烟通过）。
 
 ### 2026-09（上一轮）
 
@@ -734,9 +737,16 @@ image-search/
 
 ## 十一、开源协议
 
-本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0）**，完整条款见
+本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0-only）**，完整条款见
 [LICENSE](LICENSE)。2026-09-12 起由 MIT 变更为 AGPL-3.0：**此前已发布的副本仍适用当时
 的 MIT 条款**，此后版本与后续提交适用 AGPL-3.0。
+
+**源码文件头声明**：仓库内全部 52 个源文件（`main.py`、`gui.py`、`perfscope.py`、
+`perfwatch.py`、`compare_view.py`、`handoff_launcher.py`、`peer_launcher.py`、
+`hybrid_search/*.py`、`devtools/*.py`、`image-search.spec` 等）已在文件头标注
+`Copyright (C) 2026 zccored` 与 SPDX 标识 `AGPL-3.0-only`（英文 + 中文双语声明），
+插入时保留原有 BOM 与换行风格、模块 docstring 不受影响。第三方依赖（PyTorch /
+torchvision / OpenCV / Pillow / numpy 等）文件夹内不带本声明，仍按其原协议。
 
 ```text
 Copyright (C) 2026 zccored

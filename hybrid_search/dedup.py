@@ -1,4 +1,14 @@
 # -*- coding: utf-8 -*-
+# ---------------------------------------------------------------------------
+# ImageSearchTool · 图库检索管理器（二值法粗筛 + ResNet 精排）
+# Copyright (C) 2026 zccored
+#
+# 本程序是自由软件：你可以再发布和/或修改它，但必须遵守 GNU Affero 通用公共
+# 许可证 v3.0（AGPL-3.0-only）的条款；本程序不提供任何担保。完整条款见根目录 LICENSE。
+# This program is free software under the GNU Affero General Public License
+# v3.0 (AGPL-3.0-only), WITHOUT ANY WARRANTY. See the LICENSE file for terms.
+# ---------------------------------------------------------------------------
+
 """重复图查验（一对多）：完全重复（MD5）+ 近似重复（指纹条带阻塞 + 汉明复核）。
 
 为什么要复用索引：整图索引里已经存了每张图的 md5、64×64 二值指纹与 ResNet
