@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
-# ImageSearchTool · 图库检索管理器（二值法粗筛 + ResNet 精排）
+# ImageSearchTool · 图库检索管理器 — CLI 统一入口：把 argv 转交 hybrid_search.cli，供 python main.py <子命令> 使用
 # Copyright (C) 2026 zccored
 #
 # 本程序是自由软件：你可以再发布和/或修改它，但必须遵守 GNU Affero 通用公共
