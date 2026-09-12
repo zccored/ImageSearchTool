@@ -28,16 +28,22 @@
   在 ImageSearch 目录打开终端（或把 ImageSearchCLI.exe 加入 PATH）：
     ImageSearchCLI.exe build <图库目录> --prefix <索引前缀>
     ImageSearchCLI.exe add   <新增图片目录> --prefix <索引前缀>   :: 增量去重
+    ImageSearchCLI.exe build-tiles <图库目录> --prefix <瓦片索引前缀>  :: 瓦片(局部)索引
+    ImageSearchCLI.exe add-tiles   <图库目录> --prefix <瓦片索引前缀>
     ImageSearchCLI.exe search <查询图> --prefix <索引前缀> --top-k 10
+    ImageSearchCLI.exe search <局部截图> --mode tiles --tiles-prefix <瓦片索引前缀>
     ImageSearchCLI.exe stats --prefix <索引前缀>
     ImageSearchCLI.exe eval  <查询图目录> --prefix <索引前缀>     :: 召回率评估
+    ImageSearchCLI.exe compact --prefix <索引前缀>                :: npz → 侧车 .npy
   示例：
     ImageSearchCLI.exe build D:\图片库 --prefix D:\图片库\.gallery_index\gallery
     ImageSearchCLI.exe search D:\某张图.jpg --prefix D:\图片库\.gallery_index\gallery
 
 五、索引位置与格式
-  默认索引前缀 <图库根>\.gallery_index\gallery(.meta.json/.coarse.npz/
-  .fine.npz)。相同参数下索引可直接跨机器复制使用（路径需一致）。
+  默认索引前缀 <图库根>\.gallery_index\gallery（整图）与 …\gallery_tiles（瓦片局部），
+  新索引默认写成"侧车 .npy"（paths/fp/hu/fine/… 并列 .npy，可 mmap 快载，打开快、
+  常驻内存小），meta.json 记录建库参数；旧 npz 索引仍可读取，用 compact 可就地转换。
+  相同参数下索引可直接跨机器复制使用（路径需一致）。
   图库文件本身只读，索引重建/增量均幂等安全。
 
 六、其它
@@ -47,3 +53,9 @@
   * 首次运行如被杀毒软件拦截：此为 PyInstaller 单目录打包的正常
     误报，添加信任后运行即可（本工具不含任何网络外联）。
   * 数据安全：本工具只读取图片、只写索引文件，不修改你的图片。
+
+七、开源协议
+  本工具采用 GNU Affero 通用公共许可证 v3.0（AGPL-3.0-only），完整条款见随包
+  LICENSE 文件。分发本工具（含 exe 与 _internal 目录）时请一并附上 LICENSE 全文
+  与对应版本的完整源码；用它对外提供网络服务同样视为分发（AGPL 第 13 条）。
+  源码地址：https://github.com/zccored/ImageSearchTool
