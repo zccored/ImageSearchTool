@@ -1,5 +1,7 @@
 # 二值法粗筛 + ResNet 精排 —— 混合图库检索系统
 
+![ImageSearchTool](docs/brand/banner.svg)
+
 针对“相似性图像对比为主要判别依据”的本地图库，实现 **两级漏斗式检索**。
 提供两种使用方式：**可视化界面 `gui.py`**（推荐日常使用）与命令行 `main.py`。
 
@@ -108,6 +110,8 @@ GitHub 不执行 HTML，**想在线看可交互渲染版**用 raw.githack 链接
 > `https://<用户名>.github.io/ImageSearchTool/perf/<文件名>.html`。
 
 ## 〇、可视化界面（日常使用推荐）
+
+![ImageSearchTool](docs/brand/logo.svg)
 
 ```bat
 python gui.py
@@ -603,6 +607,7 @@ image-search/
 ├── LICENSE                          # AGPL-3.0（2026-09-12 由 MIT 变更）
 ├── peer_manifest.json               # 「切换启动」白名单哈希
 ├── docs/perf/                       # 收录的性能图（整页 PNG + 原始 HTML + 采样 JSON）
+├── docs/brand/                      # 品牌图（banner/social/logo/icon，SVG 矢量 + PNG 渲染）
 ├── devtools/                        # 开发期回归/基准脚本（见下）
 ├── requirements.txt
 └── hybrid_search/
@@ -630,6 +635,7 @@ image-search/
 | `bench_real_index.py` | 真实索引基准（粗筛/精排/检索延迟） |
 | `probe_cpu_cost.py` · `probe_pipeline_split.py` · `probe_decode_threads.py` | 单张成本分布 / 生产消费占比 / 解码线程扩展性 |
 | `watch_running_build.py` | 非侵入观测正在运行的建库进程（读速/CPU/内存 → 张·块每秒） |
+| `make_brand_svg.py` | 生成品牌图 SVG（banner / social / logo / icon），确定性输出、可复现 |
 | `verify_stderr_filter.py` | libpng 噪音过滤的"吞噪音/透告警"回归验证 |
 
 ## 八、写给后续扩展（4TB / 200 万张路线）
@@ -711,6 +717,11 @@ image-search/
 - **开源协议由 MIT 变更为 AGPL-3.0**（`LICENSE` 已整体替换，见下节）；**52 个源文件
   统一插入 AGPL-3.0-only 声明头**（保留 BOM/换行风格，纯新增 520 行，`compileall` 全绿、
   CLI 与包导入冒烟通过）。
+- **品牌图**：新增 `docs/brand/`（banner 1600×900 / social 1280×640 / logo 760×200 /
+  icon 512×512，SVG 矢量 + PNG 渲染），由 `devtools/make_brand_svg.py` 确定性生成；
+  视觉元素取自项目自身——九宫格按 **25% 重叠**排布（= 瓦片切块协议）、两条连线把选中
+  瓦片放大到前景、前景方块是 GUI 可视化面板的 **16×16 采样象限马赛克**、红框用命中框
+  原色 `#ff4040`。README 顶部与「可视化界面」章节已完成置入。
 
 ### 2026-09（上一轮）
 
