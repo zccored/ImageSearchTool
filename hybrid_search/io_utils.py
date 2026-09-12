@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
-# ImageSearchTool · 图库检索管理器（二值法粗筛 + ResNet 精排）
+# ImageSearchTool · 图库检索管理器 — 通用 IO / 图像解码：cv2 域缩放解码、EXIF 旋正、路径收集、libpng 噪音过滤
 # Copyright (C) 2026 zccored
 #
 # 本程序是自由软件：你可以再发布和/或修改它，但必须遵守 GNU Affero 通用公共
