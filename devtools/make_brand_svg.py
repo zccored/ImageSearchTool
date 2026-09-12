@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
-# ImageSearchTool · 图库检索管理器（二值法粗筛 + ResNet 精排）
+# ImageSearchTool · 图库检索管理器 — 生成品牌图 SVG（banner/social/logo/icon），视觉元素取自项目自身特征、确定性可复现
 # Copyright (C) 2026 zccored
 #
 # 本程序是自由软件：你可以再发布和/或修改它，但必须遵守 GNU Affero 通用公共
