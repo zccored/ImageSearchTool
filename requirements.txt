@@ -4,6 +4,12 @@ opencv-python>=4.11.0.86
 Pillow>=10.0
 tqdm
 
+# 性能图 / 交接进程（可选，但 GUI「导出性能图」与 handoff_launcher 依赖）
+psutil>=5.9
+nvidia-ml-py>=12.535        # 提供 pynvml，仅 NVIDIA 显卡需要（显存/利用率采样）
+
+# 瓦片（局部）索引的 LSH 候选：纯 numpy 实现，无需额外依赖
+
 # ResNet 精排（可选，跑精排前安装）
 # CPU 版:     pip install torch torchvision
 # CUDA 版:    到 https://pytorch.org/get-started/locally/ 生成对应命令（如 cu121/cu124）
