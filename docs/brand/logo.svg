@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="200" viewBox="0 0 760 200" role="img" aria-label="ImageSearchTool"><defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0b1017"/><stop offset=".55" stop-color="#10141a"/>
+    <stop offset="1" stop-color="#0a0e14"/>
+  </linearGradient>
+  <radialGradient id="glowTile" cx=".5" cy=".5" r=".5">
+    <stop offset="0" stop-color="#3b82f6" stop-opacity=".30"/>
+    <stop offset="1" stop-color="#3b82f6" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="glowGrid" cx=".5" cy=".5" r=".5">
+    <stop offset="0" stop-color="#22d3ee" stop-opacity=".16"/>
+    <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="cellFill" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#60a5fa" stop-opacity=".20"/>
+    <stop offset="1" stop-color="#22d3ee" stop-opacity=".07"/>
+  </linearGradient>
+  <linearGradient id="cellHot" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#60a5fa" stop-opacity=".48"/>
+    <stop offset="1" stop-color="#22d3ee" stop-opacity=".22"/>
+  </linearGradient>
+  <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0" stop-color="#60a5fa" stop-opacity=".30"/>
+    <stop offset="1" stop-color="#22d3ee" stop-opacity=".10"/>
+  </linearGradient>
+  <linearGradient id="lineG" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0" stop-color="#60a5fa"/><stop offset="1" stop-color="#22d3ee"/>
+  </linearGradient>
+  <linearGradient id="word" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#bfe3ff"/>
+  </linearGradient>
+  <pattern id="paper" width="40" height="40" patternUnits="userSpaceOnUse">
+    <path d="M40 0H0V40" fill="none" stroke="#1b2531" stroke-width="1" opacity=".55"/>
+  </pattern>
+  <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+    <feDropShadow dx="0" dy="16" stdDeviation="26" flood-color="#05080c"
+                  flood-opacity=".62"/>
+  </filter>
+  <clipPath id="tileClip"><rect x="0" y="0" width="400"
+      height="400" rx="20"/></clipPath>
+  <clipPath id="hotClip"><rect x="0" y="0" width="46" height="46" rx="6"/></clipPath>
+</defs><rect width="760" height="200" fill="url(#bg)"/><rect width="760" height="200" fill="url(#paper)" opacity=".45"/><circle cx="98" cy="110" r="109" fill="url(#glowGrid)"/><circle cx="264" cy="100" r="125" fill="url(#glowTile)"/><rect x="40.0" y="52.0" width="46.0" height="46.0" rx="10" fill="url(#cellFill)" stroke="#60a5fa" stroke-opacity=".34"/><rect x="74.5" y="52.0" width="46.0" height="46.0" rx="10" fill="url(#cellFill)" stroke="#60a5fa" stroke-opacity=".34"/><rect x="109.0" y="52.0" width="46.0" height="46.0" rx="10" fill="url(#cellFill)" stroke="#60a5fa" stroke-opacity=".34"/><rect x="40.0" y="86.5" width="46.0" height="46.0" rx="10" fill="url(#cellFill)" stroke="#60a5fa" stroke-opacity=".34"/><rect x="74.5" y="86.5" width="46.0" height="46.0" rx="10" fill="url(#cellFill)" stroke="#60a5fa" stroke-opacity=".34"/><rect x="40.0" y="121.0" width="46.0" height="46.0" rx="10" fill="url(#cellFill)" stroke="#60a5fa" stroke-opacity=".34"/><rect x="74.5" y="121.0" width="46.0" height="46.0" rx="10" fill="url(#cellFill)" stroke="#60a5fa" stroke-opacity=".34"/><rect x="109.0" y="121.0" width="46.0" height="46.0" rx="10" fill="url(#cellFill)" stroke="#60a5fa" stroke-opacity=".34"/><rect x="109.0" y="86.5" width="46.0" height="46.0" rx="10" fill="url(#cellHot)" stroke="#dff1ff" stroke-opacity=".92" stroke-width="2"/><g clip-path="url(#hotClip)" transform="translate(109.0,86.5)"><rect x="11.96" y="11.96" width="6.12" height="6.12" fill="#526b83"/><rect x="17.48" y="11.96" width="6.12" height="6.12" fill="#528cab"/><rect x="23.00" y="11.96" width="6.12" height="6.12" fill="#4a9066"/><rect x="28.52" y="11.96" width="6.12" height="6.12" fill="#4e6690"/><rect x="11.96" y="17.48" width="6.12" height="6.12" fill="#607eb3"/><rect x="17.48" y="17.48" width="6.12" height="6.12" fill="#ca793b"/><rect x="23.00" y="17.48" width="6.12" height="6.12" fill="#e87043"/><rect x="28.52" y="17.48" width="6.12" height="6.12" fill="#5b9d6e"/><rect x="11.96" y="23.00" width="6.12" height="6.12" fill="#5b9e6f"/><rect x="17.48" y="23.00" width="6.12" height="6.12" fill="#d5b077"/><rect x="23.00" y="23.00" width="6.12" height="6.12" fill="#93c0ec"/><rect x="28.52" y="23.00" width="6.12" height="6.12" fill="#538dad"/><rect x="11.96" y="28.52" width="6.12" height="6.12" fill="#45758f"/><rect x="17.48" y="28.52" width="6.12" height="6.12" fill="#4f9b6e"/><rect x="23.00" y="28.52" width="6.12" height="6.12" fill="#607db1"/><rect x="28.52" y="28.52" width="6.12" height="6.12" fill="#6c401f"/></g><rect x="30.0" y="42.0" width="135.0" height="135.0" rx="14" fill="none" stroke="#22d3ee" stroke-opacity=".38" stroke-dasharray="9 8"/><polygon points="155.0,86.5 214.0,50.0 214.0,150.0 155.0,132.5" fill="url(#beam)"/><line x1="155.0" y1="86.5" x2="214.0" y2="50.0" stroke="url(#lineG)" stroke-width="3" stroke-linecap="round" opacity=".95"/><line x1="155.0" y1="132.5" x2="214.0" y2="150.0" stroke="url(#lineG)" stroke-width="3" stroke-linecap="round" opacity=".95"/><circle cx="155.0" cy="86.5" r="3.0" fill="#eaf6ff" opacity=".95"/><circle cx="155.0" cy="132.5" r="3.0" fill="#eaf6ff" opacity=".95"/><circle cx="214.0" cy="50.0" r="3.0" fill="#eaf6ff" opacity=".95"/><circle cx="214.0" cy="150.0" r="3.0" fill="#eaf6ff" opacity=".95"/><g filter="url(#soft)"><rect x="214.0" y="50.0" width="100.0" height="100.0" rx="20" fill="#11161d"/></g><g clip-path="url(#tileClip)" transform="translate(214.0,50.0) scale(0.2500)"><rect x="0.00" y="0.00" width="100.60" height="100.60" fill="#526b83"/><rect x="100.00" y="0.00" width="100.60" height="100.60" fill="#528cab"/><rect x="200.00" y="0.00" width="100.60" height="100.60" fill="#4a9066"/><rect x="300.00" y="0.00" width="100.60" height="100.60" fill="#4e6690"/><rect x="0.00" y="100.00" width="100.60" height="100.60" fill="#607eb3"/><rect x="100.00" y="100.00" width="100.60" height="100.60" fill="#ca793b"/><rect x="200.00" y="100.00" width="100.60" height="100.60" fill="#e87043"/><rect x="300.00" y="100.00" width="100.60" height="100.60" fill="#5b9d6e"/><rect x="0.00" y="200.00" width="100.60" height="100.60" fill="#5b9e6f"/><rect x="100.00" y="200.00" width="100.60" height="100.60" fill="#d5b077"/><rect x="200.00" y="200.00" width="100.60" height="100.60" fill="#93c0ec"/><rect x="300.00" y="200.00" width="100.60" height="100.60" fill="#538dad"/><rect x="0.00" y="300.00" width="100.60" height="100.60" fill="#45758f"/><rect x="100.00" y="300.00" width="100.60" height="100.60" fill="#4f9b6e"/><rect x="200.00" y="300.00" width="100.60" height="100.60" fill="#607db1"/><rect x="300.00" y="300.00" width="100.60" height="100.60" fill="#6c401f"/></g><rect x="214.0" y="50.0" width="100.0" height="100.0" rx="20" fill="none" stroke="#ffffff" stroke-opacity=".16" stroke-width="2"/><rect x="240.0" y="72.0" width="52.0" height="52.0" fill="none" stroke="#ff4040" stroke-width="2.0" stroke-opacity=".95"/><text x="344" y="100" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC','Noto Sans SC',sans-serif" font-size="44" font-weight="700" letter-spacing=".5" fill="url(#word)">ImageSearchTool</text><text x="346" y="138" font-family="'Segoe UI','Microsoft YaHei UI','PingFang SC','Noto Sans SC',sans-serif" font-size="17" fill="#9aa7b0">二值法粗筛 + ResNet 精排 · 瓦片索引 · 命中框回传</text></svg>
