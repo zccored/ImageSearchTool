@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """复核真实索引（侧车格式）：加载耗时/RSS + 三种检索模式。
 
 只读：仅打开与检索，不写图库/索引。
@@ -41,7 +41,8 @@ def open_engine(prefix: str):
     return eng
 
 
-print("== 1) 加载 ==")
+HAS_TILES = os.path.exists(TP + ".meta.json")
+print("== 1) 加载 ==" + ("" if HAS_TILES else "（瓦片索引不存在，仅测整图）"))
 eng_t = open_engine(TP)
 eng_f = open_engine(FP)
 

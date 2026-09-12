@@ -139,6 +139,17 @@ def scan_duplicates(paths: Sequence[str], *,
 
     idx = _IndexReuse(prefix)
     cfg = idx.cfg or Config()
+    # 预处理缓存：命中即跳过“读原图 + md5 + 解码”（去重只需要指纹与 md5）
+    pcache = None
+    try:
+        from .fine import _PRE_DOWNSCALE_SIDE
+        from .prep_cache import PrepCache, default_cache_dir
+        if prefix and os.path.exists(prefix + ".meta.json"):
+            pcache = PrepCache(default_cache_dir(prefix), model=cfg.model,
+                               pre_side=_PRE_DOWNSCALE_SIDE)
+    except Exception:                       # noqa: BLE001 —— 无缓存也能跑
+        pcache = None
+    cache_hits = 0
 
     md5s: List[str] = [""] * n
     fps: List[Optional[np.ndarray]] = [None] * n
@@ -203,9 +214,20 @@ def scan_duplicates(paths: Sequence[str], *,
     if todo:
         if progress:
             progress(0, len(todo), "解码未入库文件(取指纹+MD5)")
+
+        def _md5_fp_cached(path: str):
+            """优先用预处理缓存（命中则完全不读盘/不解码）。"""
+            nonlocal cache_hits
+            if pcache is not None:
+                hit = pcache.get(path)
+                if hit is not None:
+                    rec = hit[1]
+                    cache_hits += 1
+                    return (rec.md5 or ""), np.asarray(rec.fp, dtype=np.uint8)
+            return _md5_and_fp(path, cfg, True)
+
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_md5_and_fp, paths[i], cfg, not md5s[i]): i
-                    for i in todo}
+            futs = {ex.submit(_md5_fp_cached, paths[i]): i for i in todo}
             done = 0
             for fut in futs:
                 i = futs[fut]

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 可视化界面（tkinter，无需额外 GUI 依赖）。
 
@@ -1181,14 +1181,28 @@ class App:
 
     def _maybe_draw_viz(self):
         """24fps 节流：每 tick 最多取一帧绘制；帧率超限时自然丢弃，
-        绘制绝不拖慢主流程。粗筛帧队列播完前不切 ResNet 帧（顺序观感）。"""
+        绘制绝不拖慢主流程。粗筛帧队列播完前不切 ResNet 帧（顺序观感）。
+
+        任务结束（_viz_fast）后进入**快放**：跳帧只画最后一帧，让排队帧在
+        1 秒内播完——否则用户会以为“ResNet 还在跑、输出被中断了”。"""
+        fast = bool(getattr(self, "_viz_fast", False))
         q = (self._viz_queue["coarse"] or self._viz_queue["fine"])
         if not q:
+            if fast:
+                self._viz_fast = False
+                self.viz_status_var.set(
+                    f"✅ 可视化回放结束（累计 {self._viz_frames} 帧）· 建库已完成")
             return
         now = time.monotonic()
-        if now - self._viz_last_draw < 1.0 / 24.0:
+        if now - self._viz_last_draw < (1.0 / 60.0 if fast else 1.0 / 24.0):
             return
         self._viz_last_draw = now
+        if fast:                      # 快放：丢弃中间帧，只绘制最后一帧
+            for _ in range(15):
+                q = (self._viz_queue["coarse"] or self._viz_queue["fine"])
+                if not q or len(q) <= 1:
+                    break
+                q.popleft()
         if self._viz_queue["coarse"]:
             phase, data = self._viz_queue["coarse"].popleft()
         else:
@@ -1504,6 +1518,10 @@ class App:
         self._add_check(page_build, "预构建 ResNet 全库索引(快/占内存)", "store_fine", True)
         self._add_check(page_build, "新索引用侧车 .npy 存储(加载快/省内存)",
                         "fast_load", False)
+        self._add_check(page_build, "屏蔽 libpng/iCCP 噪音输出(推荐)",
+                        "silence_png_warnings", True)
+        self._add_check(page_build, "启用预处理缓存(重复建库更快/占磁盘)",
+                        "prep_cache", True)
         self._add_check(page_build, "MD5 内容去重", "dedup", True)
         self._add_int(page_build, "粗筛并行线程(0=自动≤8)", "workers", 0, 0, 64,
                       tooltip="0=自动(不超过8且不超过CPU核数)，1=串行最省内存；\n"
@@ -1907,7 +1925,11 @@ class App:
         return path
 
     def _perf_report_ready(self, path: str, modal: bool = False):
-        """主线程：提示已导出 + 点亮“最近性能图”按钮。"""
+        """主线程：提示已导出 + 点亮“最近性能图”按钮。
+
+        模态弹窗会阻塞 Tk 主循环；若此时可视化还在回放排队帧，界面会像
+        “卡住/输出中断”。因此有回放在跑时先等它播完（最多 ~6 秒）再弹。
+        """
         if not path:
             return
         self._last_perf_report = path
@@ -1918,8 +1940,26 @@ class App:
                 btn.configure(state="normal")
             except tk.TclError:
                 pass
-        if modal:
-            messagebox.showinfo("性能图已导出", f"已写入：\n{path}")
+        if not modal:
+            return
+        self._pending_perf_modal = [path, 0]
+        self.root.after(200, self._pump_perf_modal)
+
+    def _viz_busy(self) -> bool:
+        return bool(self._viz_queue.get("coarse") or self._viz_queue.get("fine"))
+
+    def _pump_perf_modal(self):
+        """等可视化回放结束后再弹性能图提示（最多等 6 秒，避免一直不弹）。"""
+        pend = getattr(self, "_pending_perf_modal", None)
+        if not pend:
+            return
+        path, waited = pend
+        if self._viz_busy() and waited < 30:
+            self._pending_perf_modal = [path, waited + 1]
+            self.root.after(200, self._pump_perf_modal)
+            return
+        self._pending_perf_modal = None
+        messagebox.showinfo("性能图已导出", f"已写入：\n{path}")
 
     # ------------------------------------------------------------------
     # 索引存储格式转换（旧 npz -> 侧车 .npy 快载）
@@ -2003,6 +2043,8 @@ class App:
     def _index_worker(self, title: str, cfg: Config, op):
         prof = self._perf_start("index", title, cfg, prefix=self.prefix,
                                 meta={"图片数": len(self.all_images)})
+        self._cur_prof = prof          # 供 _prog_cb 在阶段切换时打点
+        self._prog_prof_phase = None
         try:
             # 建库前先释放缓存引擎：把内存让给解码流水线（瓦片库可占 1GB+）
             self._drop_engines("建库前腾内存", silent=True)
@@ -2010,10 +2052,12 @@ class App:
             eng = HybridEngine(cfg)
             if prof:
                 prof.mark("初始化引擎", 耗时=round(time.time() - t0, 3))
-                prof.mark("解码+特征提取")
+                prof.mark("解码+特征提取(粗筛与ResNet同一条流水线)")
             n = op(eng)
             if prof:
-                prof.mark("写盘完成")
+                # op() 返回即代表“特征提取 + 落盘”全部结束（engine 内部有
+                # save/done 阶段边界事件，这里再补一条终结打点）
+                prof.mark("op 返回：提取+落盘完成", 张数=n)
             self.q.put(("indexed", {"n": n, "prefix": self.prefix, "title": title,
                                     "perf": self._perf_finish(
                                         prof, note=f"{n} 张",
@@ -2021,6 +2065,8 @@ class App:
         except Exception as e:  # noqa: BLE001
             self._perf_finish(prof, status="error", note=str(e)[:120])
             self.q.put(("error", f"{title}失败：{e}\n{traceback.format_exc()}"))
+        finally:
+            self._cur_prof = None
 
     # ------------------------------------------------------------------
     # 查验去重（一对多重复图）
@@ -2090,11 +2136,23 @@ class App:
         DedupWindow(self, rep)
 
     def _prog_cb(self, prof=None):
-        """engine 进度回调 -> 消息队列（worker 线程调用，主线程 pump 渲染）。"""
+        """engine 进度回调 -> 消息队列（worker 线程调用，主线程 pump 渲染）。
+
+        阶段切换时**同时给性能图打点**：这样性能图上能明确看到
+        “解码+特征提取 / 写盘 / 全部完成”的边界，不会误判 ResNet 还没跑完。
+        """
         def cb(done, total, phase):
             self.q.put(("progress", (done, total, phase)))
-            if prof is not None:
-                prof.bump(done, total)
+            p = prof if prof is not None else getattr(self, "_cur_prof", None)
+            if p is None:
+                return
+            p.bump(done, total)
+            if phase != getattr(self, "_prog_prof_phase", None):
+                self._prog_prof_phase = phase
+                label = self._PHASE_LABELS.get(phase, phase or "")
+                p.mark(f"阶段：{label}", 计数=f"{done}/{total}")
+                if phase == "done":
+                    p.mark("特征提取与落盘全部完成")
         return cb
 
     def _reset_viz(self):
@@ -2161,8 +2219,9 @@ class App:
             self._drop_engines("瓦片建库前腾内存", silent=True)
             eng = HybridEngine(cfg)
             prog = self._prog_cb(prof)
-            # 瓦片建库进度回调为 (done,total) 两参，包成三段式进度接口
-            cb2 = (lambda d, t: prog(d, t, "tiles")) if prog else None
+            # 瓦片建库进度回调为 (done,total) 两参；带第三参时是阶段边界
+            # （save/done），必须原样透传，否则性能图看不到“结束状态”
+            cb2 = (lambda d, t, ph="tiles": prog(d, t, ph)) if prog else None
             # 过程可视化帧(低开销)：每瓦片一张 64×64 二值帧 + 每文件首块 16×16
             # 象限帧，复用既有 24fps 绘制节流与有界帧队列，不影响建库速率
             viz = self._viz_cb()
@@ -2636,6 +2695,8 @@ class App:
         "coarse": "① 二值法粗筛",
         "fine": "② ResNet 全库特征",
         "verify": "解码校验",
+        "save": "③ 特征提取完成 · 正在写盘",
+        "done": "✅ 全部完成（粗筛与精排均已落盘）",
         "compact": "索引存储格式转换",
     }
 
@@ -2690,19 +2751,24 @@ class App:
     def _on_index_done(self, data: dict):
         self.progress.configure(value=0)
         n = data["n"]
-        self._set_busy(False, f"{data['title']}完成：{n} 张 -> {self.prefix}.*")
+        # 明确“结束状态”：粗筛与精排都在同一条流水线里，op 返回即全部落盘
+        self._set_busy(False, f"✅ {data['title']}完成：{n} 张"
+                              f"（粗筛 + ResNet 均已落盘）-> {self.prefix}.*")
+        self._log(f"✅ {data['title']}完成：{n} 张已落盘（{self.prefix}.*）")
         self._load_indexed_set()
         self._apply_indexed_tag()
         self._drop_engines("索引已改写，缓存失效", silent=True)
-        self._perf_report_ready(data.get("perf", ""), modal=True)
-        # 可视化收尾：不强制清空——让排队中的帧按 24fps 自然播完
-        # （快速任务两段动画也能完整回放），仅更新状态提示
-        if self._viz_phase:
+        # 可视化：进入快放模式，把排队帧 1 秒内播完（不再像“还在处理 ResNet”）
+        if self._viz_busy():
+            self._viz_fast = True
             label = "① 粗筛·二值点阵" if self._viz_phase == "coarse" \
                 else "② ResNet·采样象限"
             self.viz_status_var.set(
-                f"{label} 绘制中 · 任务已完成，排队帧继续回放至结束"
-                f"（已采样 {self._viz_frames} 帧）")
+                f"{label} 快放中 · 建库已完成，剩余排队帧正在快速播完"
+                f"（累计 {self._viz_frames} 帧）")
+        else:
+            self.viz_status_var.set(f"✅ 已完成（累计 {self._viz_frames} 帧）")
+        self._perf_report_ready(data.get("perf", ""), modal=True)
 
     def _on_search_done(self, data: dict):
         self.progress.configure(value=0)

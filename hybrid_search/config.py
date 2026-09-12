@@ -73,6 +73,9 @@ class Config:
     # PNG 解码器："cv2"（默认，libpng 全尺寸，比 Pillow 快 ~1.3x；
     # 个别坏 iCCP 文件会有零星 stderr 警告）/ "pillow"（安静、较慢）
     png_decoder: str = "cv2"
+    # 屏蔽 libpng 的 iCCP/cHRM stderr 噪音（只吞已知噪音行，其余原样转发）。
+    # 目的：终端不再刷屏、不淹没真实错误；不影响解码结果与构建流程。
+    silence_png_warnings: bool = True
     # 大图(>12MP)解码并发上限：这类图 RGB 峰值 36MB~100MB+/张，
     # 过高并发会推高内存(页回收反而降速)。14 物理核/16GB 内存机建议 16~20
     big_decode_conc: int = 16
@@ -86,6 +89,10 @@ class Config:
     # 常驻内存 1.3GB->约 0.3GB）。仅影响“新建/重建”索引的写盘格式，
     # 已有索引可用 compact 命令就地转换。
     fast_load: bool = False
+    # 预处理缓存（L2 内存 + L3 磁盘）：缓存“PIL 处理后的 224 裁剪 + 粗筛指纹 +
+    # md5”，重复建库时**完全跳过读原图与解码**（命中约 1.5ms/张，且逐位一致）。
+    # 实测 CPU 侧 85ms/张 vs GPU 0.41ms/张 —— 这是把 GPU 真正喂饱的关键。
+    prep_cache: bool = True
     # torch 推理线程数（0=保持 torch 默认；CPU 单线程前向通常最优，
     # GPU 场景该值无影响，由 CUDA 流自动调度）
     torch_threads: int = 0

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """验证：引擎缓存/内存释放 + 性能图导出 + add_tiles 增量正确性。
 
 不弹窗口（子类化 App 但跳过 __init__，只借用其方法）。
@@ -12,6 +12,9 @@ import threading
 import time
 
 sys.path.insert(0, r"D:\code\新的代码\全栈图库管理器 v3.2bata\image-search")
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
 
 import numpy as np  # noqa: E402
 import psutil  # noqa: E402
@@ -72,8 +75,14 @@ def drain(st, kinds=None):
     return got
 
 
+HAS_TILES = os.path.exists(os.path.join(
+    ROOT, ".gallery_index", "gallery_tiles.meta.json"))
+MODE = "tiles" if HAS_TILES else "full"
+if not HAS_TILES:
+    print("（未发现瓦片索引 gallery_tiles，本轮回退用整图索引测试）")
+
 print("=========== A) 搜图：引擎缓存 + 内存 ===========")
-st = Stub("tiles")
+st = Stub(MODE)
 cfg = Config()
 cfg.top_k = 5
 for i in range(3):
@@ -95,7 +104,7 @@ drain(st)
 print(f"  _drop_engines 后 rss={rss():.0f}MB (报告回落 {freed:.0f}MB)")
 
 print("=========== B) 搜图性能图导出 ===========")
-st2 = Stub("tiles", perf_search=True)
+st2 = Stub(MODE, perf_search=True)
 G.App._search_worker(st2, Q, cfg)
 msgs = drain(st2, kinds={"search_done", "error"})
 perf_path = msgs[0][1].get("perf", "") if msgs and msgs[0][0] == "search_done" else ""

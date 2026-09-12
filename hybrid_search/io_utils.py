@@ -44,6 +44,124 @@ _big_decode_active = [0]
 _big_decode_cond = threading.Condition()
 
 
+# ---------------------------------------------------------------------------
+# C 层 stderr 噪音过滤（libpng 的 iCCP/cHRM 警告、损坏 PNG 的 incomplete 报错）
+#   这些告警由 libpng 直接 write(2) 到 stderr，Python 层拦不住；真实终端里成千
+#   上万行会刷屏并带来可见的写入/渲染开销（实测写入本身在管道下约 1µs/行，
+#   但交互式控制台的渲染成本远高于此，且会淹没真正的错误信息）。
+#   做法：管道 + 过滤线程 —— 只吞掉已知噪音，其余（含我们自己的日志）原样转发，
+#   既不影响构建流程，也不掩盖真实错误；被吞掉的行数会累计，供日志汇总。
+#   验证脚本：devtools/verify_stderr_filter.py
+# ---------------------------------------------------------------------------
+_STDERR_NOISE_KEYS = (
+    b"libpng warning:",
+    b"libpng error: PNG input buffer is incomplete",
+    b"iCCP: known incorrect sRGB profile",
+    b"cHRM:",
+    b"sRGB:",
+)
+
+
+class _StderrNoiseFilter:
+    """把 fd 2 接到管道上，过滤已知噪音后转发其余内容。进程级、幂等、零依赖。"""
+
+    def __init__(self) -> None:
+        self._installed = False
+        self._lock = threading.Lock()
+        self._suppressed = 0
+        self._forwarded = 0
+        self._saved_fd: Optional[int] = None
+        self._read_fd: Optional[int] = None
+        self._thread: Optional[threading.Thread] = None
+
+    # -- 安装/统计 ----------------------------------------------------
+    @property
+    def installed(self) -> bool:
+        return self._installed
+
+    def install(self) -> bool:
+        if self._installed:
+            return True
+        if os.name != "nt" and not hasattr(os, "pipe"):     # 理论兜底
+            return False
+        try:
+            sys.stderr.flush()
+        except Exception:                       # noqa: BLE001
+            pass
+        try:
+            read_fd, write_fd = os.pipe()
+            self._saved_fd = os.dup(2)          # pythonw 下 fd 2 可能无效
+            os.dup2(write_fd, 2)
+            os.close(write_fd)
+            self._read_fd = read_fd
+            self._thread = threading.Thread(target=self._pump,
+                                            name="stderr-noise-filter",
+                                            daemon=True)
+            self._thread.start()
+            self._installed = True
+            return True
+        except Exception as e:                  # noqa: BLE001 —— 装不上就算了
+            LOGGER.debug("stderr 噪音过滤安装失败（忽略）: %r", e)
+            self._installed = False
+            return False
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"installed": self._installed,
+                    "suppressed": self._suppressed,
+                    "forwarded": self._forwarded}
+
+    # -- 后台泵 ------------------------------------------------------
+    def _pump(self) -> None:
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(self._read_fd, 16384)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                self._emit(line + b"\n")
+            if len(buf) > 32768:                # 异常长行（无换行）先吐出去
+                self._emit(buf)
+                buf = b""
+        if buf:
+            self._emit(buf)
+
+    def _emit(self, line: bytes) -> None:
+        noise = any(k in line for k in _STDERR_NOISE_KEYS)
+        with self._lock:
+            if noise:
+                self._suppressed += 1
+            else:
+                self._forwarded += 1
+        if noise:
+            return
+        try:
+            os.write(self._saved_fd, line)
+        except Exception:                       # noqa: BLE001
+            pass
+
+
+_stderr_filter = _StderrNoiseFilter()
+
+
+def silence_png_noise(enable: bool = True) -> bool:
+    """开关 C 层 stderr 噪音过滤（libpng iCCP/cHRM 等）。返回当前是否生效。"""
+    if not enable:
+        return _stderr_filter.installed
+    return _stderr_filter.install()
+
+
+def stderr_noise_stats() -> dict:
+    """噪音过滤统计：{"installed", "suppressed", "forwarded"}。"""
+    return _stderr_filter.stats()
+
+
+
 def set_big_decode_limit(n: int) -> None:
     """动态调整大图解码并发上限（引擎按 Config.big_decode_conc 调用）。"""
     with _big_decode_cond:
@@ -266,11 +384,18 @@ def _decode_opencv(data: bytes, gray: bool,
 _PNG_DECODER = "cv2"
 
 
-def set_png_decoder(mode: str) -> None:
-    """全局切换 PNG 解码器（由 Config.png_decoder 驱动，运行时生效）。"""
+def set_png_decoder(mode: str, silence_noise: Optional[bool] = None) -> None:
+    """全局切换 PNG 解码器（由 Config.png_decoder 驱动，运行时生效）。
+
+    silence_noise：是否同时屏蔽 libpng 的 iCCP/cHRM stderr 噪音（不影响解码结果）。
+    """
     global _PNG_DECODER
     if mode in ("cv2", "pillow"):
         _PNG_DECODER = mode
+    if silence_noise is None:
+        silence_noise = _PNG_DECODER == "cv2"    # cv2/libpng 才有噪音
+    if silence_noise:
+        silence_png_noise(True)
 
 
 def _decode_png_cv2(data: bytes, gray: bool,

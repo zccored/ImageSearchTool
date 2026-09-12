@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 命令行入口：python main.py <子命令> [参数]
 
@@ -83,6 +83,11 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--fast-load", action="store_true",
                     help="新索引用侧车 .npy 存储（可 mmap：加载更快、常驻内存"
                          "更省；已有索引可用 compact 就地转换）")
+    sp.add_argument("--no-prep-cache", action="store_true",
+                    help="关闭预处理缓存（默认开启：重复建库跳过读盘与解码）")
+    sp.add_argument("--no-silence-png", action="store_true",
+                    help="不屏蔽 libpng 的 iCCP/cHRM stderr 噪音"
+                         "（默认屏蔽：终端不刷屏、不淹没真实错误）")
     sp.add_argument("--ext", action="append", default=None,
                     help="额外支持的图片扩展名（可多次，如 .gif）")
     sp.add_argument("--coarse-k", type=int, default=300,
@@ -117,6 +122,8 @@ def _apply_feature_args(cfg: Config, a: argparse.Namespace) -> None:
                                      cfg.tile_decode_slots))
     cfg.tile_flush_ms = int(_val(a, "tile_flush_ms", cfg.tile_flush_ms))
     cfg.fast_load = bool(_flag(a, "fast_load", cfg.fast_load))
+    cfg.silence_png_warnings = not _flag(a, "no_silence_png")
+    cfg.prep_cache = not _flag(a, "no_prep_cache")
     cfg.coarse_k = int(_val(a, "coarse_k", cfg.coarse_k))
     cfg.exclude_self = not _flag(a, "no_exclude_self")
     ext = _val(a, "ext")

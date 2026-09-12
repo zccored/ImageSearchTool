@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 混合检索引擎：把“二值法粗筛”与“ResNet 精排”串成一条漏斗式流水线。
 
@@ -65,6 +65,19 @@ class Outcome:
 
 
 # ---------------------------------------------------------------------------
+# 阶段边界事件：进度回调除了“计数”，还会收到 save / done 两个明确边界，
+#   让 GUI 能在“特征提取完成”与“落盘完成”分别打点（性能图需要确切结束状态）。
+# ---------------------------------------------------------------------------
+def _phase(progress, done: int, total: int, phase: str) -> None:
+    if progress is None:
+        return
+    try:
+        progress(int(done), int(max(total, 1)), phase)
+    except Exception:                       # noqa: BLE001 —— 打点失败不影响建库
+        pass
+
+
+# ---------------------------------------------------------------------------
 # 引擎
 # ---------------------------------------------------------------------------
 class HybridEngine:
@@ -72,8 +85,11 @@ class HybridEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         # 让解码层跟随配置的 PNG 解码器（cv2 全尺寸 / pillow）
-        from .io_utils import set_png_decoder, set_big_decode_limit
+        from .io_utils import (set_big_decode_limit, set_png_decoder,
+                               silence_png_noise)
         set_png_decoder(getattr(cfg, "png_decoder", "cv2"))
+        if getattr(cfg, "silence_png_warnings", True):
+            silence_png_noise(True)      # 屏蔽 libpng iCCP/cHRM stderr 噪音
         set_big_decode_limit(getattr(cfg, "big_decode_conc", 16))
         self.coarse = CoarseIndex(cfg)
         self.prefix: Optional[str] = None
@@ -118,6 +134,7 @@ class HybridEngine:
         elif limit is not None and limit > 0:
             paths = paths[:limit]
 
+        self._prep_cache = self._make_prep_cache(prefix)
         has_fine = False
         feat_dim = None
         if self.cfg.store_fine:
@@ -132,6 +149,10 @@ class HybridEngine:
             if ok != self.coarse.paths:
                 raise RuntimeError(
                     "融合建库内部顺序不一致（粗筛与精排结果集错位），请联系排查")
+            n_done = len(ok)
+            LOGGER.info("特征提取完成：%d 张（粗筛指纹 + ResNet 特征，单遍解码）",
+                        n_done)
+            _phase(progress, n_done, n_done, "save")   # 明确的阶段边界
             files.save_fine(self.coarse.paths, feats,
                             sidecar=self._storage == "sidecar")
             self._keep_fine(feats)
@@ -145,8 +166,11 @@ class HybridEngine:
             if n == 0:
                 raise RuntimeError(
                     "没有可入库的图片（检查目录、扩展名或图片完整性）")
+            _phase(progress, n, n, "save")
 
         self._save_all(files, has_fine=has_fine, feature_dim=feat_dim)
+        _phase(progress, self.coarse.size, self.coarse.size, "done")
+        self._log_prep_cache()
         LOGGER.info("索引构建完成：%d 张，耗时 %.1f s，输出前缀 %s.*",
                     self.coarse.size, time.time() - start, prefix)
         return self.coarse.size
@@ -163,6 +187,7 @@ class HybridEngine:
             paths = collect_images(img_dir, self.cfg.extensions, limit=limit)
         elif limit is not None and limit > 0:
             paths = paths[:limit]
+        self._prep_cache = self._make_prep_cache(prefix)
         old_n = self.coarse.size
         old_has_fine = self._fine_feats is not None
         start = time.time()
@@ -186,6 +211,8 @@ class HybridEngine:
             added = len(ok)
             if self.coarse.paths[old_n:] != ok:
                 raise RuntimeError("融合增量内部顺序不一致，请联系排查")
+            LOGGER.info("特征提取完成：新增 %d 张", added)
+            _phase(progress, added, added, "save")
             if old_has_fine:
                 new_feats = np.concatenate(
                     [np.asarray(self._fine_feats), new_feats], axis=0)
@@ -202,10 +229,40 @@ class HybridEngine:
             if added == 0:
                 LOGGER.info("无新增图片（路径与内容均重复）")
                 return 0
+            _phase(progress, added, added, "save")
             self._save_all(IndexFiles(prefix), has_fine=False)
+        _phase(progress, self.coarse.size, self.coarse.size, "done")
+        self._log_prep_cache()
         LOGGER.info("增量入库完成：+%d 张（总计 %d），耗时 %.1f s",
                     added, self.coarse.size, time.time() - start)
         return added
+
+    # ------------------------------------------------------------------
+    # 预处理缓存（L2 内存 + L3 磁盘）
+    # ------------------------------------------------------------------
+    def _make_prep_cache(self, prefix: str):
+        """按索引前缀创建/复用预处理缓存；关闭时返回 None。"""
+        if not getattr(self.cfg, "prep_cache", True):
+            try:
+                from .fine import set_prep_cache
+                set_prep_cache(None)
+            except Exception:               # noqa: BLE001
+                pass
+            return None
+        from .fine import _PRE_DOWNSCALE_SIDE, set_prep_cache
+        from .prep_cache import PrepCache, default_cache_dir
+        root = default_cache_dir(prefix)
+        cache = getattr(self, "_prep_cache", None)
+        if cache is None or cache.root != root or not cache.enabled:
+            cache = PrepCache(root, model=self.cfg.model,
+                              pre_side=_PRE_DOWNSCALE_SIDE)
+        set_prep_cache(cache)               # 让 build-fine / 查询路径也能命中
+        return cache
+
+    def _log_prep_cache(self) -> None:
+        cache = getattr(self, "_prep_cache", None)
+        if cache is not None:
+            LOGGER.info("%s", cache.summary())
 
     # ------------------------------------------------------------------
     # 融合建库（单遍解码：解码一次，同时出粗筛指纹 + ResNet 张量）
@@ -268,8 +325,16 @@ class HybridEngine:
         from .io_utils import decode_rgb, read_bytes
 
         cfg = self.cfg
+        # 预处理缓存（L2 内存 + L3 磁盘）：命中即跳过
+        # “读原图(数 MB) + md5 + 解码(18~600ms) + 粗筛特征 + PIL 预处理”，
+        # 只需 ~1.5ms 重建张量，且与全新建库**逐位一致**（PNG 无损）。
+        cache = getattr(self, "_prep_cache", None)
 
         def prep(path):
+            if cache is not None:
+                hit = cache.get(path)
+                if hit is not None:
+                    return hit
             data = read_bytes(path)
             if data is None:
                 return None, None
@@ -308,6 +373,8 @@ class HybridEngine:
                 if tensor is None:
                     return None, None
                 rec = CoarseRecord(path=path, md5=md5, hu=hu, fp=fp)
+                if cache is not None:
+                    cache.put(path, tensor, rec, ex._mean, ex._std)
                 return tensor, rec
             except Exception as e:  # noqa: BLE001 —— 单张失败不影响整体
                 LOGGER.debug("融合解码失败 %s: %r", path, e)
@@ -332,6 +399,8 @@ class HybridEngine:
             # 只允许在“全量重建”语义下使用 limit（写回仍按全库顺序，只重建子集需谨慎）
             raise RuntimeError("build-fine 暂不支持 --limit（会破坏顺序一致性）")
         # 释放旧 fine 的 mmap（Windows 下被映射的 .npy 无法被替换）
+        LOGGER.info("精排特征提取完成：%d 张", len(ok))
+        _phase(progress, len(ok), len(ok), "save")
         self.release_fine()
         IndexFiles(prefix).save_fine(self.coarse.paths, feats,
                                      sidecar=self._storage == "sidecar")
@@ -340,6 +409,7 @@ class HybridEngine:
         meta["fine"] = {"exists": True, "feature_dim": feats.shape[1]}
         meta["storage"] = self._storage
         IndexFiles(prefix).save_meta(meta)
+        _phase(progress, len(ok), len(ok), "done")
         LOGGER.info("精排索引已保存：%d 张 × %d 维 -> %s",
                     feats.shape[0], feats.shape[1],
                     IndexFiles(prefix).fine_path)
@@ -398,6 +468,11 @@ class HybridEngine:
                     if has_fine and files.fine_exists() else "")
         LOGGER.info("索引落盘 %s.*（粗筛 %s%s）", files.prefix,
                     human_bytes(files.coarse_size() or 0), fine_txt)
+        from .io_utils import stderr_noise_stats
+        _st = stderr_noise_stats()
+        if _st.get("suppressed"):
+            LOGGER.info("已屏蔽 %d 条 libpng/iCCP stderr 噪音（不影响解码结果）",
+                        _st["suppressed"])
 
     # ==================================================================
     # 打开索引

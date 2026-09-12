@@ -101,6 +101,47 @@ _PRE_DOWNSCALE_SIDE = 2048          # 重型图降采样后的最长边
 _VIZ_QUAD = 16                      # 可视化象限分辨率：16×16 RGB 采样块
 
 
+def prep_cv2(rgb: np.ndarray, mean, std) -> "object":
+    """numpy RGB -> ResNet 输入张量（cv2 实现，语义对齐 torchvision）。
+
+    等价于 `Resize(256) -> CenterCrop(224) -> ToTensor -> Normalize`：
+      * 短边缩到 256（cv2.INTER_AREA 面积平均，缩小时比 PIL BILINEAR 更快更清晰）；
+      * 居中裁 224×224（偏移用 round((len-224)/2)，与 torchvision 一致）；
+      * 归一化后转 (3,224,224) float32 CHW。
+
+    为什么默认不用：实测大图（≤2048 边长）只快 1.67×（8.9ms→5.3ms），
+    占单张图片总 CPU 成本的 ~2%，但特征余弦相对 torchvision 路径漂到 0.9945，
+    与既有索引不一致，得不偿失（见 devtools/bench_prep_big.py）。保留此实现
+    以便将来在“全量重建”场景下按需启用。
+    """
+    import cv2
+    import torch
+
+    h, w = rgb.shape[:2]
+    side = min(h, w)
+    scale = 256.0 / max(side, 1)
+    if abs(scale - 1.0) > 1e-6:
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        rgb = cv2.resize(rgb, (max(1, int(round(w * scale))),
+                               max(1, int(round(h * scale)))),
+                         interpolation=interp)
+    h, w = rgb.shape[:2]
+    if h < 224 or w < 224:                     # 极端小图：补齐到 224（居中）
+        pad_y = max(0, 224 - h)
+        pad_x = max(0, 224 - w)
+        rgb = cv2.copyMakeBorder(rgb, pad_y // 2, pad_y - pad_y // 2,
+                                 pad_x // 2, pad_x - pad_x // 2,
+                                 cv2.BORDER_REPLICATE)
+        h, w = rgb.shape[:2]
+    y0 = int(round((h - 224) / 2))
+    x0 = int(round((w - 224) / 2))
+    crop = np.ascontiguousarray(rgb[y0:y0 + 224, x0:x0 + 224])
+    t = torch.from_numpy(crop).permute(2, 0, 1).float().div_(255.0)
+    t = t.sub_(torch.as_tensor(mean).view(3, 1, 1)).div_(
+        torch.as_tensor(std).view(3, 1, 1))
+    return t.contiguous()
+
+
 def _center_quad_sample(rgb: np.ndarray) -> np.ndarray:
     """取图片中心 224×224 窗口（与 ResNet 预处理一致的采样视野），
     降采样成 16×16×3 的 RGB 象限块 —— 供 GUI 可视化“ResNet 正在采样这张图”。"""
@@ -115,13 +156,25 @@ def _center_quad_sample(rgb: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(quad)
 
 
+_PREP_CACHE = None                  # 由 engine 注入（见 set_prep_cache）
+
+
+def set_prep_cache(cache) -> None:
+    """全局挂载预处理缓存：build-fine / 查询等解码路径也能命中（省一次解码）。"""
+    global _PREP_CACHE
+    _PREP_CACHE = cache
+
+
 def _prepare_one(path: str, transform, frame_sink=None) -> Optional:
     """
     单个工作项：单次读盘 -> 快速解码 RGB -> torchvision 预处理 -> CPU 张量。
     frame_sink(path, quad16x16x3)：可选可视化回调（解码 worker 线程内调用，
     异常被吞，不影响前向）。
     """
-    import torch
+    if _PREP_CACHE is not None and frame_sink is None:
+        hit = _PREP_CACHE.get(path)      # 命中：跳过读盘+解码+预处理
+        if hit is not None:
+            return hit[0]
     data = read_bytes(path)
     if data is None:
         return None
@@ -134,7 +187,7 @@ def _prepare_one(path: str, transform, frame_sink=None) -> Optional:
         except Exception:  # noqa: BLE001 —— 可视化失败不得影响任务
             pass
     # 重型图（如 1 亿像素长图）先在解码层降一次采样到 ≤2048 边长，
-    # 避免 torchvision 对全尺寸像素做 Resize（省 10~100 倍内存与时间）。
+    # 避免后续对全尺寸像素做 Resize（省 10~100 倍内存与时间）。
     if rgb.shape[0] * rgb.shape[1] > _PRE_DOWNSCALE_PX:
         import cv2
         scale = _PRE_DOWNSCALE_SIDE / max(rgb.shape[:2])
@@ -194,6 +247,9 @@ class ResNetExtractor:
                     self.decode_workers, self.batch)
 
         import torchvision.transforms as transforms
+        self._mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+        self._std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+        # 兼容保留 torchvision 版本（语义等价，作为对照/兜底）
         self.transform = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
@@ -201,6 +257,15 @@ class ResNetExtractor:
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225]),
         ])
+
+    def prep(self, rgb: np.ndarray):
+        """numpy RGB -> ResNet 输入张量。
+
+        保留 cv2 快路径备查：实测大图仅快 1.67×（8.9ms→5.3ms，占单张 CPU
+        成本 ~2%），但特征余弦会漂到 0.9945（与既有索引不一致），故**不使用**；
+        如需启用请配合全量重建，见 devtools/bench_prep_big.py。
+        """
+        return prep_cv2(rgb, self._mean, self._std)
 
     # ------------------------------------------------------------------
     def _forward(self, tensors) -> Optional[np.ndarray]:

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 瓦片局部索引（tile index）：把大幅原图切成瓦片分别建库，实现“裁切图/局部图
 搜原图 + 命中位置框”。
@@ -470,6 +470,8 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
         side = getattr(engine, "_storage", "npz") == "sidecar"
         # 解除 fine 的 mmap（含 LSH 缓存引用）：Windows 下被映射的 .npy
         # 无法被替换，必须先释放；feats_all 已是拼接后的新数组
+        LOGGER.info("瓦片特征提取完成：%d 块", added)
+        _phase(progress, added)
         engine.release_fine()
         old_feats = None
         files.save_coarse(st["paths"], st["md5s"], st["hu"], st["fp"],
@@ -500,9 +502,20 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
                                 "pre_max": pre_max}
         files.save_meta(meta)
     rate = added / max(time.time() - t0, 1e-6)
+    _phase(progress, added, "done")
     LOGGER.info("瓦片索引：+%d 块（原图 %d 张），库内共 %d 块，吞吐 %.1f 块/秒",
                 added, n, engine.coarse.size, rate)
     return added
+
+
+def _phase(progress, done: int, phase: str = "save") -> None:
+    """向进度回调发送阶段边界事件（save/done），失败不影响建库。"""
+    if progress is None:
+        return
+    try:
+        progress(int(done), int(max(done, 1)), phase)
+    except Exception:                       # noqa: BLE001
+        pass
 
 
 def build_tiles(engine, prefix: str, img_dir: Optional[str] = None,
