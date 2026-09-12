@@ -1,4 +1,4 @@
-﻿# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
@@ -218,6 +218,14 @@ __marimo__/
 .streamlit/secrets.toml
 
 # ---- ImageSearch 项目追加 ----
+# 本文件忽略"本地产物"：索引、缓存、性能图报告、字节码，避免误入库。
+# 1) 性能图报告（GUI 勾选「导出性能图」或 perfscope.py 生成）
 perf_reports/
-*.pyc
+# 2) 索引目录与缓存：侧车 .npy / meta / 缩略图 / 预处理缓存
 .gallery_index/
+prep_cache/
+thumbs/
+*.npz
+# 3) Python 字节码与打包中间产物
+*.pyc
+*.pyo
