@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
-# ImageSearchTool · 图库检索管理器（二值法粗筛 + ResNet 精排）
+# ImageSearchTool · 图库检索管理器 — PyInstaller runtime hook：把 torch._dynamo 替换为宽松 no-op stub
 # Copyright (C) 2026 zccored
 #
 # 本程序是自由软件：你可以再发布和/或修改它，但必须遵守 GNU Affero 通用公共
