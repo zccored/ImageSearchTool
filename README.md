@@ -100,14 +100,6 @@ GitHub 不执行 HTML，**想在线看可交互渲染版**用 raw.githack 链接
 - 场景：1,500 张 / 12,704 块的实验样本，两级任务池改造后 **86 → 385 块/秒**。
 - 这份报告章节最全：逐文件解码窗、逐批前向"锯齿/空窗"诊断、解码器对照。
 
-> 报告格式说明：`perfscope.py`（只读观测仪，章节最全）与 `perfwatch.py`（GUI 内
-> 阶段画像，每 0.4s 采样一行）输出同源 HTML；`perf_reports/*.json` 是逐行原始采样，
-> 可自行画图或做 A/B 对比。仓库里收录的是上面三份历史基线，日常跑出来的新报告
-> 仍默认写在本地 `perf_reports/`（已在 `.gitignore` 中）。
->
-> 上面 raw.githack / htmlpreview 这类在线渲染服务**仅对公开仓库有效**；私有仓库请把
-> HTML 下载到本地双击打开（浏览器直接渲染），或启用 GitHub Pages 后访问
-> `https://<用户名>.github.io/ImageSearchTool/perf/<文件名>.html`。
 
 ## 〇、可视化界面（日常使用推荐）
 
