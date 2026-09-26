@@ -211,6 +211,15 @@ class IndexFiles:
                 print(f"[索引] 侧车读取失败（{type(e).__name__}: {e}），"
                       f"回退旧 npz：{self.prefix}")
                 self._storage_cache = "npz"
+        if not os.path.exists(self.coarse_path):
+            # 清单 .npz 不存在（例如新建索引走侧车 .npy 格式）→ 再试侧车，
+            # 而不是直接抛 FileNotFoundError（GUI「读取已索引清单」曾因此失败）。
+            try:
+                return self._load_coarse_sidecar()
+            except Exception as e:  # noqa: BLE001
+                raise FileNotFoundError(
+                    f"索引不存在或不可读：{self.coarse_path}"
+                    f"（侧车 {self.side('hu')} 亦失败：{type(e).__name__}: {e})")
         data = np.load(self.coarse_path, allow_pickle=True)
         out = {
             "paths": list(data["paths"]),

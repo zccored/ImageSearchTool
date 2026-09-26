@@ -237,7 +237,9 @@ class ResNetExtractor:
                 "ignore", message="Arguments other than a weight enum.*",
                 category=UserWarning)
             weights = _load_weights(models, cfg.model)
-            model = models.get_model(cfg.model, weights=weights)
+            # progress=False：GUI 下 stdout/stderr 可能是无效句柄，torchvision 下载权重时
+# 内置的 tqdm 进度条会直接抛 OSError(WinError 1 函数不正确)。关掉进度条即可避免。
+            model = models.get_model(cfg.model, weights=weights, progress=False)
         # fc 的输入维 == 全局池化特征维；移除分类头后前向即返回特征
         self.feature_dim = model.fc.in_features
         model.fc = nn.Identity()
