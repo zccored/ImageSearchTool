@@ -44,14 +44,33 @@ MAGIC = b"IHPC2"
 CACHE_DIRNAME = "prep_cache"
 _L2_MAX_BYTES = 256 * 1024 * 1024      # 内存缓存上限（张量 602KB/张）
 
+# 缓存条目编码：libdeflate-6（zlib 封装）取代 PNG。实测 256×256 载荷：
+#   写侧 1.01×（PIL 存 PNG 14.3ms → libdeflate 2.0ms，写侧大幅受益）、读侧 3.02×、体积 +8%。
+# 需要在"该用哪个编码"上保持确定性：进程启动时探测一次，探测结果进缓存签名，
+# 因此同一缓存目录不会混用两种格式（libdeflate 不可用时整体回退 PNG）。
+_CODEC = "ldf6"
+_CODEC_OK = [False]
+try:                                             # 探测一次（导入期，失败即回退 PNG）
+    from . import png_fast as _pf_probe
+    _CODEC_OK[0] = bool(_pf_probe.has_libdeflate())
+except Exception:                                # noqa: BLE001
+    _CODEC_OK[0] = False
+
 
 def default_cache_dir(prefix: str) -> str:
     """索引前缀 -> 缓存目录：<索引目录>/prep_cache。"""
     return os.path.join(os.path.dirname(os.path.abspath(prefix)), CACHE_DIRNAME)
 
 
-def _sig_of(model: str, pre_side: int) -> str:
-    raw = f"{model}|resize256|crop224|pre{pre_side}".encode("utf-8")
+def _sig_of(model: str, pre_side: int, norm_on_gpu: bool = False,
+            codec: str = "png1") -> str:
+    """预处理契约签名；归一化位置不同 -> 缓存内容与消费方式不同，必须区分。
+
+    codec 也进签名：缓存条目编码从 PNG 换成 libdeflate 后，旧缓存**自动失效**，
+    不会出现"按新格式读旧文件"的混用（用户选择：直接换，旧缓存重建）。
+    """
+    raw = f"{model}|resize256|crop224|pre{pre_side}|" \
+          f"{'normgpu' if norm_on_gpu else 'normcpu'}|{codec}".encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:12]
 
 
@@ -59,10 +78,15 @@ class PrepCache:
     """单文件/张的预处理缓存；线程安全，失败一律降级为“未命中”。"""
 
     def __init__(self, root: str, model: str = "", pre_side: int = 2048,
-                 enabled: bool = True, mem_bytes: int = _L2_MAX_BYTES):
+                 enabled: bool = True, mem_bytes: int = _L2_MAX_BYTES,
+                 norm_on_gpu: bool = False):
         self.root = root
         self.enabled = bool(enabled)
-        self.sig = _sig_of(model, pre_side)
+        # norm_on_gpu=True：缓存里存的是"仅 ToTensor（uint8/255）"的张量，
+        # 归一化由 GPU 侧完成 —— 存盘只需 round(t*255)，无需逆向归一化。
+        self.norm_on_gpu = bool(norm_on_gpu)
+        self.sig = _sig_of(model, pre_side, self.norm_on_gpu,
+                           _CODEC if _CODEC_OK[0] else "png1")
         self._mem_bytes = int(mem_bytes)
         self._mem: "OrderedDict[str, tuple]" = OrderedDict()
         self._mem_used = 0
@@ -139,13 +163,23 @@ class PrepCache:
         head = json.loads(blob[9:9 + hlen].decode("utf-8"))
         if head.get("sig") != self.sig:
             return None                          # 预处理契约变了 -> 未命中
-        img = Image.open(io.BytesIO(blob[9 + hlen:])).convert("RGB")
-        arr = np.asarray(img, dtype=np.uint8)
-        # 与 _make_fused_prep 一致：PIL 张量 = ToTensor + Normalize
-        t = torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1)
+        body = blob[9 + hlen:]
+        if head.get("codec", "png") == "ldf6":
+            from . import png_fast
+            shp = tuple(head.get("shape", (224, 224, 3)))
+            arr = np.empty(shp, dtype=np.uint8)
+            if not png_fast.ldf_decompress_into(body, arr):
+                return None
+        else:                                    # 旧格式（PNG）仍可读
+            img = Image.open(io.BytesIO(body)).convert("RGB")
+            arr = np.array(img, dtype=np.uint8)  # 拷一份可写数组（避免 torch 只读告警）
+        # 与 _make_fused_prep 一致：PIL 张量 = ToTensor [+ Normalize]
+        t = torch.from_numpy(arr).permute(2, 0, 1)
         t = t.float().div_(255.0)
-        t = t.sub_(torch.as_tensor(head["mean"]).view(3, 1, 1)).div_(
-            torch.as_tensor(head["std"]).view(3, 1, 1))
+        if not self.norm_on_gpu:
+            t = t.sub_(torch.as_tensor(head["mean"]).view(3, 1, 1)).div_(
+                torch.as_tensor(head["std"]).view(3, 1, 1))
+        # norm_on_gpu：保持"未归一化"，由 _forward 在 GPU 上做 (x-mean)/std
         fp = np.frombuffer(bytes.fromhex(head["fp_hex"]), dtype=np.uint8)
         hu = np.asarray(head["hu"], dtype=np.float32)
         rec = CoarseRecord(path=path, md5=head["md5"], hu=hu, fp=fp)
@@ -164,19 +198,21 @@ class PrepCache:
             import torch
             from PIL import Image
 
-            # (3,224,224) float32 -> uint8 RGB（逆向归一化，无损存 PNG）
-            # 注意：必须 **四舍五入**（round）而不是截断（byte() 会 floor），
-            # 否则浮点误差会让个别像素差 1 级，精排特征出现 ~5e-4 的余弦漂移。
+            # (3,224,224) float32 -> uint8 RGB（无损存 PNG）
+            # 两种模式：
+            #   norm_on_gpu：张量就是 uint8/255，直接 round(t*255)（逐位无损）；
+            #   否则：先逆向归一化 (t*std+mean)*255。注意必须 **四舍五入**，
+            #   截断（byte() 会 floor）会让像素差 1 级、精排余弦漂 ~5e-4。
             t = tensor.detach().cpu()
-            m = torch.as_tensor(mean).view(3, 1, 1)
-            s = torch.as_tensor(std).view(3, 1, 1)
-            img_arr = ((t * s + m) * 255.0).round_().clamp_(0, 255).to(
-                torch.uint8)
+            if self.norm_on_gpu:
+                img_arr = (t * 255.0).round_().clamp_(0, 255).to(torch.uint8)
+            else:
+                m = torch.as_tensor(mean).view(3, 1, 1)
+                s = torch.as_tensor(std).view(3, 1, 1)
+                img_arr = ((t * s + m) * 255.0).round_().clamp_(0, 255).to(
+                    torch.uint8)
             arr = img_arr.permute(1, 2, 0).numpy()
-            buf = io.BytesIO()
-            Image.fromarray(np.ascontiguousarray(arr)).save(
-                buf, format="PNG", compress_level=1)
-            png = buf.getvalue()
+            arr = np.ascontiguousarray(arr)
             head = {
                 "sig": self.sig, "md5": rec.md5 or "",
                 "hu": np.asarray(rec.hu, dtype=np.float32).tolist(),
@@ -184,8 +220,22 @@ class PrepCache:
                 "mean": np.asarray(mean, dtype=np.float32).tolist(),
                 "std": np.asarray(std, dtype=np.float32).tolist(),
             }
+            # 编码：默认 libdeflate-6（写侧与 PNG 持平/更快、读侧 3×、体积 +8%）；
+            # 不可用时逐条回退 PNG（格式写进 head.codec，读侧两种都能认）。
+            body = None
+            if _CODEC_OK[0]:
+                from . import png_fast
+                body = png_fast.ldf_compress(arr.tobytes(), 6)
+                if body is not None:
+                    head["codec"] = "ldf6"
+                    head["shape"] = list(arr.shape)
+            if body is None:
+                buf = io.BytesIO()
+                Image.fromarray(arr).save(buf, format="PNG", compress_level=1)
+                body = buf.getvalue()
+                head["codec"] = "png"
             hb = json.dumps(head, separators=(",", ":")).encode("utf-8")
-            blob = MAGIC + struct.pack("<I", len(hb)) + hb + png
+            blob = MAGIC + struct.pack("<I", len(hb)) + hb + body
             fp_path = self.file_of(key)
             os.makedirs(os.path.dirname(fp_path), exist_ok=True)
             tmp = fp_path + ".tmp"

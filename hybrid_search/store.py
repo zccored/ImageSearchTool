@@ -148,6 +148,21 @@ class IndexFiles:
 
     def _save_coarse_sidecar(self, paths, md5s, hu, fp, hu_mean, hu_std,
                              boxes) -> None:
+        try:
+            self._save_coarse_sidecar_inner(paths, md5s, hu, fp, hu_mean, hu_std,
+                                            boxes)
+        except PermissionError as e:
+            # Windows：上一轮索引被本进程 mmap 时 os.replace 会被拒（WinError 5）。
+            # 新建索引默认走侧车后，"同进程重建"就会踩到；此处降级为 npz 落盘，
+            # 索引内容仍正确（只是这一轮不是侧车格式，下次重建可再转侧车）。
+            from .io_utils import LOGGER
+            LOGGER.warning("侧车 .npy 落盘失败（%s），本次降级为 npz 写出: %r",
+                           os.path.basename(self.coarse_path), e)
+            self.save_coarse(paths, md5s, hu, fp, hu_mean, hu_std, boxes,
+                             sidecar=False)
+
+    def _save_coarse_sidecar_inner(self, paths, md5s, hu, fp, hu_mean, hu_std,
+                                   boxes) -> None:
         _atomic_npy(self.side("paths"), np.array(paths, dtype=object))
         _atomic_npy(self.side("md5s"), np.array(md5s, dtype=object))
         for name, arr, dt in (("hu", hu, np.float32), ("fp", fp, np.uint8)):
