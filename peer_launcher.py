@@ -41,7 +41,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 
 # 全栈图库管理器绝对位置（可用环境变量 IMG_PEER_DIR 覆盖——换机/迁移时用）
 PEER_DIR = os.environ.get("IMG_PEER_DIR") or \
-    r"D:\code\新的代码\全栈图库管理器 v3.2bata"
+    r"."
 PEER_MAIN = os.path.join(PEER_DIR, "main.py")
 PEER_NAME = "main.py"
 
