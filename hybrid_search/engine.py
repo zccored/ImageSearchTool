@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
 # ImageSearchTool · 图库检索管理器 — 混合检索引擎：融合建库（单遍解码）+ 两级漏斗检索 + 索引生命周期
 # Copyright (C) 2026 zccored
@@ -27,6 +27,8 @@ _open 时做 O(N) 逐位校验，防止历史损坏导致按行取特征错位�
 from __future__ import annotations
 
 import os
+import threading
+
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -95,9 +97,22 @@ class HybridEngine:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         # 让解码层跟随配置的 PNG 解码器（cv2 全尺寸 / pillow）
-        from .io_utils import (set_big_decode_limit, set_png_decoder,
-                               silence_png_noise)
+        from .io_utils import (set_big_decode_limit, set_cv2_rgb_direct,
+                               set_png_decoder, silence_png_noise)
         set_png_decoder(getattr(cfg, "png_decoder", "cv2"))
+        set_cv2_rgb_direct(getattr(cfg, "cv2_rgb_direct", True))
+        if getattr(cfg, "png_decoder", "cv2") == "libdeflate":
+            try:                             # 让使用者一眼看到旁路是否真的生效
+                from . import png_fast as _pf
+                LOGGER.info("PNG 解码器：libdeflate 旁路（%s）", _pf.describe())
+            except Exception:                # noqa: BLE001
+                pass
+            # libdeflate 路径的每线程 scratch 上限（内存与复用的折中，见 png_fast.py）
+            try:
+                from . import png_fast
+                png_fast.set_scratch_cap_mb(getattr(cfg, "png_fast_scratch_mb", 32.0))
+            except Exception as e:                 # noqa: BLE001
+                LOGGER.debug("png_fast 初始化失败（将回退 cv2）: %r", e)
         if getattr(cfg, "silence_png_warnings", True):
             silence_png_noise(True)      # 屏蔽 libpng iCCP/cHRM stderr 噪音
         set_big_decode_limit(getattr(cfg, "big_decode_conc", 16))
@@ -265,7 +280,8 @@ class HybridEngine:
         cache = getattr(self, "_prep_cache", None)
         if cache is None or cache.root != root or not cache.enabled:
             cache = PrepCache(root, model=self.cfg.model,
-                              pre_side=_PRE_DOWNSCALE_SIDE)
+                              pre_side=_PRE_DOWNSCALE_SIDE,
+                              norm_on_gpu=getattr(self.cfg, "norm_on_gpu", True))
         set_prep_cache(cache)               # 让 build-fine / 查询路径也能命中
         return cache
 
@@ -296,7 +312,14 @@ class HybridEngine:
         期间 CPU 解码与 GPU 前向双缓冲并行，硬件不空等。
         """
         ex = self._get_extractor()
-        prep = self._make_fused_prep(ex, frame_sink)
+        # 内容去重预过滤：同内容文件只处理第一张（其余跳过解码+指纹+预处理；
+        # 与“照常处理后被 add_results 按 md5 丢弃”结果等价，索引内容不变）
+        if self.cfg.dedup and getattr(self.cfg, "dedup_prefilter", True):
+            _seen, _seen_lock = set(), threading.Lock()
+        else:
+            _seen, _seen_lock = None, None
+        prep = self._make_fused_prep(ex, frame_sink, seen=_seen,
+                                     seen_lock=_seen_lock)
 
         def on_batch(ok_paths, tensors, payloads):
             # 1) 粗筛特征入库（结果顺序 = 追加顺序）
@@ -319,7 +342,8 @@ class HybridEngine:
         return ex.stream_decode(paths, prep=prep, progress=progress,
                                 on_batch=on_batch)
 
-    def _make_fused_prep(self, ex, frame_sink=None):
+    def _make_fused_prep(self, ex, frame_sink=None, seen=None,
+                         seen_lock=None):
         """
         融合解码工作项：一次读盘 + 一次解码，产出 ResNet 张量与粗筛特征。
         返回 prep(path) -> (tensor|None, CoarseRecord|None)。
@@ -349,6 +373,13 @@ class HybridEngine:
             if data is None:
                 return None, None
             try:
+                # 内容去重预过滤：整文件 md5 提前算（本来也要算，只是挪到解码前），
+                # 同内容文件已成功入库过就直接返回，省掉解码+指纹+预处理整段。
+                md5 = hashlib.md5(data).hexdigest() if cfg.dedup else ""
+                if seen is not None and md5:
+                    with seen_lock:
+                        if md5 in seen:
+                            return None, None
                 rgb = decode_rgb(data)
                 if rgb is None:
                     return None, None
@@ -364,7 +395,6 @@ class HybridEngine:
                         interpolation=cv2.INTER_AREA)
                 gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
                 binary, hu, fp = extract_binary_features(gray, cfg)
-                md5 = hashlib.md5(data).hexdigest() if cfg.dedup else ""
                 if frame_sink is not None:
                     try:
                         frame_sink(path, binary, "coarse")
@@ -383,6 +413,9 @@ class HybridEngine:
                 if tensor is None:
                     return None, None
                 rec = CoarseRecord(path=path, md5=md5, hu=hu, fp=fp)
+                if seen is not None and md5:
+                    with seen_lock:
+                        seen.add(md5)        # 成功产出后才登记，失败不污染
                 if cache is not None:
                     cache.put(path, tensor, rec, ex._mean, ex._std)
                 return tensor, rec

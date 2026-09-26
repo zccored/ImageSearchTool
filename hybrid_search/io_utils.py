@@ -377,14 +377,14 @@ def _decode_opencv(data: bytes, gray: bool,
     fmt, (w, h), _orient = probe
     if fmt not in ("JPEG", "WEBP"):
         return None                     # 其他格式交给专用/兜底路径
-    flag = _reduced_flag(w, h, gray)
+    flag, swap = _flag_maybe_rgb(_reduced_flag(w, h, gray), gray)
     try:
         arr = cv2.imdecode(np.frombuffer(data, np.uint8), flag)
     except Exception:  # noqa: BLE001 —— 解码异常走兜底
         return None
     if arr is None:
         return None
-    if not gray:
+    if swap:
         arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
     return arr
 
@@ -393,14 +393,45 @@ def _decode_opencv(data: bytes, gray: bool,
 # 代价：个别坏 iCCP 文件的 libpng 警告会出现在 stderr）/ 'pillow'（安静、慢）
 _PNG_DECODER = "cv2"
 
+# cv2 直出 RGB（IMREAD_COLOR_RGB，OpenCV ≥4.5.5）：省掉一次「全图 BGR→RGB 拷贝」。
+# 实测 40 张真实 PNG（均 4.06 MB）：99.9 ms/张 → 89.7 ms/张（-10.2%），逐位一致。
+# 注意：OpenCV 只为非缩放档提供 *_RGB 常量（REDUCED_* 没有 RGB 变体），
+# 因此域缩放档仍走 BGR + cvtColor。置 False 即回退旧行为（对照/排错用）。
+_CV2_RGB_DIRECT = True
+_RGB_FLAG = getattr(cv2, "IMREAD_COLOR_RGB", None)
+
+
+def set_cv2_rgb_direct(enabled: bool) -> None:
+    """全局开关：cv2 解码是否直出 RGB（True=默认，省一次全图换通道拷贝）。"""
+    global _CV2_RGB_DIRECT
+    _CV2_RGB_DIRECT = bool(enabled)
+
+
+def _flag_maybe_rgb(flag: int, gray: bool) -> Tuple[int, bool]:
+    """未域缩放的彩色档改用 IMREAD_COLOR_RGB，返回 (实际 flag, 是否仍需手工换通道)。"""
+    if (not gray) and _CV2_RGB_DIRECT and _RGB_FLAG is not None \
+            and flag == cv2.IMREAD_COLOR:
+        return _RGB_FLAG, False
+    return flag, (not gray)
+
 
 def set_png_decoder(mode: str, silence_noise: Optional[bool] = None) -> None:
     """全局切换 PNG 解码器（由 Config.png_decoder 驱动，运行时生效）。
 
+    mode:
+      "cv2"         OpenCV 捆绑 libpng（默认）
+      "pillow"      Pillow 自带 PNG 解码器（安静但实测慢 0.70~0.74×）
+      "imagecodecs" imagecodecs 的 libpng 1.6.58 + zlib-ng（实测大 PNG 快 21%、
+                    小 PNG 快 11%，输出与 cv2 路径逐位一致；未安装则自动回退 cv2）
+      "libdeflate"  libdeflate 解 IDAT + 原生（Cython/MinGW）反滤波，直出紧凑 RGB。
+                    实测 inflate 1526 MB/s vs cv2 全解码 365 MB/s（docs/perf-plan.md 第五节）；
+                    只覆盖 8bit 非交错 RGB/RGBA，其余自动回退 cv2；缺少原生模块或
+                    libdeflate.dll 时也回退（见 hybrid_search/png_fast.py）
+
     silence_noise：是否同时屏蔽 libpng 的 iCCP/cHRM stderr 噪音（不影响解码结果）。
     """
     global _PNG_DECODER
-    if mode in ("cv2", "pillow"):
+    if mode in ("cv2", "pillow", "imagecodecs", "libdeflate"):
         _PNG_DECODER = mode
     if silence_noise is None:
         silence_noise = _PNG_DECODER == "cv2"    # cv2/libpng 才有噪音
@@ -412,6 +443,8 @@ def _decode_png_cv2(data: bytes, gray: bool,
                     probe: Tuple[str, Tuple[int, int], int]) -> Optional[np.ndarray]:
     """
     PNG -> OpenCV/libpng 全尺寸解码（无域缩放收益，故不解 reduced）。
+    彩色档直出 RGB（IMREAD_COLOR_RGB，省掉一次全图 BGR→RGB 拷贝；
+    实测 40 张真实 PNG 快 10.2%，逐位一致），不可用时回退 BGR + cvtColor。
     输出与 Pillow 全尺寸语义一致（无色彩管理、原像素）。
     大图（>12M 像素）与 Pillow 路径一样受信号量钳制并发。
     失败/异常返回 None 交给 Pillow 兜底。
@@ -419,7 +452,8 @@ def _decode_png_cv2(data: bytes, gray: bool,
     w, h, orient = probe[1][0], probe[1][1], probe[2]
     if orient != 1:
         return None                     # 带 EXIF 方向交给 Pillow exif_transpose
-    flag = cv2.IMREAD_GRAYSCALE if gray else cv2.IMREAD_COLOR
+    flag, swap = _flag_maybe_rgb(cv2.IMREAD_GRAYSCALE if gray else cv2.IMREAD_COLOR,
+                                 gray)
     try:
         if w * h > _BIG_IMAGE_PX:
             _big_decode_enter()
@@ -433,9 +467,105 @@ def _decode_png_cv2(data: bytes, gray: bool,
         return None
     if arr is None:
         return None
-    if not gray:
+    if swap:
         arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
     return arr
+
+
+def _ic_to_rgb8(a: np.ndarray) -> np.ndarray:
+    """imagecodecs 原生输出 -> cv2 语义的 RGB uint8（丢 alpha、16bit 取高 8 位、灰度铺 3 通道）。"""
+    if a.dtype == np.uint16:
+        a = (a >> 8).astype(np.uint8)
+    elif a.dtype != np.uint8:
+        a = a.astype(np.uint8)
+    if a.ndim == 2:
+        a = np.repeat(a[:, :, None], 3, axis=2)
+    elif a.ndim == 3 and a.shape[2] == 4:
+        a = a[:, :, :3]
+    elif a.ndim == 3 and a.shape[2] == 2:            # 灰度 + alpha
+        a = np.repeat(a[:, :, :1], 3, axis=2)
+    return np.ascontiguousarray(a)
+
+
+# imagecodecs 可用性（只探测一次；缺库时自动回退 cv2，不影响建库）
+_IC_STATE = {"mod": None, "checked": False, "warned": False}
+
+
+def _imagecodecs_png(data: bytes):
+    """imagecodecs.png_decode（libpng + zlib-ng）；不可用返回 None。"""
+    if not _IC_STATE["checked"]:
+        _IC_STATE["checked"] = True
+        try:
+            import imagecodecs
+            _IC_STATE["mod"] = imagecodecs
+            LOGGER.info("PNG 解码：imagecodecs %s（libpng %s / zlib-ng %s）",
+                        getattr(imagecodecs, "__version__", "?"),
+                        imagecodecs.png_version().split()[-1],
+                        imagecodecs.zlibng_version().split()[-1])
+        except Exception as e:                       # noqa: BLE001
+            LOGGER.warning("imagecodecs 不可用（已回退 cv2）: %r", e)
+    mod = _IC_STATE["mod"]
+    if mod is None:
+        if not _IC_STATE["warned"]:
+            _IC_STATE["warned"] = True
+            LOGGER.warning("png_decoder=imagecodecs 但未安装 imagecodecs，本次回退 cv2")
+        return None
+    try:
+        return mod.png_decode(data)
+    except Exception as e:                           # noqa: BLE001 —— 单张失败回退 cv2
+        LOGGER.debug("imagecodecs PNG 解码失败（回退 cv2）: %r", e)
+        return None
+
+
+def _decode_png_imagecodecs(data: bytes, gray: bool) -> Optional[np.ndarray]:
+    """PNG -> imagecodecs/libpng(+zlib-ng)。
+
+    **只用于彩色（RGB）路径**：实测 RGB 输出与 cv2 路径逐位一致
+    （含 8bit/RGBA/灰度+alpha/调色板/16bit/隔行，见 devtools/verify_png_decoder.py）。
+
+    灰度不走这里：cv2 的 IMREAD_GRAYSCALE 走 libpng 自己的 rgb→gray 定点转换，
+    与 cvtColor 的舍入在彩色图上会差 ±1 级（实测 RGB 差 0、灰度差 1）；而建库主
+    路径（融合建库/瓦片）的灰度是由**已解码 RGB** 再 cvtColor 得到，所以只要 RGB
+    逐位一致，指纹/Hu/ResNet 输入就完全一致，无需重建索引。返回 None 表示回退 cv2。
+    """
+    if gray:
+        return None
+    arr = _imagecodecs_png(data)
+    if arr is None:
+        return None
+    return _ic_to_rgb8(arr)
+
+
+def _decode_png_libdeflate(data: bytes, gray: bool,
+                           probe: Tuple[str, Tuple[int, int], int]) -> Optional[np.ndarray]:
+    """PNG -> libdeflate inflate + 原生反滤波（直出紧凑 RGB）。
+
+    **只用于彩色（RGB）路径**：灰度保持 cv2（cv2 的 IMREAD_GRAYSCALE 走 libpng 自己的
+    rgb→gray 定点转换，与 cvtColor 舍入可差 ±1 级；而建库主路径的灰度是对已解码 RGB
+    再 cvtColor，所以只要 RGB 逐位一致即安全）。
+
+    覆盖 8bit 非交错 RGB/RGBA；调色板/16bit/灰度/隔行/带 tRNS 的 RGB 返回 None → 回退 cv2。
+    逐位一致性验证：devtools/verify_png_fast.py（大样本 + 格式矩阵）。
+    """
+    if gray:
+        return None
+    w, h, orient = probe[1][0], probe[1][1], probe[2]
+    if orient != 1:
+        return None                     # 带 EXIF 方向交给 Pillow exif_transpose
+    try:
+        from . import png_fast
+    except Exception as e:                          # noqa: BLE001
+        LOGGER.debug("png_fast 不可用（回退 cv2）: %r", e)
+        return None
+    if not png_fast.available():
+        return None
+    if w * h > _BIG_IMAGE_PX:                       # 与 cv2 路径同样的并发钳制
+        _big_decode_enter()
+        try:
+            return png_fast.decode_rgb(data)
+        finally:
+            _big_decode_exit()
+    return png_fast.decode_rgb(data)
 
 
 def decode_gray(data: bytes) -> Optional[np.ndarray]:
@@ -451,7 +581,9 @@ def decode_gray(data: bytes) -> Optional[np.ndarray]:
         LOGGER.debug("超大图跳过: %dx%d 像素超过上限", w, h)
         return None
     if fmt == "PNG":
-        if _PNG_DECODER == "cv2":
+        if _PNG_DECODER in ("imagecodecs", "libdeflate", "cv2"):
+            # imagecodecs/libdeflate 模式也走 cv2 解灰度：与 cvtColor 的舍入可能差 ±1 级，
+            # 而灰度路径只服务非融合的老路径，不值得为它冒索引漂移的风险
             arr = _decode_png_cv2(data, gray=True, probe=probe)
             if arr is not None:
                 return arr
@@ -475,7 +607,21 @@ def decode_rgb(data: bytes) -> Optional[np.ndarray]:
         LOGGER.debug("超大图跳过: %dx%d 像素超过上限", w, h)
         return None
     if fmt == "PNG":
-        if _PNG_DECODER == "cv2":
+        if _PNG_DECODER == "libdeflate":
+            arr = _decode_png_libdeflate(data, gray=False, probe=probe)
+            if arr is not None:
+                return arr
+            arr = _decode_png_cv2(data, gray=False, probe=probe)   # 回退
+            if arr is not None:
+                return arr
+        elif _PNG_DECODER == "imagecodecs":
+            arr = _decode_png_imagecodecs(data, gray=False)
+            if arr is not None:
+                return arr
+            arr = _decode_png_cv2(data, gray=False, probe=probe)
+            if arr is not None:
+                return arr
+        elif _PNG_DECODER == "cv2":
             arr = _decode_png_cv2(data, gray=False, probe=probe)
             if arr is not None:
                 return arr
