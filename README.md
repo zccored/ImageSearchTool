@@ -34,16 +34,16 @@
 ## 性能速览（本机实测）
 
 > 测试机：14 核 20 线程 / 16GB 内存 / RTX 4060 Laptop / TiPlus7100 SSD。
-> 真实图库 `F:\视频`：**39,854 个图片文件 → 整图索引 37,683 张 + 瓦片索引 444,252 块**
+> 真实图库 `<图库根目录>`：**约 4 万 个图片文件 → 整图索引 约 3.8 万 张 + 瓦片索引 约 44.4 万 块**
 > （同内容多副本按 MD5 去重，故入库数少于文件数），索引为侧车 `.npy` 格式。
 
 | 场景 | 实测结果 |
 | :--- | :--- |
-| **整图全量建库（37,683 张）** | **543 s → 69.4 张/秒**（CPU 12.7 核，单遍解码出粗筛+ResNet） |
-| **瓦片全量建库（39,854 张 → 444,252 块）** | **1843.5 s → 21.7 张/秒 · 241 块/秒**（CPU 7.5 核 / GPU 均值 26% / 写盘 1.17 s） |
-| 整图索引加载（37,683 张） | **0.09 s** |
-| 整图检索（库 37,683 张，热态） | **125 ms / 次**（中位数；首查含模型加载 2.8 s） |
-| 瓦片索引加载（444,252 块） | **0.71 s** |
+| **整图全量建库（约 3.8 万 张）** | **543 s → 69.4 张/秒**（CPU 12.7 核，单遍解码出粗筛+ResNet） |
+| **瓦片全量建库（约 4 万 张 → 约 44.4 万 块）** | **1843.5 s → 21.7 张/秒 · 241 块/秒**（CPU 7.5 核 / GPU 均值 26% / 写盘 1.17 s） |
+| 整图索引加载（约 3.8 万 张） | **0.09 s** |
+| 整图检索（库 约 3.8 万 张，热态） | **125 ms / 次**（中位数；首查含模型加载 2.8 s） |
+| 瓦片索引加载（约 44.4 万 块） | **0.71 s** |
 | 局部（瓦片）检索（444k 块） | **2.2 s 首查**（含模型加载 + LSH 建表 ~1.9 s）→ 引擎常驻后 **~1 s / 次** |
 | 局部命中精度（靶子＝整图横切 24%） | Top1 命中原图，**余弦 0.9987**，命中框 (1045,384)-(1557,896) |
 | 重复图查验（42,414 张，阈值 2%） | **89 s** → 6,899 组 / 23,906 张 / 可释放 **72.9 GB** |
@@ -59,8 +59,8 @@
 > 已知的命中框坐标系偏差见「已知问题」。
 
 复现命令：`python devtools/bench_real_index.py`、`python main.py bench <目录> --limit 400`、
-`python devtools/dedup_scan_real.py F:\视频`、`python devtools/verify_thumb_perf.py`、
-`python devtools/verify_tile_index.py "F:\视频\.gallery_index\gallery_tiles" --root F:\视频`。
+`python devtools/dedup_scan_real.py <图库根目录>`、`python devtools/verify_thumb_perf.py`、
+`python devtools/verify_tile_index.py "<图库根目录>\.gallery_index\gallery_tiles" --root <图库根目录>`。
 
 ## 性能图：本机实测报告（整页渲染 + 原始 HTML/JSON）
 
@@ -69,22 +69,20 @@
 按 GitHub 正文宽度 1012px 出图，1:1 显示）；点链接可看原始 HTML 与逐 0.4s 采样 JSON。
 GitHub 不执行 HTML，**想在线看可交互渲染版**用 raw.githack 链接。
 
-### ① 瓦片索引全量建库 · 444,252 块（2026-09-12）
+### ① 瓦片索引全量建库 · 约 44.4 万 块（2026-09-12）
 
-![瓦片索引全量建库性能图](docs/perf/tiles_full_build_20260912.png)
 
 - [原始 HTML](docs/perf/tiles_full_build_20260912.html) ·
   [原始采样 JSON](docs/perf/tiles_full_build_20260912.json) ·
   [在线渲染版](https://raw.githack.com/zccored/ImageSearchTool/main/docs/perf/tiles_full_build_20260912.html)
-- 场景：`F:\视频` 39,854 张 → 444,252 块；提取阶段 1839.7 s + 写盘 1.2 s（共 1843.5 s）。
+- 场景：`<图库根目录>` 约 4 万 张 → 约 44.4 万 块；提取阶段 1839.7 s + 写盘 1.2 s（共 1843.5 s）。
 - 读数：CPU 均值 **7.5 核**（P90 10.3）、GPU 均值 **26%**（≥75% 的采样仅 1%）、
   读盘均值 **74 MB/s**（NVMe 远远未饱和）、RSS 峰值 4.4 GB/16 GB。
 - 结论：**CPU 供给受限（解码占大头），不是 IO/GPU 瓶颈**；逐 10% 分段时间
   17.5→28.2 张/秒，**无长尾衰减**，<3 核的"空窗"采样仅 0.2%。
 
-### ② 整图索引全量建库 · 37,683 张（2026-09-12）
+### ② 整图索引全量建库 · 约 3.8 万 张（2026-09-12）
 
-![整图索引全量建库性能图](docs/perf/full_build_20260912.png)
 
 - [原始 HTML](docs/perf/full_build_20260912.html) ·
   [原始采样 JSON](docs/perf/full_build_20260912.json) ·
@@ -93,7 +91,6 @@ GitHub 不执行 HTML，**想在线看可交互渲染版**用 raw.githack 链接
 
 ### ③ 瓦片建库基准（无界面 · 优化前后对照，2026-09-09）
 
-![瓦片建库基准性能图](docs/perf/tiles_benchmark_20260909.png)
 
 - [原始 HTML](docs/perf/tiles_benchmark_20260909.html) ·
   [在线渲染版](https://raw.githack.com/zccored/ImageSearchTool/main/docs/perf/tiles_benchmark_20260909.html)
@@ -217,13 +214,13 @@ PNG 无法域缩放、大 JPEG 熵解码占主导），**不是显存或 IO 调�
 - 新格式（侧车）：大数组拆成可 mmap 的 `.npy`
   （`paths/md5s/hu/fp/boxes/hu_stats/fine/fine_paths`），meta 里标记
   `"storage": "sidecar"`。实测：**444,189 块瓦片库打开 0.71 s（4.4×）、常驻内存
-  +76 MB（省 1.1 GB）；37,683 张整图库打开 0.09 s**，检索结果完全一致；
+  +76 MB（省 1.1 GB）；约 3.8 万 张整图库打开 0.09 s**，检索结果完全一致；
   读取异常或行数不符时自动回退旧 npz。
 - 就地转换已有索引：
 
 ```bat
-python main.py compact --prefix "F:\视频\.gallery_index\gallery_tiles"
-python main.py compact --prefix "F:\视频\.gallery_index\gallery"        :: 幂等
+python main.py compact --prefix "<图库根目录>\.gallery_index\gallery_tiles"
+python main.py compact --prefix "<图库根目录>\.gallery_index\gallery"        :: 幂等
 python main.py compact --prefix <前缀> --delete-legacy                 :: 顺手删旧 npz
 ```
 
@@ -240,12 +237,12 @@ python main.py compact --prefix <前缀> --delete-legacy                 :: 顺�
 
 ```bat
 :: 建瓦片索引（与整图索引并存于 .gallery_index 下）
-python main.py build-tiles "F:\视频" --prefix "F:\视频\.gallery_index\gallery_tiles"
-python main.py add-tiles   "F:\视频" --prefix "F:\视频\.gallery_index\gallery_tiles"
+python main.py build-tiles "<图库根目录>" --prefix "<图库根目录>\.gallery_index\gallery_tiles"
+python main.py add-tiles   "<图库根目录>" --prefix "<图库根目录>\.gallery_index\gallery_tiles"
 
 :: 检索：tiles=只搜瓦片；hybrid=整图+瓦片并搜（按原图去重、取两路较高分，返回 ≤20 条）
-python main.py search "局部截图.png" --mode tiles  --tiles-prefix "F:\视频\.gallery_index\gallery_tiles"
-python main.py search "局部截图.png" --mode hybrid --prefix "F:\视频\.gallery_index\gallery"
+python main.py search "局部截图.png" --mode tiles  --tiles-prefix "<图库根目录>\.gallery_index\gallery_tiles"
+python main.py search "局部截图.png" --mode hybrid --prefix "<图库根目录>\.gallery_index\gallery"
 ```
 
 GUI 里等价操作为工具栏 **④ 子图索引(512 切块·建/增量)**，检索页有
@@ -263,9 +260,9 @@ GUI 里等价操作为工具栏 **④ 子图索引(512 切块·建/增量)**，�
   > → 这类图（本图库实测占 **53.2%**）的红框会按 1/2 或 1/4 偏位；长边 ≤2560
   > 的图不受影响。**检索本身不受影响**（查询图走同一条解码路径，尺度一致）。
   > 自检脚本：`devtools/verify_tile_index.py`，详见「已知问题」。
-- **性能**（444,252 块瓦片库、RTX 4060 Laptop）：索引加载 **0.71 s**；首个查询含
+- **性能**（约 44.4 万 块瓦片库、RTX 4060 Laptop）：索引加载 **0.71 s**；首个查询含
   ResNet 模型加载 + LSH 建表（~1.9 s）合计 **2.2 s**，引擎常驻后 **~1 s / 次**；
-  全量建库 39,854 张 → 444,252 块耗时 **1843.5 s（21.7 张/秒 · 241 块/秒）**；
+  全量建库 约 4 万 张 → 约 44.4 万 块耗时 **1843.5 s（21.7 张/秒 · 241 块/秒）**；
   靶子用例（整图横切 ~24% 高度）Top1 命中原图、余弦 **0.9987**、
   命中框 (1045,384)-(1557,896)。
 
@@ -281,9 +278,9 @@ GUI 里等价操作为工具栏 **④ 子图索引(512 切块·建/增量)**，�
 
 速度来自复用索引：已入库图片的 MD5/指纹/特征直接从索引读（不重新解码），
 只有未入库文件才读盘解码；条带（band）阻塞 + 汉明复核把比对从 O(N²) 降到
-近线性。实测 F:\视频（42,414 张，2% 阈值）：**89s 出结果，6,899 组 / 23,906 张 /
+近线性。实测 <图库根目录>（42,414 张，2% 阈值）：**89s 出结果，6,899 组 / 23,906 张 /
 可释放 72.9GB**，峰值内存 115MB。命令行只读版：
-`python devtools/dedup_scan_real.py F:\视频`。
+`python devtools/dedup_scan_real.py <图库根目录>`。
 
 审查窗口（每组第一张为默认“保留候选”：像素最多 → 体积最大 → 最新）：
 
@@ -337,10 +334,10 @@ GUI 里等价操作为工具栏 **④ 子图索引(512 切块·建/增量)**，�
 做一次小样本融合建库并采样 CPU/GPU 时间轴，最后生成 HTML“图纸报告”：
 
 ```bat
-python perfscope.py F:\视频                 :: 全流程（扫描档案缓存后可秒复用）
-python perfscope.py F:\视频 --scan-only     :: 只做档案分布
-python perfscope.py F:\视频 --no-fused      :: 跳过 GPU 时间轴
-python perfscope.py F:\视频 --rescan        :: 强制重扫（忽略缓存）
+python perfscope.py <图库根目录>                 :: 全流程（扫描档案缓存后可秒复用）
+python perfscope.py <图库根目录> --scan-only     :: 只做档案分布
+python perfscope.py <图库根目录> --no-fused      :: 跳过 GPU 时间轴
+python perfscope.py <图库根目录> --rescan        :: 强制重扫（忽略缓存）
 ```
 
 报告含：真实格式/分辨率档/大小档/解码档位分布、按(格式×分辨率档)的实测解码
@@ -363,7 +360,7 @@ img_server（下载方）完成下载与哈希校验后，在其 UI 按按钮：
   - GUI 自动模式：`python gui.py --auto-handoff <request.json>`
   - CLI 无界面模式：`python main.py ingest <request.json>`
 - **图库根自动定位**：请求 roots 是图库根下的子目录（如新下载批落在
-  `F:\视频\<子图集>`）时，自动沿祖先目录向上找到含 `.gallery_index` 的
+  `<图库根目录>\<子图集>`）时，自动沿祖先目录向上找到含 `.gallery_index` 的
   图库根，把新图增量并入既有索引，不会在子目录里另建一套；
   `prefix` 留空即启用该行为（详见 `docs/HANDOFF_PROTOCOL.md` §4.5）。
 - 无参启动 GUI/CLI 行为与平时完全一致（不影响正常打开与处理流程）。
@@ -372,7 +369,7 @@ img_server（下载方）完成下载与哈希校验后，在其 UI 按按钮：
 
 工具栏第 4 行的 **“⇄ 切换启动：全栈图库管理器”** 按钮用于与本管理器
 互切：img_server 侧按钮是“关全栈管理器 → 打开本管理器”，本按钮是反向的
-“关本管理器 → 打开 `D:\code\新的代码\全栈图库管理器 v3.2bata\main.py`”。
+“关本管理器 → 打开 `.\main.py`”。
 
 激活门槛（任一不满足 → 按钮禁用，旁边给出原因）：
 1. **建库/检索等后台任务运行中**（busy）→ 禁用，任务结束自动恢复；
@@ -653,7 +650,7 @@ image-search/
 
 ## 九、已知问题与改进项（2026-09-12 索引核查发现）
 
-用 `devtools/verify_tile_index.py` 对刚建好的 444,252 块瓦片库做自检：**索引本身可用**
+用 `devtools/verify_tile_index.py` 对刚建好的 约 44.4 万 块瓦片库做自检：**索引本身可用**
 （各 `.npy` 行数一致、块 md5 全部唯一、精排 L2 范数 1.000000、抽 12 张重算
 `md5(文件字节+框)` 全部吻合、端到端检索正常），同时查出下面几条：
 
@@ -661,7 +658,7 @@ image-search/
 
 - 现象：长边 >2560 的图，库内命中框存的是**解码域缩放后的坐标**，而 GUI 用文件名义
   尺寸换算 → 红框位置和大小按 1/2（或 1/4）偏位；本图库实测 **53.2%** 的图落在该区间。
-- 铁证：`F:\视频\Aak\2022-04-17 モモカちゃん~\2.jpg` 名义 3602×2103，实际解出
+- 铁证：`<图库根目录>\Aak\2022-04-17 モモカちゃん~\2.jpg` 名义 3602×2103，实际解出
   1801×1052（1/2），库内首块框 `(1289,0,1801,512)` —— 上界正好等于"解出宽度" 1801。
 - 归因：`io_utils._reduced_flag()` 的域缩放早于瓦片功能存在，`tiles_of_rgb()` 只看到
   缩小后的数组，docstring 里"坐标始终为原图像素"对这类图不成立；瓦片热路径自
@@ -684,7 +681,7 @@ image-search/
 - `_tile_md5(data, box)` = `md5(整份文件字节 + 框)`：一张图 11.79 块就要把同一份字节
   哈希 11.79 次，还附送一次整块拷贝。
 - 实测：`md5(6.45 MB + 框)` = **8.63 ms**；按图库平均 3.42 MB 折算 ≈ 4.6 ms/块 →
-  444,252 块 ≈ **2,040 核·秒 ≈ 1.1 核跑满全程 ≈ 提取阶段的 15%**，也是 RSS 在
+  约 44.4 万 块 ≈ **2,040 核·秒 ≈ 1.1 核跑满全程 ≈ 提取阶段的 15%**，也是 RSS 在
   1.5–2.4 GB 之间抖动的原因之一。
 - 修法：每图只算一次 `md5(data)`，块标识改 `md5(file_md5 + 框)`（会改变库内取值，
   需与索引一起重建）；顺带可在解码前按文件 MD5 预过滤重复副本（本库 2,169 张，
@@ -709,7 +706,7 @@ image-search/
   转发**（回归验证：51 行噪音被吞、1 行真实告警透出），`--no-silence-png` 可关。
 - **阶段边界事件（save/done）**：整图/瓦片建库在"特征提取完成 → 写盘 → 全部完成"分别
   上报，GUI 状态与性能图不再误判成"ResNet 还没跑完就出性能图"。
-- **瓦片索引全量重建实测**：39,854 张 → 444,252 块，**1843.5 s（21.7 张/秒 · 241 块/秒）**，
+- **瓦片索引全量重建实测**：约 4 万 张 → 约 44.4 万 块，**1843.5 s（21.7 张/秒 · 241 块/秒）**，
   CPU 7.5 核 / GPU 均值 26% / 写盘 1.17 s；报告与整页截图收录进 `docs/perf/`
   并在 README 中渲染。
 - **新增 `devtools/verify_tile_index.py`**：瓦片索引体检（行数/范数/框合法性/内容复核/
@@ -729,13 +726,13 @@ image-search/
   命中框回传；GUI 三种检索模式。444,189 块库：加载 0.71 s、首查 2.7 s、之后
   ~1 s/次；靶子用例 Top1 余弦 0.9987。
 - **侧车 `.npy` 快载格式**：npz 成员无法 mmap（444k 瓦片库打开 3.1 s / 常驻 +1.18 GB），
-  改为并列 `.npy` 后 **0.71 s / +76 MB**（37,683 张整图库 0.09 s）；`compact` 命令与
+  改为并列 `.npy` 后 **0.71 s / +76 MB**（约 3.8 万 张整图库 0.09 s）；`compact` 命令与
   GUI「优化索引存储」可就地转换，读取异常自动回退 npz。
 - **阶段性能画像 `perfwatch.py`**：建库/搜图可选导出 HTML+JSON（CPU/GPU/内存/磁盘时间轴、
   阶段打点、参数快照），工具栏「最近性能图」一键打开。
 - **重复图查验**：MD5 完全重复 + 指纹汉明近似重复（条带阻塞，O(N²)→近线性）；
   审查窗口分组展示、复选框、一键选中「MD5 相同且未入库」、回收站删除/移动、
-  索引同步剔除。实测 F:\视频 42,414 张：**89 s** 出结果，6,899 组 / 23,906 张 /
+  索引同步剔除。实测 <图库根目录> 42,414 张：**89 s** 出结果，6,899 组 / 23,906 张 /
   可释放 **72.9 GB**。
 - **大图对比预览**：双击行打开左右双图对比窗，独立缩放、拖动投放、小图栏复选框联动、
   F11 全屏、Esc 退出；分层采样 + 交互快速/停手精修，24 MP 图稳态缩放
