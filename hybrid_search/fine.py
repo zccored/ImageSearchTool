@@ -251,7 +251,9 @@ class ResNetExtractor:
             cudnn.benchmark = True      # 固定输入尺寸下自动挑最快卷积内核
         if self.use_fp16:
             LOGGER.info("精排：已启用 FP16（autocast）")
-        self.batch = cfg.batch if cfg.batch > 0 else (64 if self.device == "cuda" else 16)
+        # 自动批大小：CUDA 取 256（实测最优点——批越大解码线程池越吃饱；
+        # cuda:64 时 600 张 9.15s/9.7 核，cuda:256 时 6.95s/13.5 核，CPU 核·秒几乎不变）
+        self.batch = cfg.batch if cfg.batch > 0 else (256 if self.device == "cuda" else 16)
         self.decode_workers = _auto_decode_workers(cfg, self.device == "cuda")
         LOGGER.info("精排：解码流水线线程=%d，前向批大小=%d",
                     self.decode_workers, self.batch)
@@ -259,14 +261,25 @@ class ResNetExtractor:
         import torchvision.transforms as transforms
         self._mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
         self._std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+        # 归一化搬 GPU：仅 CUDA 有意义（CPU 场景省不了时间，反而多一次搬运）
+        self.norm_on_gpu = bool(getattr(cfg, "norm_on_gpu", True)) \
+            and self.device == "cuda"
+        import torch
+        self._mean_t = torch.as_tensor(self._mean, device=self.device).view(3, 1, 1)
+        self._std_t = torch.as_tensor(self._std, device=self.device).view(3, 1, 1)
+        # transform 的末尾两步是否留在 CPU：GPU 归一化模式下只到 ToTensor
+        _tail = [] if self.norm_on_gpu else [
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
+        ]
+        if self.norm_on_gpu:
+            LOGGER.info("精排：归一化在 GPU 上进行（transform 只做 Resize/Crop/ToTensor）")
         # 兼容保留 torchvision 版本（语义等价，作为对照/兜底）
         self.transform = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
-        ])
+        ] + _tail)
 
     def prep(self, rgb: np.ndarray):
         """numpy RGB -> ResNet 输入张量。
@@ -279,11 +292,19 @@ class ResNetExtractor:
 
     # ------------------------------------------------------------------
     def _forward(self, tensors) -> Optional[np.ndarray]:
-        """一组 CPU 张量 -> 归一化前特征矩阵（单次前向，autocast 可选）。"""
+        """一组 CPU 张量 -> 归一化前特征矩阵（单次前向，autocast 可选）。
+
+        norm_on_gpu 模式：张量是"未归一化"的 uint8/255 浮点（transform 不含
+        Normalize），在这里以 float32 做 (x-mean)/std —— 放在 autocast 之外，
+        保证与 CPU 归一化数值一致；随后 H2D 与卷积才走 fp16。
+        """
         import torch
         try:
             with torch.no_grad():
                 batch_t = torch.stack(tensors, dim=0).to(self.device)
+                if self.norm_on_gpu:
+                    # float32 精确归一化（不进入 autocast，避免 fp16 舍入漂移）
+                    batch_t = batch_t.sub(self._mean_t).div_(self._std_t)
                 if self.use_fp16:
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         feats = self.model(batch_t)

@@ -156,7 +156,8 @@ def scan_duplicates(paths: Sequence[str], *,
         from .prep_cache import PrepCache, default_cache_dir
         if prefix and os.path.exists(prefix + ".meta.json"):
             pcache = PrepCache(default_cache_dir(prefix), model=cfg.model,
-                               pre_side=_PRE_DOWNSCALE_SIDE)
+                               pre_side=_PRE_DOWNSCALE_SIDE,
+                               norm_on_gpu=getattr(cfg, "norm_on_gpu", True))
     except Exception:                       # noqa: BLE001 —— 无缓存也能跑
         pcache = None
     cache_hits = 0

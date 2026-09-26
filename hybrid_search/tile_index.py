@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
 # ImageSearchTool · 图库检索管理器 — 瓦片(局部)索引：512px+25% 切块建库、LSH 候选、切块聚合检索与命中框回传
 # Copyright (C) 2026 zccored
@@ -111,9 +111,32 @@ def tiles_of_rgb(rgb: np.ndarray, tile: int, overlap: float,
 
 
 def _tile_md5(data: bytes, box: tuple) -> str:
-    """瓦片去重标识：原文件内容 + 框坐标（同图同布局稳定；重复文件同布局自动去重）。"""
+    """瓦片去重标识：原文件内容 + 框坐标（同图同布局稳定；重复文件同布局自动去重）。
+
+    逐块调用会把整份文件字节哈希/拷贝 N 次；热路径请改用
+    `_tile_md5_base()` + `_tile_md5_of()`（逐位等价，实测 15.4×）。
+    """
     return hashlib.md5(data + f"|{box[0]},{box[1]},{box[2]},{box[3]}".encode()
                        ).hexdigest()
+
+
+def _tile_md5_base(data: bytes):
+    """每张原图**只做一次**整文件哈希，返回可复用的 md5 对象（cfg.dedup 关闭时返回 None）。
+
+    `md5(data + tag)` 与 `md5(data).copy(); update(tag)` 逐位等价（已实测），
+    于是 N 块瓦片由「N 次整文件哈希 + N 次整文件临时拷贝」变为
+    「1 次哈希 + N 次 copy/update」——库内 md5 取值不变，索引无需重建。
+    """
+    return hashlib.md5(data)
+
+
+def _tile_md5_of(base, box: tuple) -> str:
+    """由复用的 base 对象派生单块标识（与 `_tile_md5(data, box)` 逐位一致）。"""
+    if base is None:
+        return ""
+    h = base.copy()
+    h.update(("|%d,%d,%d,%d" % (box[0], box[1], box[2], box[3])).encode())
+    return h.hexdigest()
 
 
 def _decode_to_tiles(path: str, cfg, tile: int, overlap: float,
@@ -133,6 +156,7 @@ def _decode_to_tiles(path: str, cfg, tile: int, overlap: float,
         if rgb is None:
             return []
         work, boxes, _scale = tiles_of_rgb(rgb, tile, overlap, min_side, pre_max)
+        base = _tile_md5_base(data) if cfg.dedup else None      # 整文件只哈希一次
         out = []
         for bi, box in enumerate(boxes):
             x0, y0, x1, y1 = box
@@ -148,7 +172,7 @@ def _decode_to_tiles(path: str, cfg, tile: int, overlap: float,
             tile_rgb = work[sy0:sy1, sx0:sx1]
             gray = cv2.cvtColor(tile_rgb, cv2.COLOR_RGB2GRAY)
             binary, hu, fp = extract_binary_features(gray, cfg)
-            md5 = _tile_md5(data, box) if cfg.dedup else ""
+            md5 = _tile_md5_of(base, box)
             rec = CoarseRecord(path=path, md5=md5, hu=hu, fp=fp, box=box)
             try:
                 tensor = transform(Image.fromarray(tile_rgb))
@@ -203,15 +227,33 @@ class BuildTrace:
 
 
 def _decode_to_crops(path: str, cfg, tile: int, overlap: float,
-                      min_side: int, pre_max: int
-                      ) -> List[Tuple[np.ndarray, tuple, bytes, bool]]:
+                      min_side: int, pre_max: int,
+                      seen: Optional[set] = None,
+                      seen_lock=None,
+                      ) -> Optional[List[Tuple[np.ndarray, tuple, object, bool]]]:
     """一级：读盘一次 -> 解码(≤pre_max 处理图) -> 切块。
-    返回 [(瓦片 RGB 副本, 原图框, 原始文件字节(供 MD5), 是否本图首块)]。
-    特征提取不在此做 —— 交给全池并行的二级任务，消除单图串行长尾。"""
+    返回 [(瓦片 RGB 副本, 原图框, 整文件 md5 基准对象(供逐块派生), 是否本图首块)]；
+    内容重复（seen 里已有同 md5 且当时成功入库）时返回 None 表示"跳过该文件"；
+    解码失败返回 []。特征提取不在此做 —— 交给全池并行的二级任务。
+
+    seen/seen_lock：可选的内容去重集合（值为整文件 md5）。只在**成功产出瓦片后**
+    才登记，避免"首个同内容文件解码失败导致后续副本被误跳过"。
+    """
     data = read_bytes(path)
     if data is None:
         return []
     try:
+        reuse = bool(getattr(cfg, "tile_md5_reuse", True))
+        base = None
+        digest = None
+        if cfg.dedup:
+            # 复用模式给 md5 对象，旧模式给原始字节（对照/回退用）
+            base = _tile_md5_base(data) if reuse else data
+            if seen is not None:
+                digest = base.hexdigest() if reuse else hashlib.md5(data).hexdigest()
+                with seen_lock:
+                    if digest in seen:
+                        return None                     # 同内容已入库 → 不必解码
         rgb = decode_rgb(data)
         if rgb is None:
             return []
@@ -230,7 +272,10 @@ def _decode_to_crops(path: str, cfg, tile: int, overlap: float,
             if sx1 - sx0 < 4 or sy1 - sy0 < 4:
                 continue
             out.append((np.ascontiguousarray(work[sy0:sy1, sx0:sx1]),
-                        box, data, bi == 0))
+                        box, base, bi == 0))
+        if out and digest is not None:                   # 成功产出后才登记内容指纹
+            with seen_lock:
+                seen.add(digest)
         return out
     except Exception as e:               # noqa: BLE001 —— 单图失败不影响整体
         LOGGER.debug("瓦片解码失败 %s: %r", path, e)
@@ -238,14 +283,20 @@ def _decode_to_crops(path: str, cfg, tile: int, overlap: float,
 
 
 def _feature_one_tile(path: str, rgb_crop: np.ndarray, box: tuple,
-                      data: bytes, first: bool, cfg, transform,
+                      base, first: bool, cfg, transform,
                       frame_sink=None
                       ) -> Optional[Tuple[np.ndarray, CoarseRecord]]:
-    """二级：单瓦片特征（粗筛指纹+Hu + ResNet 预处理张量）。失败返回 None。"""
+    """二级：单瓦片特征（粗筛指纹+Hu + ResNet 预处理张量）。失败返回 None。
+
+    base：`_tile_md5_base()` 返回的整文件 md5 对象（复用它派生本块标识，
+    避免逐块重新哈希整份文件字节）。
+    """
     try:
         gray = cv2.cvtColor(rgb_crop, cv2.COLOR_RGB2GRAY)
         binary, hu, fp = extract_binary_features(gray, cfg)
-        md5 = _tile_md5(data, box) if cfg.dedup else ""
+        # base 为 md5 对象 → 复用派生；为 bytes → 旧行为（逐块整文件哈希）
+        md5 = (_tile_md5(base, box) if isinstance(base, (bytes, bytearray))
+               else _tile_md5_of(base, box))
         rec = CoarseRecord(path=path, md5=md5, hu=hu, fp=fp, box=box)
         try:
             tensor = transform(Image.fromarray(rgb_crop))
@@ -291,7 +342,8 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
     if n == 0:
         return 0
     t0 = time.time()
-    TILE_FWD_BATCH = max(64, ex.batch)
+    tile_fwd_batch = int(getattr(engine.cfg, "tile_fwd_batch", 64) or 64)
+    TILE_FWD_BATCH = max(64, tile_fwd_batch)
     _cfg = engine.cfg
     TICK = max(2.0, float(getattr(_cfg, "tile_flush_ms", 20) or 20)) / 1000.0
     DECODE_CONC = min(workers, int(getattr(_cfg, "tile_decode_slots", 18) or 20))
@@ -299,6 +351,11 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
     task_q: "queue.Queue" = queue.Queue()
     lock = threading.Lock()
     stop = threading.Event()
+    # 内容去重预过滤：同内容文件只处理第一张（其余跳过解码+切块；
+    # 结果与"照常处理后被 add_results 丢弃"完全等价，索引内容不变）
+    prefilter = bool(_cfg.dedup and getattr(_cfg, "dedup_prefilter", True))
+    seen_ok: set = set()
+    stats = {"dup_skipped": 0}
     n_img_done = 0
     n_img_active = 0
     n_tile_inflight = 0
@@ -335,8 +392,16 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
                 if kind == "img":
                     _i, path = item[1], item[2]
                     t_a = time.monotonic()
+                    # 去重预过滤：同内容已成功入库过的文件直接跳过（省掉解码+切块+
+                    # 特征+MD5 整段；即便不跳过，add_results 之后也会按块 md5 丢弃）
                     crops = _decode_to_crops(path, engine.cfg, tile, overlap,
-                                             min_side, pre_max)
+                                             min_side, pre_max,
+                                             seen=seen_ok if prefilter else None,
+                                             seen_lock=lock)
+                    if crops is None:                       # 内容重复 → 跳过
+                        crops = []
+                        with lock:
+                            stats["dup_skipped"] += 1
                     t_b = time.monotonic()
                     if trace is not None:
                         try:
@@ -358,10 +423,10 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
                     feed_next()
                     maybe_send_end()
                 else:
-                    path, rgb_crop, box, data, first = (item[1], item[2],
+                    path, rgb_crop, box, base, first = (item[1], item[2],
                                                         item[3], item[4],
                                                         item[5])
-                    out = _feature_one_tile(path, rgb_crop, box, data, first,
+                    out = _feature_one_tile(path, rgb_crop, box, base, first,
                                             engine.cfg, ex.transform,
                                             frame_sink)
                     with lock:
