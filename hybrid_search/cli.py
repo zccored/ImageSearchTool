@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
 # ImageSearchTool · 图库检索管理器 — CLI 子命令与参数：build/add/build-fine/build-tiles/add-tiles/search/eval/ingest/bench/stats/compact
 # Copyright (C) 2026 zccored
@@ -80,9 +80,16 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
                          "GPU 前向重叠）")
     sp.add_argument("--torch-threads", type=int, default=0,
                     help="torch 推理线程数（0=保持默认）")
-    sp.add_argument("--png-decoder", choices=["cv2", "pillow"], default="cv2",
-                    help="PNG 解码器：cv2=libpng 全尺寸(快~1.3x；坏 iCCP 文件"
-                         "零星 stderr 警告)；pillow=安静较慢")
+    sp.add_argument("--png-decoder", choices=["cv2", "imagecodecs", "pillow", "libdeflate"],
+                    default="cv2",
+                    help="PNG 解码器：cv2=OpenCV/libpng（默认）；imagecodecs="
+                         "libpng 1.6.58+zlib-ng（实测大 PNG 快 21%%、小 PNG 快 11%%，"
+                         "输出逐位一致，需 pip install imagecodecs，缺库自动回退）；"
+                         "pillow=安静但慢（0.70~0.74x）；libdeflate=libdeflate 解 IDAT + "
+                         "原生反滤波（纯 inflate 实测 1526 MB/s vs cv2 全解码 365 MB/s，"
+                         "只覆盖 8bit 非交错 RGB/RGBA，其余与缺库情况自动回退 cv2）")
+    sp.add_argument("--png-fast-scratch-mb", type=float, default=32.0,
+                    help="libdeflate 路径每线程 scratch 缓冲上限 MB（默认 32；0=不复用）")
     sp.add_argument("--big-decode-conc", type=int, default=16,
                     help="大图(>12MP)解码并发上限（受内存约束，14核/16GB 建议 "
                          "16~20；1=串行）")
@@ -126,7 +133,10 @@ def _apply_feature_args(cfg: Config, a: argparse.Namespace) -> None:
     cfg.workers = int(_val(a, "workers", cfg.workers))
     cfg.decode_workers = int(_val(a, "decode_workers", cfg.decode_workers))
     cfg.torch_threads = int(_val(a, "torch_threads", cfg.torch_threads))
-    cfg.png_decoder = _val(a, "png_decoder", cfg.png_decoder)
+    if _val(a, "png_decoder", None):         # CLI 显式指定时才覆盖 Config 默认
+        cfg.png_decoder = a.png_decoder
+    cfg.png_fast_scratch_mb = float(_val(a, "png_fast_scratch_mb",
+                                         getattr(cfg, "png_fast_scratch_mb", 32.0)))
     cfg.big_decode_conc = int(_val(a, "big_decode_conc", cfg.big_decode_conc))
     cfg.tile_decode_slots = int(_val(a, "tile_decode_slots",
                                      cfg.tile_decode_slots))

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
 # ImageSearchTool · 图库检索管理器 — tkinter 可视化界面：扫描图库、建库/增量、三种检索模式、去重审查、性能图、可视化面板
 # Copyright (C) 2026 zccored
@@ -1526,10 +1526,12 @@ class App:
         self._add_int(page_build, "批大小(0=自动)", "batch", 0, 0, 512)
         self._add_check(page_build, "GPU 半精度 FP16", "fp16", True)
         self._add_check(page_build, "预构建 ResNet 全库索引(快/占内存)", "store_fine", True)
-        self._add_check(page_build, "新索引用侧车 .npy 存储(加载快/省内存)",
-                        "fast_load", False)
-        self._add_check(page_build, "屏蔽 libpng/iCCP 噪音输出(推荐)",
-                        "silence_png_warnings", True)
+        # 「新索引用侧车 .npy」「屏蔽 libpng/iCCP 噪音」已收敛为默认行为（config 默认 True），
+        # 不再在 UI 单独占位：前者是纯收益（可 mmap，加载快且省内存），后者只吞已知噪音行。
+        # 旁路开关：默认 libdeflate（libdeflate 解 IDAT + 原生 SIMD 反滤波，只处理
+        # 8bit 非交错 RGBA，其余格式/依赖缺失自动回退 cv2，输出与 cv2 逐位一致）。
+        self._add_combo(page_build, "PNG 解码器(旁路)", "png_decoder",
+                        ["libdeflate", "cv2", "imagecodecs", "pillow"])
         self._add_check(page_build, "启用预处理缓存(重复建库更快/占磁盘)",
                         "prep_cache", True)
         self._add_check(page_build, "MD5 内容去重", "dedup", True)
