@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<!--
+  ImageSearchTool · 图库检索管理器 — Web 界面入口（Vue3 挂载点 + 外置主题加载）
+  Copyright (C) 2026 zccored
+  本程序是自由软件：AGPL-3.0-only；完整条款见仓库根 LICENSE。
+  This program is free software under the GNU Affero General Public License v3.0.
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>二值法粗筛 + ResNet精排 · 混合图库检索</title>
+    <script>
+      // 首屏前恢复上次的亮/暗选择（避免闪一下默认色）；逻辑与 src/theme.js 的 initTheme() 等价
+      try {
+        var th = localStorage.getItem('ise.theme');
+        if (th === 'light' || th === 'dark') {
+          document.documentElement.setAttribute('data-theme', th);
+        }
+      } catch (e) { /* 隐私模式等：用默认（暗色） */ }
+    </script>
+    <!-- 外置主题：随包分发的 ui_theme.css 若存在则覆盖内置 CSS 变量（见 frontend/README.md）。
+         暗色改 `:root {…}`；亮色改 `:root[data-theme="light"] {…}`（后者更具体，不被前者覆盖）。 -->
+    <link rel="stylesheet" href="/ui_theme.css" onerror="this.remove()" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
