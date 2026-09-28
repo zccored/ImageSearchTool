@@ -50,7 +50,26 @@
 
 ### 一、用打包版（最省事，目标机不需要 Python）
 
-1. 解压发行包，得到 `ImageSearch/` 目录（内含 `ImageSearchWeb.exe` / `ImageSearchGUI.exe` /
+**先下载**：到 [Releases](https://github.com/zccored/ImageSearchTool/releases) 页下最新的打包版
+（`ImageSearchTool-v3.3.0-beta-win64-cuda.zip.001` / `.002`）。GitHub 单个附件上限 2 GiB，
+所以一个包拆成两卷；两卷放到**同一目录**后，用 `cmd` 合并、再解压：
+
+```bat
+copy /b ImageSearchTool-v3.3.0-beta-win64-cuda.zip.001 + ImageSearchTool-v3.3.0-beta-win64-cuda.zip.002 ImageSearchTool-v3.3.0-beta-win64-cuda.zip
+```
+
+> 合并后的 zip 应为 **2,688.1 MiB**，SHA256
+> `9828f5c61c11f55809a481de1551578e1f2aa2497dbe556271230b79d4287fe4`；
+> 两卷各自的 SHA256 列在 Release 说明里，下载后可自行核对。解压得到 `ImageSearch/`
+> （**4,149 MB / 4,308 个文件**）。
+
+> 🖥️ **一个包，自己选「满血 CUDA」还是「纯 CPU」**：包里带的是 CUDA 版 torch（包体 4.15 GB
+> 几乎全是它），目标机**没有 NVIDIA 显卡/驱动时会自动回退 CPU** 照常运行，只是精排慢一些。
+> 想手动固定：桌面版与 Web 版都在「**建库参数**」页的「**ResNet 精排**」组里，把
+> **`设备`** 设为 **`auto` / `cuda` / `cpu`**（`auto` = 有显卡用显卡、没有就用 CPU）；
+> CLI 用 `--device auto|cuda|cpu` —— **换模式不用换包**。
+
+1. 解压得到 `ImageSearch/` 目录（内含 `ImageSearchWeb.exe` / `ImageSearchGUI.exe` /
    `ImageSearchCLI.exe` 与 `_internal/`）——**整个目录一起用**，不要只拷 exe；
 2. 双击 **`ImageSearchWeb.exe`** 即起窗。系统需 **WebView2 运行时**
    （Win10 1803+ 一般已内置；缺失时会提示去装 Microsoft Edge WebView2 Runtime，装完重开）；
@@ -866,6 +885,15 @@ image-search/
 - 性能档案：`docs/perf-plan.md` 新增第六节（JPEG 解码器对照：TurboJPEG 解码级 1.125×
   且逐位一致，但**建库级净负**，故不采纳）、第七节（预处理缓存覆盖率实测 100%），
   第三节补入「更激进 DCT 缩放阈值」的实测否决。
+
+- **打包版随 Release 发布**：`v3.3.0-beta` 起提供可直接双击运行的 Windows 打包版
+  （PyInstaller onedir，GUI / Web / CLI 三入口共享 `_internal/`，共 **4,149 MB / 4,308 个文件**，
+  构建耗时 641.8 s）。GitHub 单附件上限 2 GiB，因此拆成 `.zip.001`（1400.0 MiB）
+  + `.zip.002`（1288.1 MiB）两卷，`copy /b` 合并后解压即用；包内是 CUDA 版 torch，
+  无 N 卡会**自动回退 CPU**，桌面版与 Web 版均在「建库参数」页的「ResNet 精排」组里
+  可手动选 `设备` = `auto` / `cuda` / `cpu` —— **一个包同时覆盖满血 CUDA 与纯 CPU 两种用法**。
+  验收：包内 CLI `stats` rc=0（37,683 张）、Web 版只监听 `127.0.0.1` 且 `/health` 200、
+  全包敏感信息扫描无本机路径/用户名/令牌；详见 Release 说明与上「快速上手 · 一」。
 
 ### 2026-09-27（新界面一轮）
 
