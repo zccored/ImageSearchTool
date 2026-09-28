@@ -836,23 +836,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-    # ---- 命中结果加工：补 `thumb`（缩略图 URL）与字段名 ----
-    def _enrich(self, res: dict | None) -> dict | None:
-        if not res:
-            return res
-        hits = res.get("hits") or []
-        paths = [h[1] for h in hits]
-        keys = self.svc.thumb_keys(paths) if paths else []
-        out_hits = []
-        for i, h in enumerate(hits):
-            item = dict(zip(HIT_FIELDS, h))
-            item["thumb"] = (f"/thumb/{keys[i]}?p={b64u(h[1])}"
-                             if i < len(keys) else "")
-            out_hits.append(item)
-        res = dict(res)
-        res["hits"] = out_hits
-        return res
-
-
-# @@TAIL@@

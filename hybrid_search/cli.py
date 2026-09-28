@@ -719,9 +719,16 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- stats
     sp = sub.add_parser("stats", help="索引统计")
     _add_prefix(sp)
+    # 只读命令也要注册 feature 参数：否则对「用非默认解码器建的索引」无法显式声明基准
+    # （例如 meta 记 png_decoder=cv2 的老索引），打开时一致性校验会直接拒绝（rc=2）。
+    # 这些参数的默认值全部与 config.py 对齐，不传即等于用 Config 默认 → 行为与以前一致
+    # （回归见 devtools/verify_cli_defaults.py）。
+    _add_feature_args(sp)
     sp.set_defaults(func=cmd_stats)
 
     # ---- compact（旧 npz -> 侧车 .npy 快载格式）
+    # 注意：compact 走 store.compact(prefix)，**完全不读 Config**、也不做参数一致性校验，
+    # 因此它不需要 feature 参数（加了也不会被使用）。
     sp = sub.add_parser(
         "compact", help="把旧 npz 索引转成侧车 .npy 快载格式（可 mmap）")
     _add_prefix(sp)
