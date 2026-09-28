@@ -14,6 +14,12 @@
 
 用法： python gui.py
 
+状态（2026-09-27）：本文件是**保底 / 可选**界面 —— 图形界面的主线已迁到 **Web 版**
+（`gui_web.py` + `frontend/`，见 `frontend/README.md`）。两者**共用同一服务层**
+`hybrid_search/service.py`（命令 / 事件 / 参数取值只有那一份），功能与索引行为一致，可随时切换；
+本文件**保留不删**（零额外 GUI 依赖，缺少 WebView2 时仍可用），后续以缺陷修复与兼容为主、
+不再加新功能。
+
 功能：
   1. 自定义图库位置（输入或浏览选择目录）
   2. 一键“扫描图库”：递归遍历文件夹内全部图片，支持多格式
@@ -28,14 +34,11 @@
 """
 from __future__ import annotations
 
-import logging
 import os
 import queue
-import subprocess
 import sys
 import threading
 import time
-import traceback
 
 import tkinter as tk
 from collections import deque
@@ -45,35 +48,16 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image, ImageDraw, ImageTk
 
 from hybrid_search.config import Config
-from hybrid_search.engine import HybridEngine
 from hybrid_search.io_utils import human_bytes
-from hybrid_search.store import IndexFiles
+from hybrid_search.service import (
+    EVENT_LOG, EVENT_PERF_REPORT, EVENT_PHASE_BOUNDARY, EVENT_PROGRESS,
+    EVENT_TASK_DONE, EVENT_TASK_ERROR, EVENT_VIZ_FRAME, OP_ADD, OP_BUILD,
+    OP_COMPACT, OP_DEDUP_APPLY, OP_DEDUP_SCAN, OP_HANDOFF, OP_SCAN, OP_SEARCH,
+    OP_TILES, PHASE_LABELS, SearchService)
 from hybrid_search.thumbs import ThumbCache
 
 # 与 io_utils 保持一致：抬高 Pillow 解压炸弹上限，避免超大图预览直接抛错
 Image.MAX_IMAGE_PIXELS = 256 * 1024 * 1024
-
-import peer_launcher as PL      # “切换启动”全栈图库管理器（校验/登记/启动）
-from perfwatch import StageProfiler, latest_report  # 阶段性能画像（可选导出）
-
-LOGGER = logging.getLogger("hybrid_search")
-
-# ==========================================================================
-# 日志桥：引擎日志 -> 队列 -> 主线程 -> 文本框
-# ==========================================================================
-class QueueLogHandler(logging.Handler):
-    def __init__(self, q: "queue.Queue"):
-        super().__init__()
-        self.q = q
-        fmt = logging.Formatter("[%(asctime)s] %(levelname)-5s %(message)s", "%H:%M:%S")
-        self.setFormatter(fmt)
-
-    def emit(self, record):
-        try:
-            self.q.put(("log", self.format(record)))
-        except Exception:  # noqa: BLE001
-            pass
-
 
 # ==========================================================================
 # 缩略图 LRU 缓存（PIL 解码 + 缩略，PhotoImage 需保活引用）
@@ -865,7 +849,6 @@ class DedupWindow:
 
     # ---- 动作 --------------------------------------------------------
     def _delete_selected(self):
-        from hybrid_search import dedup as DD
         paths = self._selected()
         if not paths:
             return
@@ -889,7 +872,11 @@ class DedupWindow:
                 f"{sample}{more}\n\n合计 {human_bytes(total)}。{warn}\n继续？",
                 parent=self.win):
             return
-        ok, bad = DD.recycle_paths(paths)
+        result = self.app.svc.dedup_delete("dedup_delete", paths,
+                                           prefix=self.app.prefix,
+                                           sync=self.sync_var.get())
+        ok = (result or {}).get("removed") or []
+        bad = (result or {}).get("failed") or []
         if not ok:
             messagebox.showerror("删除失败", f"没有文件被删除。\n"
                                              f"首个原因：{bad[0][1] if bad else '未知'}",
@@ -901,10 +888,8 @@ class DedupWindow:
                 "部分失败", f"成功 {len(ok)} 张，失败 {len(bad)} 张：\n"
                             + "\n".join(f"  {os.path.basename(p)}: {r}"
                                         for p, r in bad[:5]), parent=self.win)
-        self._sync_index(ok)
 
     def _move_selected(self):
-        from hybrid_search import dedup as DD
         paths = self._selected()
         if not paths:
             return
@@ -913,7 +898,12 @@ class DedupWindow:
         if not dest:
             return
         base = self.app.dir_var.get().strip() or None
-        ok, bad = DD.move_paths(paths, dest, base_root=base)
+        result = self.app.svc.dedup_move("dedup_move", paths, dest,
+                                        base_root=base,
+                                        prefix=self.app.prefix,
+                                        sync=self.sync_var.get())
+        ok = (result or {}).get("removed") or []
+        bad = (result or {}).get("failed") or []
         if not ok:
             messagebox.showerror("移动失败", f"没有文件被移动。\n"
                                              f"首个原因：{bad[0][1] if bad else '未知'}",
@@ -925,7 +915,6 @@ class DedupWindow:
                 "部分失败", f"成功 {len(ok)} 张，失败 {len(bad)} 张：\n"
                             + "\n".join(f"  {os.path.basename(p)}: {r}"
                                         for p, r in bad[:5]), parent=self.win)
-        self._sync_index(ok)
 
     def _after_removed(self, removed: list, what: str):
         rm = set(removed)
@@ -974,27 +963,6 @@ class DedupWindow:
             self.win.destroy()
             messagebox.showinfo("查验去重", f"{what}后已无重复图。")
 
-    def _sync_index(self, removed: list):
-        if not self.sync_var.get() or not removed:
-            return
-        try:
-            from hybrid_search.store import prune
-            from hybrid_search import tile_index as TI
-            self.app._drop_engines("索引剔除前释放内存", silent=True)
-            prefixes = []
-            if self.app.prefix and os.path.exists(self.app.prefix + ".meta.json"):
-                prefixes.append(self.app.prefix)
-            tp = TI.tiles_prefix_of(self.app.prefix) if self.app.prefix else ""
-            if tp and os.path.exists(tp + ".meta.json"):
-                prefixes.append(tp)
-            for p in prefixes:
-                r = prune(p, removed)
-                if r["removed"]:
-                    self.app._log(f"索引同步：{os.path.basename(p)}.* 剔除 "
-                                  f"{r['removed']} 条（剩 {r['kept']} 条）")
-        except Exception as e:  # noqa: BLE001
-            self.app._log(f"索引同步失败（可稍后重建/增量刷新）：{e}")
-
 
 # ==========================================================================
 # 主程序
@@ -1014,6 +982,7 @@ class App:
         self.busy = False
         self.worker: threading.Thread | None = None
         self._peer_ok = False               # 切换目标（全栈管理器）校验通过？
+        self._svc_peer_main = ""            # 切换目标 main.py（服务层给出）
         self._peer_proc = None              # 最近一次切换启动的进程句柄
         self.search_mode_var = tk.StringVar(value="full")   # 检索模式：full/tiles/hybrid
         self._hybrid_warned = False         # 混合模式性能警告是否已提示过（会话内一次）
@@ -1028,22 +997,15 @@ class App:
         self._tile_photos: list = []        # 保活
         self.last_query: str = ""
 
-        # ---- 索引引擎缓存 ----
-        # 每次搜图都新建引擎会重新加载整个索引：444k 瓦片库实测 3.6s、RSS+1.26GB，
-        # 用户观感是“搜图后加载索引卡 4 秒”。这里按 (前缀, 关键参数) 缓存引擎，
-        # 索引被改写/参数变化/手动释放时失效；最多保留两套（整图 + 瓦片）。
-        self._eng_lock = threading.Lock()
-        self._eng_cache: dict = {}          # prefix -> (签名, HybridEngine)
+        # ---- 服务层（唯一编排层）：扫描 / 建库 / 检索 / 去重 / 引擎缓存与释放
+        # 界面只做 UI 与线程调度：命令给它、事件推回本进程队列（见 _on_service_event）
+        self.svc = SearchService(emit=self._on_service_event)
         # ---- 性能图导出开关（默认关；开启时弹“有性能损耗”提示）----
         self.perf_build_var = tk.BooleanVar(value=False)
         self.perf_search_var = tk.BooleanVar(value=False)
         self._perf_ok: set = set()          # 已确认开启过的开关 key
         self._last_perf_report = ""
-
-        # ---- 日志 ----
-        handler = QueueLogHandler(self.q)
-        logging.getLogger("hybrid_search").addHandler(handler)
-        logging.getLogger("hybrid_search").setLevel(logging.INFO)
+        self._last_phase_boundary = {}      # task_id -> 最近一次阶段边界（诊断用）
 
         self._build_style()
         self._build_ui()
@@ -1058,58 +1020,47 @@ class App:
             root.after(800, self._auto_handoff_start)
 
     # ------------------------------------------------------------------
+    # 服务层事件 -> 本进程队列（主线程 _pump 消费）
+    # ------------------------------------------------------------------
+    # 任务完成事件 -> 队列消息 kind（_pump 的既有分发键，保持界面行为不变）
+    _SVC_DONE_KIND = {OP_SCAN: "scan_done", OP_BUILD: "indexed",
+                      OP_ADD: "indexed", OP_TILES: "tiles_done",
+                      OP_COMPACT: "compact_done", OP_SEARCH: "search_done",
+                      OP_DEDUP_SCAN: "dedup_done", OP_HANDOFF: "handoff_done"}
+
+    def _on_service_event(self, ev: dict):
+        """服务层事件回调（可能来自 worker 线程）：只入队，绝不直接碰 UI。"""
+        kind = ev.get("event")
+        if kind == EVENT_LOG:
+            self.q.put(("log", ev.get("text", "")))
+        elif kind == EVENT_PROGRESS:
+            self.q.put(("progress", (ev["done"], ev["total"], ev["phase"])))
+        elif kind == EVENT_PHASE_BOUNDARY:
+            self.q.put(("phase_boundary",
+                        (ev.get("task_id", ""), ev.get("phase", ""))))
+        elif kind == EVENT_VIZ_FRAME:
+            self.q.put(("viz", (ev["kind"], ev["data"])))
+        elif kind == EVENT_PERF_REPORT:
+            self.q.put(("perf", (ev.get("path", ""), bool(ev.get("modal")))))
+        elif kind == EVENT_TASK_DONE:
+            dest = self._SVC_DONE_KIND.get(ev.get("op"))
+            if dest:
+                self.q.put((dest, ev.get("result")))
+        elif kind == EVENT_TASK_ERROR:
+            self.q.put(("error", (ev.get("error", ""), ev.get("traceback", ""),
+                                  ev.get("title") or "操作失败")))
+
+    # ------------------------------------------------------------------
     # 自动交接：处理 img_server 交接文件并增量建库（GUI 全程可视）
     # ------------------------------------------------------------------
     def _auto_handoff_start(self):
-        import os as _os
-        from hybrid_search import handoff as H
-
-        p = self.auto_handoff
-        if not _os.path.isfile(p):
-            self._log(f"【自动交接】文件不存在：{p}")
-            messagebox.showerror("自动交接", f"交接文件不存在：\n{p}")
-            return
-        try:
-            req = H.load_request(p)
-        except Exception as e:                 # noqa: BLE001
-            messagebox.showerror("自动交接", f"交接文件无效：{e}")
-            return
-        roots = [r["path"] for r in req.get("roots", [])]
-        if not roots:
-            messagebox.showerror("自动交接", "请求中缺少增量根目录(roots)")
-            return
-        explicit_prefix = req.get("prefix") or ""
-        loc0 = None if explicit_prefix else H.locate_gallery_root(roots[0])
-        prefix = (explicit_prefix or (loc0["prefix"] if loc0 else _os.path.join(
-            roots[0], ".gallery_index", "gallery")))
-        self.prefix = prefix
-        if roots:
-            self.dir_var.set(roots[0])
-        self._log(f"【自动交接】收到 img_server 请求：{req.get('request_id', '')}")
-        for r in roots:
-            self._log(f"    增量来源: {r}")
-        if loc0 and loc0["root"] != roots[0]:
-            self._log(f"    自动定位图库根: {roots[0]} -> {loc0['root']}"
-                      "（子目录自身无索引，增量并入上级图库索引）")
-        self._log(f"    索引前缀 : {prefix}")
-        self._log("开始校验并增量建库（路径+MD5 去重，重复内容自动跳过）…")
+        """自动交接模式：校验 / 定位图库根 / 增量建库都在服务层完成。"""
         self._set_busy(True, "自动交接：校验并增量建库中…")
-        threading.Thread(target=self._auto_handoff_worker, args=(p,),
-                         daemon=True).start()
+        threading.Thread(target=self._auto_handoff_worker,
+                         args=(self.auto_handoff,), daemon=True).start()
 
     def _auto_handoff_worker(self, req_path: str):
-        from hybrid_search import handoff as H
-
-        def cb(done, total, phase):
-            self.q.put(("progress", (done, total, phase)))
-
-        self.q.put(("progress", (0, 1, "fused")))
-        try:
-            result = H.process_request_file(req_path, progress=cb)
-            self.q.put(("handoff_done", result))
-        except Exception as e:                 # noqa: BLE001
-            import traceback as _tb
-            self.q.put(("error", f"自动交接失败：{e}\n{_tb.format_exc()}"))
+        self.svc.handoff("handoff", req_path)
 
     def _on_handoff_done(self, result: dict):
         self.progress.configure(value=0)
@@ -1119,6 +1070,9 @@ class App:
         secs = result.get("total_secs", 0)
         prefix = result.get("prefix", self.prefix)
         self.prefix = prefix
+        roots = result.get("roots") or []
+        if roots:            # 服务层定位到的图库根（可能由子目录上溯到宿主）
+            self.dir_var.set(roots[0])
         msg = (f"自动增量完成：新增 {added} 张，耗时 {secs}s -> {prefix}"
                if ok else "自动增量完成但存在错误（见日志/result 文件）")
         self._set_busy(False, msg)
@@ -1142,6 +1096,10 @@ class App:
     def _on_close(self):
         if self.busy:
             self._log("后台任务仍在运行：窗口关闭后任务将被中断（不写入部分索引）")
+        try:
+            self.svc.close()            # 解绑日志 + 释放 mmap 索引
+        except Exception:               # noqa: BLE001 —— 退出路径不报错
+            pass
         try:
             self.root.destroy()
         except tk.TclError:
@@ -1180,14 +1138,8 @@ class App:
         self._viz_frames = 0
         self._viz_photo = None
 
-    # 可视化帧回调（engine worker 线程里被调用：只入队，零重量）
-    def _viz_cb(self):
-        def cb(_path, data, phase):
-            try:
-                self.q.put(("viz", (phase, data)))
-            except Exception:  # noqa: BLE001
-                pass
-        return cb
+    # 可视化帧：engine 的 frame_sink 已由服务层转成 `viz_frame` 事件，
+    # 界面侧只按阶段入有界帧队列（见 _on_service_event / _pump）
 
     def _maybe_draw_viz(self):
         """24fps 节流：每 tick 最多取一帧绘制；帧率超限时自然丢弃，
@@ -1366,7 +1318,8 @@ class App:
         # 性能图 / 内存：报告默认关闭（参数页勾选），这里只做查看与手动释放
         self.btn_perf_open = ttk.Button(row_t, text="📈 最近性能图",
                                         command=self._open_last_perf,
-                                        state="normal" if latest_report()
+                                        state="normal"
+                                        if self.svc.latest_perf_report()
                                         else "disabled")
         self.btn_perf_open.pack(side="left", padx=(10, 6))
         ttk.Button(row_t, text="🧹 释放索引内存",
@@ -1391,22 +1344,24 @@ class App:
         self._peer_refresh_state()
 
     # ------------------------------------------------------------------
-    # 切换启动：全栈图库管理器（peer_launcher，见同目录模块注释）
+    # 切换启动：全栈图库管理器（校验/登记/启动在服务层，窗口生命周期在这里）
     #   * 建库(busy)期间禁用；切换目标不存在/未登记/内容哈希不符 → 禁用
     #   * 校验通过并确认后：独立进程启动对方 main.py，短暂探测存活，
     #     成功则关闭本程序（两套程序互切闭环）
     # ------------------------------------------------------------------
     def _peer_refresh_state(self):
-        st = PL.check()
+        info = self.svc.peer_state()
+        st, codes = info["state"], info["codes"]
+        self._svc_peer_main = info["main"]
         self._peer_ok = bool(st["ok"])
         self._peer_apply_state()
         if self._peer_ok:
             self.peer_state_var.set("切换目标就绪，可切换")
             self.peer_state_lbl.configure(foreground="#1a7f37")
         else:
-            short = {PL.ST_MISSING: "目标不存在（本包独立分发时禁用）",
-                     PL.ST_UNREGISTERED: "目标未登记，请点“校验/信任…”",
-                     PL.ST_MISMATCH: "目标哈希不一致，已禁用（防篡改）"}
+            short = {codes["missing"]: "目标不存在（本包独立分发时禁用）",
+                     codes["unregistered"]: "目标未登记，请点“校验/信任…”",
+                     codes["mismatch"]: "目标哈希不一致，已禁用（防篡改）"}
             self.peer_state_var.set("切换不可用：" +
                                     short.get(st["code"], st["code"]))
             self.peer_state_lbl.configure(foreground="#b35900")
@@ -1421,11 +1376,12 @@ class App:
 
     def _on_peer_inspect(self):
         """查看校验详情；目标存在但未登记/哈希不符时，允许人工确认后登记。"""
-        st = PL.check()
+        info = self.svc.peer_state()
+        st, codes = info["state"], info["codes"]
         if st["ok"]:
             messagebox.showinfo("切换启动校验", st["reason"])
             return
-        if st["code"] == PL.ST_MISSING:
+        if st["code"] == codes["missing"]:
             messagebox.showwarning("切换启动校验", st["reason"])
             return
         sure = messagebox.askyesno(
@@ -1435,7 +1391,7 @@ class App:
               "确认后将把当前哈希写入本包 peer_manifest.json（登记留痕）。\n\n"
               "是否登记并启用切换？")
         if sure:
-            r = PL.register()
+            r = self.svc.peer_register()
             if r["ok"]:
                 self._log(f"已登记切换目标信任：sha256 {r['sha256'][:16]}…")
                 messagebox.showinfo("登记完成", r["reason"])
@@ -1446,7 +1402,9 @@ class App:
     def _on_peer_switch(self):
         if self.busy:
             return                       # 建库中：按钮已禁用，此处兜底
-        st = PL.check()
+        info = self.svc.peer_state()
+        st = info["state"]
+        self._svc_peer_main = info["main"]
         if not st["ok"]:
             self._peer_refresh_state()
             messagebox.showwarning("切换启动", st["reason"])
@@ -1454,16 +1412,16 @@ class App:
         if not messagebox.askyesno(
                 "切换启动",
                 f"即将关闭本程序（图库检索管理器），并启动：\n\n"
-                f"{PL.PEER_MAIN}\n\n"
+                f"{self._svc_peer_main}\n\n"
                 "若需回到本程序，请稍后手动重新打开。\n继续？"):
             return
-        proc, err = PL.launch()
+        proc, err = self.svc.peer_launch()
         if err or proc is None:
             messagebox.showerror("启动失败", err or "未知错误")
             self._peer_refresh_state()
             return
         self._peer_proc = proc
-        self._status(f"已启动 {os.path.basename(PL.PEER_MAIN)}"
+        self._status(f"已启动 {os.path.basename(self._svc_peer_main)}"
                      f"（pid={proc.pid}），探测存活中…")
         self.root.after(2000, self._peer_proc_check)
 
@@ -1474,8 +1432,8 @@ class App:
         rc = proc.poll()
         if rc is None:
             # 目标进程存活（2 秒内未崩溃）→ 正常关闭本程序
-            self._log(f"切换启动成功（{os.path.basename(PL.PEER_MAIN)} 运行中），"
-                      "关闭本程序…")
+            self._log(f"切换启动成功（{os.path.basename(self._svc_peer_main)}"
+                      " 运行中），关闭本程序…")
             self.root.destroy()
             return
         # 目标启动后立即退出：视为失败，保留本程序并给出原因
@@ -1741,10 +1699,8 @@ class App:
             return None
 
     def _auto_prefix(self) -> str:
-        d = self.dir_var.get().strip().rstrip("\\/")
-        if not d:
-            return ""
-        return os.path.join(d, ".gallery_index", "gallery")
+        """<图库根>/.gallery_index/gallery（推导函数在服务层，别处不要手拼）。"""
+        return SearchService.auto_prefix(self.dir_var.get())
 
     # ==================================================================
     # 工具栏动作：目录 / 扫描 / 索引 / 标记
@@ -1772,36 +1728,15 @@ class App:
                          args=(d, cfg, self.recursive_var.get(),
                                self.verify_var.get()), daemon=True).start()
 
+    def _run_cmd(self, busy: str, fn, *args, **kwargs):
+        """长任务统一入口：置忙 + 后台线程跑服务层命令（收尾一律由事件驱动）。"""
+        self._set_busy(True, busy)
+        threading.Thread(target=fn, args=args, kwargs=kwargs,
+                         daemon=True).start()
+
     def _scan_worker(self, d: str, cfg: Config, recursive: bool, verify: bool):
-        try:
-            from hybrid_search.io_utils import collect_images
-            t0 = time.time()
-            paths = collect_images(d, cfg.extensions, sort=True)
-            if not recursive:
-                root = os.path.normcase(os.path.abspath(d)) + os.sep
-                paths = [p for p in paths
-                         if os.path.sep not in
-                         os.path.normcase(os.path.abspath(p))[len(root):]]
-            from collections import Counter
-            cnt = Counter(os.path.splitext(p)[1].lower() for p in paths)
-            broken = 0
-            if verify and paths:
-                from hybrid_search.io_utils import load_rgb
-                ok = []
-                for i, p in enumerate(paths):
-                    if i % 20 == 0:
-                        self.q.put(("progress", (i, len(paths), "verify")))
-                    if load_rgb(p) is None:
-                        broken += 1
-                    else:
-                        ok.append(p)
-                paths = ok
-            self.q.put(("scan_done",
-                        {"paths": paths, "count": len(paths), "broken": broken,
-                         "elapsed": time.time() - t0,
-                         "formats": dict(cnt.most_common())}))
-        except Exception as e:  # noqa: BLE001
-            self.q.put(("error", f"扫描失败：{e}\n{traceback.format_exc()}"))
+        """扫描（过滤 / 扩展名统计 / 可解码校验都在服务层做）。"""
+        self.svc.scan("scan", d, recursive=recursive, verify=verify, cfg=cfg)
 
     def _index_all(self):
         if not self._require_scan():
@@ -1810,12 +1745,12 @@ class App:
         if cfg is None:
             return
         self._reset_viz()
-        self._run_index("全部图片新建索引", cfg,
-                        lambda eng: eng.build(self.prefix,
-                                              paths=list(self.all_images),
-                                              force=True,
-                                              progress=self._prog_cb(),
-                                              frame_sink=self._viz_cb()))
+        title = "全部图片新建索引"
+        self._run_cmd(f"{title} …（操作期间请勿重复点击）",
+                      self.svc.build_index, "build", self.prefix,
+                      paths=list(self.all_images), force=True, cfg=cfg,
+                      perf=self.perf_build_var.get(), title=title,
+                      perf_meta={"图片数": len(self.all_images)})
 
     def _index_selected(self):
         sel = self._checked_rows()
@@ -1827,15 +1762,16 @@ class App:
             return
         existing = self._index_exists()
         self._reset_viz()
-        self._run_index(
-            f"索引勾选的 {len(sel)} 张", cfg,
-            (lambda eng: eng.build(self.prefix, paths=sel, force=True,
-                                   progress=self._prog_cb(),
-                                   frame_sink=self._viz_cb()))
-            if not existing else
-            (lambda eng: eng.add(self.prefix, paths=sel,
-                                 progress=self._prog_cb(),
-                                 frame_sink=self._viz_cb())))
+        title = f"索引勾选的 {len(sel)} 张"
+        busy = f"{title} …（操作期间请勿重复点击）"
+        if existing:
+            self._run_cmd(busy, self.svc.add_index, "add", self.prefix,
+                          paths=sel, cfg=cfg, perf=self.perf_build_var.get(),
+                          title=title)
+        else:
+            self._run_cmd(busy, self.svc.build_index, "build", self.prefix,
+                          paths=sel, force=True, cfg=cfg,
+                          perf=self.perf_build_var.get(), title=title)
 
     def _add_new(self):
         if not self._require_scan():
@@ -1847,95 +1783,22 @@ class App:
             messagebox.showwarning("提示", "索引不存在，请先“全部入库并建索引”")
             return
         self._reset_viz()
-        self._run_index("增量入库（自动去重）", cfg,
-                        lambda eng: eng.add(self.prefix,
-                                            paths=list(self.all_images),
-                                            progress=self._prog_cb(),
-                                            frame_sink=self._viz_cb()))
+        title = "增量入库（自动去重）"
+        self._run_cmd(f"{title} …（操作期间请勿重复点击）",
+                      self.svc.add_index, "add", self.prefix,
+                      paths=list(self.all_images), cfg=cfg,
+                      perf=self.perf_build_var.get(), title=title)
 
     # ------------------------------------------------------------------
-    # 索引引擎缓存：避免每次搜图都重新加载索引（444k 瓦片库 3.6s/1.26GB）
+    # 索引引擎缓存 / 内存释放：全部在服务层（mmap 释放时机的唯一持有者）
     # ------------------------------------------------------------------
-    @staticmethod
-    def _eng_sig(cfg: Config, prefix: str) -> tuple:
-        """影响已加载索引语义/特征的参数 —— 变则缓存失效。"""
-        return (prefix, cfg.model, cfg.device, bool(cfg.fp16), cfg.coarse_size,
-                cfg.coarse_blur, bool(cfg.use_hu), bool(cfg.use_fp),
-                bool(cfg.invert_binary), getattr(cfg, "png_decoder", "cv2"),
-                float(cfg.hu_weight), float(cfg.fp_weight))
-
-    def _engine_for(self, cfg: Config, prefix: str):
-        """返回 (引擎, 是否命中缓存)。未命中时加载索引（慢，见 open()）。"""
-        sig = self._eng_sig(cfg, prefix)
-        with self._eng_lock:
-            hit = self._eng_cache.get(prefix)
-            if hit is not None and hit[0] == sig:
-                return hit[1], True
-        eng = HybridEngine(cfg)
-        eng.open(prefix)
-        with self._eng_lock:
-            self._eng_cache[prefix] = (sig, eng)
-            # 最多两套：整图 + 瓦片（混合检索同时用）；多出的先淘汰
-            while len(self._eng_cache) > 2:
-                for k in list(self._eng_cache):
-                    if k != prefix:
-                        self._eng_cache.pop(k, None)
-                        break
-                else:
-                    break
-        return eng, False
-
     def _drop_engines(self, reason: str = "", silent: bool = False) -> float:
-        """释放缓存的索引引擎（npz/memmap + 桶表），并回收内存。"""
-        with self._eng_lock:
-            n = len(self._eng_cache)
-            self._eng_cache.clear()
-        freed = 0.0
-        try:
-            import gc
-            import psutil
-            p = psutil.Process()
-            before = p.memory_info().rss
-            gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:       # noqa: BLE001
-                pass
-            freed = max(0.0, (before - p.memory_info().rss) / 2 ** 20)
-        except Exception:           # noqa: BLE001
-            pass
-        if not silent:
-            # 可能由 worker 线程调用：日志一律经消息队列回主线程渲染
-            self.q.put(("log", f"已释放索引内存：{n} 套引擎，"
-                               f"RSS 回落 {freed:.0f} MB"
-                               + (f"（{reason}）" if reason else "")))
-        return freed
+        """释放缓存的索引引擎（npz/memmap + 桶表）并回收内存。"""
+        return self.svc.release_engines(reason, silent=silent)
 
     # ------------------------------------------------------------------
-    # 性能图（可选导出）
+    # 性能图（可选导出）：打点与落盘在服务层，这里只做界面提示
     # ------------------------------------------------------------------
-    def _perf_start(self, stage: str, title: str, cfg: Config,
-                    prefix: str = "", meta: dict | None = None):
-        """按开关创建阶段画像器；未开启返回 None（零开销）。"""
-        var = self.perf_build_var if stage == "index" else self.perf_search_var
-        if not var.get():
-            return None
-        prof = StageProfiler(stage, title, cfg=cfg, prefix=prefix, meta=meta)
-        prof.start()
-        return prof
-
-    def _perf_finish(self, prof, status: str = "ok",
-                     extra: list | None = None, note: str = "") -> str:
-        """worker 线程调用：只写报告并记路径，UI 更新交给主线程。"""
-        if prof is None:
-            return ""
-        path = prof.stop(status=status, extra=extra, note=note)
-        if path:
-            self._last_perf_report = path
-        return path
-
     def _perf_report_ready(self, path: str, modal: bool = False):
         """主线程：提示已导出 + 点亮“最近性能图”按钮。
 
@@ -1995,45 +1858,17 @@ class App:
                 + "\n\n是否继续？"):
             return
         self._set_busy(True, "转换索引存储格式…")
-        threading.Thread(target=self._compact_worker, args=(cfg, prefixes),
+        threading.Thread(target=self.svc.compact, args=("compact", prefixes),
+                         kwargs={"cfg": cfg,
+                                 "perf": self.perf_build_var.get()},
                          daemon=True).start()
-
-    def _compact_worker(self, cfg: Config, prefixes: list):
-        from hybrid_search.store import compact
-        prof = self._perf_start("index", "索引存储格式转换", cfg,
-                                prefix=", ".join(prefixes))
-        try:
-            self._drop_engines("转换前释放索引内存", silent=True)
-            total = len(prefixes)
-            for i, p in enumerate(prefixes):
-                r = compact(
-                    p, delete_legacy=False,
-                    progress=(lambda d, t, ph, _i=i: self._compact_prog(
-                        _i, total, d, t, ph, prof)))
-                msg = (f"{os.path.basename(p)}.* 已是侧车格式"
-                       if r.get("already") else
-                       f"{os.path.basename(p)}.* 转换完成：{r['n']} 行，"
-                       f"{r['sec']:.1f}s")
-                self.q.put(("log", msg))
-            self.q.put(("compact_done",
-                        {"perf": self._perf_finish(prof, note="完成")}))
-        except Exception as e:  # noqa: BLE001
-            self._perf_finish(prof, status="error", note=str(e)[:120])
-            self.q.put(("error", f"索引存储转换失败：{e}\n{traceback.format_exc()}"))
-
-    def _compact_prog(self, i: int, total: int, done: int, t: int,
-                      phase: str, prof):
-        self.q.put(("progress", (i * t + done, total * t, "compact")))
-        if prof is not None:
-            prof.bump(i * t + done, total * t)
 
     def _on_compact_done(self, data: dict):
         self._set_busy(False, "索引存储已优化（下次加载更快、内存更省）")
         self._drop_engines("格式已变，缓存失效", silent=True)
-        self._perf_report_ready(data.get("perf", ""), modal=True)
 
     def _open_last_perf(self):
-        p = self._last_perf_report or latest_report()
+        p = self.svc.latest_perf_report()
         if not p or not os.path.exists(p):
             messagebox.showinfo("性能图", "还没有生成过性能图。\n"
                                           "可在“建库参数/检索参数”页勾选导出开关。")
@@ -2042,43 +1877,6 @@ class App:
             os.startfile(p)         # noqa: S606 Windows 打开默认浏览器
         except Exception as e:      # noqa: BLE001
             messagebox.showwarning("打开失败", f"{p}\n{e}")
-
-    def _run_index(self, title: str, cfg: Config, op):
-        # 阶段进度状态复位
-        self._prog_phase = None
-        self._prog_t0 = time.monotonic()
-        self._prog_done0 = 0
-        self._set_busy(True, f"{title} …（操作期间请勿重复点击）")
-        threading.Thread(target=self._index_worker, args=(title, cfg, op),
-                         daemon=True).start()
-
-    def _index_worker(self, title: str, cfg: Config, op):
-        prof = self._perf_start("index", title, cfg, prefix=self.prefix,
-                                meta={"图片数": len(self.all_images)})
-        self._cur_prof = prof          # 供 _prog_cb 在阶段切换时打点
-        self._prog_prof_phase = None
-        try:
-            # 建库前先释放缓存引擎：把内存让给解码流水线（瓦片库可占 1GB+）
-            self._drop_engines("建库前腾内存", silent=True)
-            t0 = time.time()
-            eng = HybridEngine(cfg)
-            if prof:
-                prof.mark("初始化引擎", 耗时=round(time.time() - t0, 3))
-                prof.mark("解码+特征提取(粗筛与ResNet同一条流水线)")
-            n = op(eng)
-            if prof:
-                # op() 返回即代表“特征提取 + 落盘”全部结束（engine 内部有
-                # save/done 阶段边界事件，这里再补一条终结打点）
-                prof.mark("op 返回：提取+落盘完成", 张数=n)
-            self.q.put(("indexed", {"n": n, "prefix": self.prefix, "title": title,
-                                    "perf": self._perf_finish(
-                                        prof, note=f"{n} 张",
-                                        extra=[("结果", [("入库张数", n)])])}))
-        except Exception as e:  # noqa: BLE001
-            self._perf_finish(prof, status="error", note=str(e)[:120])
-            self.q.put(("error", f"{title}失败：{e}\n{traceback.format_exc()}"))
-        finally:
-            self._cur_prof = None
 
     # ------------------------------------------------------------------
     # 查验去重（一对多重复图）
@@ -2109,25 +1907,9 @@ class App:
                 "是否开始？"):
             return
         self._reset_viz()
-        self._set_busy(True, "查验重复图：复用索引 + 解码未入库文件…")
-        threading.Thread(target=self._dedup_worker,
-                         args=(list(self.all_images), threshold),
-                         daemon=True).start()
-
-    def _dedup_worker(self, paths: list, threshold: float):
-        try:
-            from hybrid_search import dedup as DD
-            prefix = self.prefix if self._index_exists() else None
-
-            def prog(done, total, phase):
-                self.q.put(("progress", (done, max(int(total), 1),
-                                         f"查验去重·{phase}")))
-
-            rep = DD.scan_duplicates(paths, prefix=prefix,
-                                     threshold=threshold, progress=prog)
-            self.q.put(("dedup_done", rep))
-        except Exception as e:  # noqa: BLE001
-            self.q.put(("error", f"查验去重失败：{e}\n{traceback.format_exc()}"))
+        self._run_cmd("查验重复图：复用索引 + 解码未入库文件…",
+                      self.svc.dedup_scan, "dedup", list(self.all_images),
+                      threshold=threshold, prefix=self.prefix)
 
     def _on_dedup_done(self, rep):
         self._set_busy(False)
@@ -2146,26 +1928,6 @@ class App:
         self._status(f"查验去重完成：{len(rep.groups)} 组重复，"
                      f"可释放 {human_bytes(rep.wasted_bytes)}")
         DedupWindow(self, rep)
-
-    def _prog_cb(self, prof=None):
-        """engine 进度回调 -> 消息队列（worker 线程调用，主线程 pump 渲染）。
-
-        阶段切换时**同时给性能图打点**：这样性能图上能明确看到
-        “解码+特征提取 / 写盘 / 全部完成”的边界，不会误判 ResNet 还没跑完。
-        """
-        def cb(done, total, phase):
-            self.q.put(("progress", (done, total, phase)))
-            p = prof if prof is not None else getattr(self, "_cur_prof", None)
-            if p is None:
-                return
-            p.bump(done, total)
-            if phase != getattr(self, "_prog_prof_phase", None):
-                self._prog_prof_phase = phase
-                label = self._PHASE_LABELS.get(phase, phase or "")
-                p.mark(f"阶段：{label}", 计数=f"{done}/{total}")
-                if phase == "done":
-                    p.mark("特征提取与落盘全部完成")
-        return cb
 
     def _reset_viz(self):
         """新一轮索引任务开始：清空帧队列、重置阶段与计数。"""
@@ -2189,18 +1951,16 @@ class App:
     def _index_exists(self) -> bool:
         if not self.prefix:
             self.prefix = self._auto_prefix()
-        return bool(self.prefix) and os.path.exists(self.prefix + ".meta.json")
+        return SearchService.meta_exists(self.prefix)
 
     def _tiles_prefix(self) -> str:
-        """瓦片索引前缀：与整图索引同目录下的 gallery_tiles。"""
-        from hybrid_search.tile_index import tiles_prefix_of
+        """瓦片索引前缀：与整图索引同目录下的 gallery_tiles（推导在服务层）。"""
         if not self.prefix:
             self.prefix = self._auto_prefix()
-        return tiles_prefix_of(self.prefix) if self.prefix else ""
+        return SearchService.tiles_prefix(self.prefix)
 
     def _tiles_index_exists(self) -> bool:
-        tp = self._tiles_prefix()
-        return bool(tp) and os.path.exists(tp + ".meta.json")
+        return SearchService.meta_exists(self._tiles_prefix())
 
     def _tiles_index(self):
         """④ 子图索引：无 → 全量切块构建；已有 → 增量（参数从 meta 恢复）。"""
@@ -2215,64 +1975,19 @@ class App:
             return
         exists = self._tiles_index_exists()
         self._reset_viz()
-        self._set_busy(True,
-                       "子图索引增量（切块去重）…" if exists
-                       else "子图索引构建（大图切 512px+25% 重叠瓦片）…")
-        threading.Thread(target=self._tiles_index_worker,
-                         args=(cfg, tp, exists), daemon=True).start()
-
-    def _tiles_index_worker(self, cfg: Config, tp: str, exists: bool):
-        title = "子图索引增量" if exists else "子图索引构建"
-        prof = self._perf_start("index", title, cfg, prefix=tp,
-                                meta={"图片数": len(self.all_images),
-                                      "模式": "增量" if exists else "全量"})
-        try:
-            from hybrid_search import tile_index as TI
-            self._drop_engines("瓦片建库前腾内存", silent=True)
-            eng = HybridEngine(cfg)
-            prog = self._prog_cb(prof)
-            # 瓦片建库进度回调为 (done,total) 两参；带第三参时是阶段边界
-            # （save/done），必须原样透传，否则性能图看不到“结束状态”
-            cb2 = (lambda d, t, ph="tiles": prog(d, t, ph)) if prog else None
-            # 过程可视化帧(低开销)：每瓦片一张 64×64 二值帧 + 每文件首块 16×16
-            # 象限帧，复用既有 24fps 绘制节流与有界帧队列，不影响建库速率
-            viz = self._viz_cb()
-            if exists:
-                t0 = time.time()
-                eng.open(tp)
-                if prof:
-                    prof.mark("加载已有瓦片索引", 复用="否",
-                              行数=eng.coarse.size,
-                              耗时=round(time.time() - t0, 2))
-                    prof.mark("增量解码+特征提取")
-                n = TI.add_tiles(eng, tp, paths=list(self.all_images),
-                                 progress=cb2, frame_sink=viz)
-            else:
-                if prof:
-                    prof.mark("全量解码+特征提取")
-                n = TI.build_tiles(eng, tp, paths=list(self.all_images),
-                                   progress=cb2, frame_sink=viz)
-            if prof:
-                prof.mark("写盘完成")
-            self.q.put(("tiles_done", {"n": n, "title": title, "prefix": tp,
-                                       "exists": exists,
-                                       "perf": self._perf_finish(
-                                           prof, note=f"{n} 块",
-                                           extra=[("结果", [("入库瓦片", n)])])}))
-        except Exception as e:  # noqa: BLE001
-            perf = self._perf_finish(prof, status="error", note=str(e)[:120])
-            self.q.put(("error",
-                        f"{title}失败：{e}\n{traceback.format_exc()}"))
-            if perf:
-                self.q.put(("perf", perf))
+        self._run_cmd(
+            "子图索引增量（切块去重）…" if exists
+            else "子图索引构建（大图切 512px+25% 重叠瓦片）…",
+            self.svc.tiles_index, "tiles", tp,
+            paths=list(self.all_images), exists=exists, cfg=cfg,
+            perf=self.perf_build_var.get(),
+            perf_meta={"图片数": len(self.all_images)})
 
     def _load_indexed_set(self):
-        try:
-            data = IndexFiles(self.prefix).load_coarse()
-            self.indexed_set = {os.path.normcase(os.path.abspath(p))
-                                for p in data["paths"]}
-        except Exception as e:  # noqa: BLE001
-            self._log(f"读取已索引清单失败：{e}")
+        """已入库路径集合（读索引由服务层做）；失败时保持原集合不变。"""
+        paths = self.svc.indexed_paths(self.prefix)
+        if paths:
+            self.indexed_set = set(paths)
 
     # ==================================================================
     # 右区：图片列表 / 检索
@@ -2475,78 +2190,14 @@ class App:
             return
         self._set_busy(True, f"检索中：{os.path.basename(q)} …")
         self.last_query = q
-        threading.Thread(target=self._search_worker, args=(q, cfg),
-                         daemon=True).start()
+        self._start_task(self.svc.search, "search", q, mode,
+                         prefix=self.prefix, cfg=cfg,
+                         perf=self.perf_search_var.get())
 
-    def _search_worker(self, q: str, cfg: Config):
-        mode = self.search_mode_var.get()
-        prof = self._perf_start("search", f"以图搜图({mode})", cfg,
-                                prefix=self.prefix,
-                                meta={"查询图": os.path.basename(q),
-                                      "模式": mode})
-        try:
-            if mode == "full":
-                t0 = time.time()
-                eng, cached = self._engine_for(cfg, self.prefix)
-                if prof:
-                    prof.mark("加载索引", 复用="是" if cached else "否",
-                              耗时=round(time.time() - t0, 3),
-                              库内=eng.coarse.size)
-                    prof.mark("粗筛+ResNet检索")
-                out = eng.search(q, coarse_k=cfg.coarse_k, top_k=cfg.top_k)
-            else:
-                from hybrid_search import tile_index as TI
-                tp = TI.tiles_prefix_of(self.prefix)
-                if mode == "tiles":
-                    t0 = time.time()
-                    eng, cached = self._engine_for(cfg, tp)
-                    if prof:
-                        prof.mark("加载瓦片索引", 复用="是" if cached else "否",
-                                  耗时=round(time.time() - t0, 3),
-                                  瓦片数=eng.coarse.size)
-                        prof.mark("瓦片检索(切块聚合+精排)")
-                    out = TI.search_tiles_tiled(eng, q, top_k=cfg.top_k,
-                                                coarse_k=cfg.coarse_k,
-                                                method="lsh")
-                else:                      # hybrid：两路各取 Top20 再合并（结果 ≤20）
-                    t0 = time.time()
-                    eng_full, c1 = self._engine_for(cfg, self.prefix)
-                    eng_t, c2 = self._engine_for(cfg, tp)
-                    # 共享特征提取器（同 cfg 模型），避免重复加载模型
-                    ex = getattr(eng_full, "_extractor", None)
-                    if ex is not None:
-                        eng_t._extractor = ex  # noqa: SLF001 同项目协作
-                    if prof:
-                        prof.mark("加载两套索引", 复用=f"{c1}/{c2}",
-                                  耗时=round(time.time() - t0, 3))
-                        prof.mark("整图检索")
-                    o_full = eng_full.search(q, coarse_k=cfg.coarse_k,
-                                             top_k=20)
-                    if prof:
-                        prof.mark("瓦片检索")
-                    o_t = TI.search_tiles_tiled(eng_t, q, top_k=20,
-                                                coarse_k=cfg.coarse_k,
-                                                method="lsh")
-                    out = TI.merge_hybrid(o_full, o_t, q, top_k=20)
-            hits = [(h.rank, h.path, h.fine_score, h.coarse_score, h.d_fp,
-                     h.box, h.match_kind) for h in out.hits]
-            perf = ""
-            if prof:
-                perf = self._perf_finish(
-                    prof, note=f"命中 {len(hits)} 条",
-                    extra=[("检索耗时明细(s)", list(out.times.items())),
-                           ("结果", [("库内条目", out.db_size),
-                                     ("候选保留", out.coarse_kept),
-                                     ("仅粗筛", int(bool(out.coarse_only))),
-                                     ("剔除自身", int(bool(out.self_excluded)))])])
-            self.q.put(("search_done", {
-                "hits": hits, "db": out.db_size, "kept": out.coarse_kept,
-                "coarse_only": out.coarse_only,
-                "self_excluded": out.self_excluded, "times": out.times,
-                "method": mode, "perf": perf}))
-        except Exception as e:  # noqa: BLE001
-            self._perf_finish(prof, status="error", note=str(e)[:120])
-            self.q.put(("error", f"检索失败：{e}\n{traceback.format_exc()}"))
+    def _start_task(self, fn, *args, **kwargs):
+        """把服务层命令放到后台 daemon 线程（界面不阻塞、也不直接碰引擎）。"""
+        threading.Thread(target=fn, args=args, kwargs=kwargs,
+                         daemon=True).start()
 
     # ---- 结果网格 ----
     def _show_results(self, hits):
@@ -2622,15 +2273,9 @@ class App:
         if not p or not os.path.exists(p):
             messagebox.showinfo("提示", "先在结果区点选一个缩略图")
             return
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(p)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", p])
-            else:
-                subprocess.Popen(["xdg-open", p])
-        except Exception as e:  # noqa: BLE001
-            messagebox.showerror("错误", f"无法打开图片：{e}")
+        ok, err = self.svc.open_in_shell(p)
+        if not ok:
+            messagebox.showerror("错误", f"无法打开图片：{err}")
 
     def _copy_selected(self):
         p = self._selected_hit_path()
@@ -2651,8 +2296,7 @@ class App:
             filetypes=[("PNG 图片", "*.png")])
         if not p:
             return
-        from hybrid_search.visuals import save_contact_sheet
-        ok = save_contact_sheet([h[1] for h in self.last_hits], p)
+        ok = self.svc.export_sheet([h[1] for h in self.last_hits], p)
         if ok:
             self._status(f"总览图已保存：{p}")
 
@@ -2675,6 +2319,10 @@ class App:
                     bucket = self._viz_queue.get(phase)
                     if bucket is not None:
                         bucket.append(msg[1])
+                elif kind == "phase_boundary":
+                    # 铁律：任务以 save/done 收尾；这里只做记录（诊断/未来 Web 版广播）
+                    task_id, phase = msg[1]
+                    self._last_phase_boundary[task_id] = phase
                 elif kind == "scan_done":
                     self._on_scan_done(msg[1])
                 elif kind == "indexed":
@@ -2686,14 +2334,24 @@ class App:
                 elif kind == "dedup_done":
                     self._on_dedup_done(msg[1])
                 elif kind == "perf":
-                    self._perf_report_ready(msg[1])
+                    payload = msg[1]
+                    if isinstance(payload, tuple):
+                        self._perf_report_ready(payload[0], bool(payload[1]))
+                    else:              # 兼容旧式单值载荷（外部脚本直接投递）
+                        self._perf_report_ready(payload)
                 elif kind == "compact_done":
                     self._on_compact_done(msg[1])
                 elif kind == "handoff_done":
                     self._on_handoff_done(msg[1])
                 elif kind == "error":
-                    self._log("【错误】\n" + msg[1])
-                    messagebox.showerror("操作失败", msg[1].splitlines()[0])
+                    payload = msg[1]
+                    if isinstance(payload, tuple):
+                        text, tb, title = payload
+                    else:              # 兼容旧式单值载荷
+                        text, tb, title = payload, "", "操作失败"
+                    self._log("【错误】\n" + text + (f"\n{tb}" if tb else ""))
+                    messagebox.showerror(title,
+                                         text.splitlines()[0] if text else "未知错误")
                     self._set_busy(False)
         except queue.Empty:
             pass
@@ -2702,22 +2360,13 @@ class App:
         self.root.after(33, self._pump)
 
     # ---- 双阶段进度渲染（融合建库 / 粗筛 / 校验 统一入口）-------------
-    _PHASE_LABELS = {
-        "fused": "粗筛+ResNet 融合提取(单遍解码)",
-        "coarse": "① 二值法粗筛",
-        "fine": "② ResNet 全库特征",
-        "verify": "解码校验",
-        "save": "③ 特征提取完成 · 正在写盘",
-        "done": "✅ 全部完成（粗筛与精排均已落盘）",
-        "compact": "索引存储格式转换",
-    }
-
+    # 阶段文案唯一出处：hybrid_search.service.PHASE_LABELS
     def _render_progress(self, payload):
         """payload=(done, total, phase) 或 (done, total)：更新进度条与状态栏。
         状态栏文案：阶段名 · 计数/总数(百分比) · 张/秒 · 预计剩余。"""
         done, total = payload[0], payload[1]
         phase = payload[2] if len(payload) > 2 else ""
-        label = self._PHASE_LABELS.get(phase, phase or "处理中")
+        label = PHASE_LABELS.get(phase, phase or "处理中")
         if total <= 0:
             return
         # 阶段切换时重置该阶段速率估算基准
@@ -2780,7 +2429,7 @@ class App:
                 f"（累计 {self._viz_frames} 帧）")
         else:
             self.viz_status_var.set(f"✅ 已完成（累计 {self._viz_frames} 帧）")
-        self._perf_report_ready(data.get("perf", ""), modal=True)
+        # 性能图提示由服务层的 perf_report 事件驱动（见 _on_service_event）
 
     def _on_search_done(self, data: dict):
         self.progress.configure(value=0)
@@ -2810,7 +2459,6 @@ class App:
         self.result_info_var.set(f"{len(hits)} 个结果  |  {info}")
         self.detail_var.set("点击结果缩略图查看详情（局部命中缩略图带红框）")
         self._set_busy(False, f"检索完成，返回 {len(hits)} 个结果")
-        self._perf_report_ready(data.get("perf", ""))
 
     def _on_tiles_done(self, data: dict):
         self.progress.configure(value=0)
@@ -2824,7 +2472,7 @@ class App:
             f"子图索引已构建：{n} 个瓦片 -> {data['prefix']}.*")
         self._log(f"{data['title']}完成：{n} 个瓦片 -> {data['prefix']}.*")
         self._drop_engines("瓦片索引已改写，缓存失效", silent=True)
-        self._perf_report_ready(data.get("perf", ""), modal=True)
+        # 性能图提示由服务层的 perf_report 事件驱动（见 _on_service_event）
 
     # ------------------------------------------------------------------
     def _log(self, text: str):

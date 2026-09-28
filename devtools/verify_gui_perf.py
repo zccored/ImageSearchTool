@@ -18,7 +18,6 @@ import queue
 import shutil
 import sys
 import tempfile
-import threading
 import time
 
 sys.path.insert(0, r"D:\code\新的代码\全栈图库管理器 v3.2bata\image-search")
@@ -57,10 +56,11 @@ class Stub(G.App):
         self.perf_search_var = V(perf_search)
         self.perf_build_var = V(perf_build)
         self.q = queue.Queue()
-        self._eng_lock = threading.Lock()
-        self._eng_cache = {}
+        # 编排层在服务层（P0 起）：这里给 Stub 装一份，事件仍汇入 self.q
+        self.svc = G.SearchService(emit=self._on_service_event)
         self._perf_ok = set()
         self._last_perf_report = ""
+        self._last_phase_boundary = {}
         self.btn_perf_open = None
         self.all_images = []
         self._viz_queue = {"coarse": __import__("collections").deque(maxlen=8),
@@ -97,7 +97,7 @@ cfg = Config()
 cfg.top_k = 5
 for i in range(3):
     t0 = time.time()
-    G.App._search_worker(st, Q, cfg)
+    st.svc.search("search", Q, MODE, prefix=st.prefix, cfg=cfg)
     msgs = drain(st, kinds={"search_done", "error"})
     dt = time.time() - t0
     if not msgs or msgs[0][0] != "search_done":
@@ -107,15 +107,15 @@ for i in range(3):
     top1 = os.path.basename(d["hits"][0][1]) if d["hits"] else "-"
     print(f"  search#{i} 耗时 {dt:5.2f}s  rss={rss():6.0f}MB  "
           f"top1={top1}  total={d['times'].get('total', 0):.2f}s")
-print("  引擎缓存:", list(st._eng_cache.keys()))
+print("  引擎缓存:", list(st.svc._eng_cache.keys()))
 print("  RSS 释放前:", f"{rss():.0f} MB")
-freed = st._drop_engines("验证")
+freed = st.svc.release_engines("验证")
 drain(st)
-print(f"  _drop_engines 后 rss={rss():.0f}MB (报告回落 {freed:.0f}MB)")
+print(f"  release_engines 后 rss={rss():.0f}MB (报告回落 {freed:.0f}MB)")
 
 print("=========== B) 搜图性能图导出 ===========")
 st2 = Stub(MODE, perf_search=True)
-G.App._search_worker(st2, Q, cfg)
+st2.svc.search("search", Q, MODE, prefix=st2.prefix, cfg=cfg, perf=True)
 msgs = drain(st2, kinds={"search_done", "error"})
 perf_path = msgs[0][1].get("perf", "") if msgs and msgs[0][0] == "search_done" else ""
 print("  报告:", perf_path or "(未生成)")
@@ -127,7 +127,7 @@ if perf_path:
           f"阶段={[p['name'] for p in js['phases']]}")
     print("  RSS 曲线首末:", f"{js['rows'][0].get('rssMB'):.0f} -> "
                            f"{js['rows'][-1].get('rssMB'):.0f} MB")
-st2._drop_engines("验证")
+st2.svc.release_engines("验证")
 drain(st2)
 
 print("=========== C) 索引阶段性能图 + add_tiles 增量 ===========")
@@ -155,7 +155,8 @@ try:
     cfg3.workers = 4
     cfg3.tile_decode_slots = 4
     t0 = time.time()
-    G.App._tiles_index_worker(st3, cfg3, tp, False)
+    st3.svc.tiles_index("tiles", tp, paths=list(paths), exists=False,
+                        cfg=cfg3, perf=True)
     msgs = drain(st3, kinds={"tiles_done", "error"})
     print(f"  建库 {time.time() - t0:.1f}s ->", msgs[0][0] if msgs else "无消息")
     n1 = msgs[0][1]["n"] if msgs and msgs[0][0] == "tiles_done" else 0
@@ -166,18 +167,21 @@ try:
     paths += make_imgs(2, "b")
     st3.all_images = list(paths)
     t0 = time.time()
-    G.App._tiles_index_worker(st3, cfg3, tp, True)
+    st3.svc.tiles_index("tiles", tp, paths=list(paths), exists=True,
+                        cfg=cfg3, perf=True)
     msgs = drain(st3, kinds={"tiles_done", "error"})
     dt = time.time() - t0
     n2 = msgs[0][1]["n"] if msgs and msgs[0][0] == "tiles_done" else 0
     perf2 = msgs[0][1].get("perf", "") if msgs and msgs[0][0] == "tiles_done" else ""
     print(f"  增量 {dt:.1f}s 新增瓦片={n2}（应为 8）报告={bool(perf2)}")
     if msgs and msgs[0][0] == "error":
-        print("  错误:", msgs[0][1][:400])
+        payload = msgs[0][1]
+        print("  错误:", (payload[0] if isinstance(payload, tuple) else payload)[:400])
 
     # 再跑一次增量（无新图）应为 0
     t0 = time.time()
-    G.App._tiles_index_worker(st3, cfg3, tp, True)
+    st3.svc.tiles_index("tiles", tp, paths=list(paths), exists=True,
+                        cfg=cfg3, perf=True)
     msgs = drain(st3, kinds={"tiles_done", "error"})
     n3 = msgs[0][1]["n"] if msgs and msgs[0][0] == "tiles_done" else -1
     print(f"  空增量 {time.time() - t0:.1f}s 新增瓦片={n3}（应为 0）")
