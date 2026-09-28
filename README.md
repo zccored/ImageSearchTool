@@ -214,7 +214,7 @@ PNG 无法域缩放、大 JPEG 熵解码占主导），**不是显存或 IO 调�
   <summary>旧版可视化界面（日常使用推荐）</summary>
 
 <details>
-  <summary>新界面（Web 版，可选）</summary>
+  <summary>新界面（Web 版，Bu Ling~Bu Ling 好看的界面，以后可视化的主要更新中心）</summary>
 与上一节**功能一致的现代化界面**：Python 侧只有一层壳 `gui_web.py`（pywebview 6 + 自建只读
 WSGI），界面本体在 `frontend/`（Vue3 + Vite，本质是一个本地网页）。两套界面共用同一服务层
 `hybrid_search/service.py`（命令、事件、参数取值只有这一份），所以**建出来的索引完全一样**，
