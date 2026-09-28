@@ -8,6 +8,13 @@ tqdm
 psutil>=5.9
 nvidia-ml-py>=12.535        # 提供 pynvml，仅 NVIDIA 显卡需要（显存/利用率采样）
 
+# 新 Web 界面（pywebview + Vue3）：源码在 frontend/，产物 frontend/dist 随包分发（不用它可不装）
+#   * 运行期还需要系统组件 **WebView2 运行时**（Win11 自带；旧 Win10/离线机见打包说明）
+#   * win32 侧由 pywebview 带入 pythonnet / clr_loader / proxy_tools
+pywebview>=6.2.1
+bottle==0.13.4              # pywebview 内置 HTTP 服务器依赖；锁版本避免上游行为漂移（G6）
+pythonnet>=3.1              # win32 后端；分类器声明支持 Python 3.14
+
 # 瓦片（局部）索引的 LSH 候选：纯 numpy 实现，无需额外依赖
 
 # ResNet 精排（可选，跑精排前安装）

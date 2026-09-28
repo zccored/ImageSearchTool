@@ -229,3 +229,7 @@ thumbs/
 # 3) Python 字节码与打包中间产物
 *.pyc
 *.pyo
+# 4) 新界面（Web 版，frontend/）：依赖与构建产物不入库
+#    （`frontend/dist` 也被上面模板里的 `dist/` 覆盖，这里显式写一遍便于理解）
+frontend/node_modules/
+frontend/dist/
