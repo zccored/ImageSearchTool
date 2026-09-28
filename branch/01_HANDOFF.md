@@ -114,6 +114,14 @@ dd9afc3 ui: PNG 解码器(旁路) 下拉 + 默认 libdeflate；两个选项收�
 
 ## 五、待办清单与用户已做决定
 
+> **2026-09-28 补记（第二次交接）**：C2 已完成并定档"不采纳"（见下表）；
+> 另修正两处上一轮的数字：**索引内 JPEG 是约 2.3 万张**（"2.5 万"是扫描到的文件数）、
+> **渐进式 JPEG 占 3.7%**（旧记"样本 0%"是抽样偏差）；全库 EXIF 方向 **100% = 1**。
+> 新增 6 个 devtools 脚本（`probe_jpeg_census` / `fetch_turbojpeg` / `bench_jpeg_decoders` /
+> `verify_jpeg_decoder` / `ab_jpeg_turbo` / `ab_jpeg_mt`），按既有口径**不入库**。
+> 另记录一个口径坑：`devtools/ab_build_bench.py` 的 `--png-decoder` 默认是 `cv2`，
+> 而生产默认是 `libdeflate`，做配对 A/B 时要显式指定，否则结论会跑偏。
+
 **用户已定**：不发 Release（本轮净负）→ 先回退+校验（**已完成，全绿**）→ 再按下面清单推进。
 
 | # | 事项 | 状态/决定 |
@@ -122,7 +130,7 @@ dd9afc3 ui: PNG 解码器(旁路) 下拉 + 默认 libdeflate；两个选项收�
 | A2 | 同口径全库 A/B（基准台 `--png-decoder cv2`，4 万张 ≈8 分钟），挤掉 GUI vs 基准台的口径噪声 | 待做（用户此前未选） |
 | A4 | `cv2_threads` 结论定档为"实验性、默认 0"（代码注释） | 待做（改动已回退，需在文档里说明） |
 | C1+C3 | JPEG 零成本侦察 | **已完成**（见上表：p99/p50 6.08；95% baseline、0% progressive） |
-| C2 | JPEG 解码器对照（cv2 vs PyTurboJPEG vs imagecodecs）+ 逐位校验 + 性能图 | **待做（下一步）** |
+| C2 | JPEG 解码器对照（cv2 vs PyTurboJPEG vs imagecodecs）+ 逐位校验 + 性能图 | **已完成 → ❌ 不采纳**（解码级 TurboJPEG 1.125× 且逐位一致，但建库级 +20~22.5% CPU 净负；详见 `docs/perf-plan.md` 第六节） |
 | C4 | 更激进 DCT 缩放阈值（>1600 用 1/2） | 未评估；**代价：几何/语义变化 → 必须重建索引 + 重跑召回** |
 | D1 | 旁路峰值内存 +31% 收敛（尺寸分流 / 分段 inflate 受限） | 未做 |
 | D2 | 预处理约 5.6 核（torchvision/PIL Resize+Crop）→ 换 cv2 | 未做；代价 cosine 漂 0.9945 需重建 |
