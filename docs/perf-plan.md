@@ -336,11 +336,98 @@ pinned 传输带宽：H2D **12.05 GB/s**、D2H **12.26 GB/s**（256 MB，即 PCI
 5. **同名文件**：图库里不同目录的同名图很常见，按 basename 做基准键会误报"逐位不一致"；
    必须按完整路径。
 
-复现命令见第六节。
+复现命令见第七节。
 
 ---
 
-## 六、复现命令
+## 六、JPEG 解码器对照（C2 · 2026-09-28）—— ❌ 建库级净负，不采纳
+
+**问题**：JPEG 解码占整图建库 CPU 约 1/4（实测见下），换一个更快的 libjpeg-turbo 构建能否把这块拿下来？
+**候选**：PyTurboJPEG（libjpeg-turbo 3.2.0，conda-forge 预编译 DLL，纯 Python 解包，不跑安装器）、
+imagecodecs jpeg（同为 libjpeg-turbo 3.2.0）与 imagecodecs mozjpeg（4.1.5）；
+**基线**：cv2 捆绑的 libjpeg-turbo 3.0.3（现状）。
+
+### 6.1 全库普查（只读表头，约 2.5 万张 JPEG）
+
+| 项 | 实测 | 说明 |
+| :--- | :--- | :--- |
+| 编码类别 | 基线 96.3% / **渐进 3.7%** | 上一轮"样本 0% 渐进"是抽样偏差，全库实测有 3.7% |
+| EXIF 方向 | **100% = 1** | 换库不需要自己做 numpy 转正（但仍对非 1 一律回退，见 6.3） |
+| 采样比 | 4:4:4 **79.9%** / 4:2:0 17.2% / 灰度 1.1% | 以 4:4:4 为主，没有色度上采样开销 |
+| DCT 缩放档 | 全解 49.9% / 1/2 40.0% / 1/4 10.1% / 1/8 0.1%（**占像素 90.8%**） | **关键**：一半张数、九成像素走采样域缩放 |
+
+最后一行决定了候选的成败：**imagecodecs / mozjpeg 不支持 DCT 域缩放解码**，
+只能全尺寸解，在这三个档上像素量多 2~8 倍，因此结构性吃亏（实测 0.88×）。
+
+### 6.2 解码级：TurboJPEG 更快，且逐位一致
+
+配对 A/B（按缩放档分层抽样、每张图同轮跑全部解码器、顺序按 图号+轮号 轮转、3 轮取逐张比值中位）：
+
+| 解码器 | ms/张 | 配对中位比 | 逐位一致（基准=现状） |
+| :--- | ---: | ---: | :--- |
+| cv2 现状（libjpeg-turbo 3.0.3） | 53.76 | 1.000× | 46/46 |
+| **TurboJPEG 3.2.0（同缩放档）** | **48.17** | **1.125×** | **46/46** |
+| imagecodecs jpeg 3.2.0（全尺寸） | 74.43 | 0.884× | 15/46（形状不同，其余档位不可比） |
+| imagecodecs mozjpeg（全尺寸） | 74.15 | 0.882× | 15/46（同上） |
+
+分档：全解 **1.15×** / 1/2 **1.19×** / 1/4 **1.07×** / 1/8 **1.10×** —— 每一档都更快。
+（口径与第五节一致：单线程、按图独立配对；整轮总时长比与配对中位比同向。）
+
+### 6.3 逐位校验：0 位差，但查出一个真实契约差异
+
+逐位一致是换库的准入线（指纹/Hu/ResNet 输入由像素直接决定，有位差就要重建索引）：
+真实图库 **365/365**、合成格式矩阵 **67/67**（渐进/灰度/4:4:4/4:2:2/4:2:0/4:4:0/CMYK/极小图）、
+18 路线程池压测 340 张 0 位差、EXIF 1..8 全部按预期回退。
+
+**过程中查出的差异（重要）**：**截断的 JPEG** 两者行为不同 ——
+cv2 的 `imdecode` 返回 `None`（文件被跳过、不入索引），TurboJPEG 却会补边解出半张图。
+若不拦，这类文件会**从"不入索引"变成"入索引"**，索引内容就变了。
+解法是零成本的结构守卫：**尾部不带 EOI（`FFD9`）一律回退 cv2**。
+实测全库只有 69 张缺 EOI，且它们在 cv2 下都能正常解出 —— 即这条守卫在当前语料上不改变任何一张结果。
+（先试过 TurboJPEG 的 `TJFLAG_STOPONWARNING`，实测对 libjpeg 的 "Premature end of JPEG file" 警告**无效**，
+截断文件照样解出，不能替代该守卫。）
+
+### 6.4 建库级配对 A/B：净负，且可复现
+
+零侵入 A/B（monkey-patch 替 `decode_rgb`，不动主代码；固定 600 张样本、4 轮交替、生产配置 `png_decoder=libdeflate`）：
+
+| 轮 | 现状墙钟 | TurboJPEG 墙钟 | Δwall | ΔCPU |
+| :--- | ---: | ---: | ---: | ---: |
+| 1–4 | 7.6 / 7.1 / 7.0 / 7.2 s | 9.6 / 9.3 / 9.2 / 8.9 s | **+28.6%（中位）** | **+22.5%（中位）** |
+
+**索引数组逐位一致**（`fp`/`hu`/`features` 最大绝对差 0）。三次独立复跑（含 `png_decoder=cv2`、
+含页错误计数）结论同向：ΔCPU **+20%~+22.5%**、Δwall **+24%~+29%**。
+
+**阶段归因把回归钉死了**（同一 A/B 内同时给 `decode_rgb` / `read_bytes` / 前向装计时器）：
+
+| 阶段 | 变化 |
+| :--- | :--- |
+| JPEG 解码 | 22.8 → 18.4 核秒（**1.24× 变快**） |
+| 读盘 | 2.4 → 2.1 核秒（不变） |
+| 前向 | 0.7 → 0.7 核秒（不变） |
+| **PNG 解码（一行没改）** | **69.8 → 99.9 核秒（+43%）** ← 回归全部落在这里 |
+
+PNG 占解码 CPU 的 **75.4%**，所以它被拖慢 43% 足以吃掉 JPEG 省下的那点。
+
+**这不是解码器本身慢**：把建库流水线整个剥掉、只留 18 路线程池的隔离实验里，
+纯 JPEG 负载下 TurboJPEG **Δwall −16.0% / ΔCPU −20.3%**，混合负载 **−8.5% / −11.8%**（PNG 未被拖慢）。
+所以机制是**进程内交互**。已排除的方向：内存页错误只多 6%（不足以解释 +21% CPU）；
+`READ/FORWARD` 均未变。**根因尚未定论** —— 留作后续：怀疑方向是
+本项目用户态与 `tj3Init`/`tj3Destroy`（PyTurboJPEG 每张新建/销毁句柄）带来的分配器/GIL 交互，
+但未取得直接证据。
+
+### 6.5 结论
+
+**不采纳**（判据是"<5% 收益不采纳"，而这里是**负**收益）。
+解码级 1.125×、逐位一致这两条是成立的，若将来要重开这条线，**必须先用持久句柄的 ctypes 绑定
+（而非 PyTurboJPEG 的每张 init/destroy）重做 6.4 的建库级 A/B**，只看建库级结果。
+
+**顺带记录的口径坑**：`devtools/ab_build_bench.py` 自己的 `--png-decoder` 默认是 `cv2`，
+而生产默认是 `libdeflate` —— 两边不一致会让结论跑偏，做 JPEG 类 A/B 时应显式指定。
+
+---
+
+## 七、复现命令
 
 ```bat
 :: 建库 A/B 基准台（固定样本、模型加载与计时分离、内容一致性比对）
@@ -379,15 +466,23 @@ python -E devtools/verify_png_fast.py 2500 40 800   :: 格式矩阵 + 大样本�
 python -E devtools/bench_png_fast.py 6 3 256        :: 解码级逐档性能图（HTML/JSON）
 python -E devtools/ab_build_bench.py --mode tiles --label t_ldf --n 540 --dup 60 --png-decoder libdeflate
 python -E devtools/ab_build_bench.py --mode whole --label w_ldf --n 540 --dup 60 --png-decoder libdeflate
+
+:: JPEG 解码器对照（C2，2026-09-28）：取 DLL → 普查 → 解码级性能图 → 逐位校验 → 建库 A/B → 隔离对照
+python -E devtools/fetch_turbojpeg.py --check          :: conda-forge 纯 Python 解包 turbojpeg.dll（不跑安装器）
+python -E devtools/probe_jpeg_census.py                :: 全库 JPEG 表头普查（缩放档 / EXIF / 基线-渐进）
+python -E devtools/bench_jpeg_decoders.py 15 3         :: 解码级配对 A/B + 逐位校验 + HTML 性能图
+python -E devtools/verify_jpeg_decoder.py 3000 40      :: 逐位校验（真实 + 合成 + 18 路压测 + 截断/损坏回退）
+python -E devtools/ab_jpeg_turbo.py --mode whole --rounds 4 --n 540 --dup 60 --png-decoder libdeflate
+                                                       :: 零侵入建库级配对 A/B（含阶段归因）
+python -E devtools/ab_jpeg_mt.py 200 18 3              :: 剥掉流水线的 18 路解码对照（区分"交互"与"解码器慢"）
 ```
 
 ## 七、环境注意（踩过的坑）
 
 1. `python -E` 是本仓库脚本/基准的**推荐运行方式**：本机曾存在用户级
-   `PYTHONPATH=F:\NX\NXBIN\python`（Siemens NX 留下），它让 `_ctypes.pyd` 从 NX 的
-   Python 加载 → `import ctypes`/`numpy` 直接失败（已删除，原值备份在
-   `C:\Users\zc_cored\.dsh\nx-pythonpath-backup.log`）。NX Open 脚本请按进程设置
-   `PYTHONPATH`，不要设全局。
+   `PYTHONPATH=<第三方 python 目录>`（Siemens NX 留下），它让 `_ctypes.pyd` 从 NX 的
+   Python 加载 → `import ctypes`/`numpy` 直接失败（已删除，原值备份在用户目录
+   `.dsh/` 下）。NX Open 脚本请按进程设置 `PYTHONPATH`，不要设全局。
 2. **numpy 必须是 1.26.x**：torch 2.4.0+cu124 与 numpy 2.x 不兼容
    （`Could not load numpy`/`Could not infer dtype of numpy.float32`）。
    装第三方库（如 imagecodecs）时注意别被连带升级。
@@ -400,6 +495,6 @@ python -E devtools/ab_build_bench.py --mode whole --label w_ldf --n 540 --dup 60
    脚本里用 `BENCH_LINGER` 控制跑完后的窗口滞留秒数（0 = 立刻关，便于串跑多个基准）。
 6. 重定向到文件的 stdout 是**块缓冲**，跑到一半看不到内容属正常；判定进度请看
    `perf_reports/*.json` 是否出现，或看进程 CPU 时间。
-7. 本机无 MSVC / cmake / ninja；有 **MinGW gcc**（`C:\mingw64\bin\gcc.exe`）、
+7. 本机无 MSVC / cmake / ninja；有 **MinGW gcc**（`<MinGW 安装目录>\bin\gcc.exe`，已在 PATH）、
    `cython`、`cffi` —— 要做 C 扩展请按 MinGW 路线（`setuptools` 指定
    `--compiler=mingw32`），或直接用 ctypes + 现成 DLL。
