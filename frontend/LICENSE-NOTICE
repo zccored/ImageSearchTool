@@ -1,0 +1,30 @@
+ImageSearchTool · 图库检索管理器 — 前端（frontend/**）许可说明
+Copyright (C) 2026 zccored
+
+本目录下的一切源文件（.vue / .js / .css / .html / .json，除 node_modules 与构建产物 dist/）
+属 ImageSearchTool 项目的一部分，采用与项目一致的许可：
+
+    GNU Affero General Public License v3.0 only (AGPL-3.0-only)
+    完整条款见仓库根目录的 LICENSE 文件。
+
+This directory (frontend/**) is part of the ImageSearchTool project and is
+licensed under the GNU Affero General Public License v3.0 only (AGPL-3.0-only).
+See the LICENSE file in the repository root for the full terms.
+
+第三方依赖（package.json 中的 vue / vite / @vitejs/plugin-vue 等）保留各自的许可，
+许可文本随 node_modules 分发；这些依赖不随本目录的源码一起被本文件重新许可。
+
+## 打包时随包分发的第三方组件（Web 界面）
+
+| 组件 | 版本（本机实测） | 许可 | 随包位置 |
+| :--- | :--- | :--- | :--- |
+| Vue 3 | 3.5.x | MIT | 前端产物 `dist/assets/*.js`（已编译进产物，无独立许可文件） |
+| Vite / @vitejs/plugin-vue | 6.x / 5.x | MIT | **构建期**依赖，不进包（产物里不含其代码） |
+| pywebview | 6.2.1 | BSD-3-Clause | `_internal/webview/**`（含其自带的 `js/` 资源与 WebView2 interop DLL） |
+| pythonnet / clr_loader | 3.1.0 / 0.3.1 | MIT | `_internal/pythonnet`、`_internal/clr_loader` |
+| bottle | 0.13.4 | MIT | 打进 PYZ 归档 |
+| Microsoft WebView2 SDK 组件 | 随 pywebview | Microsoft 许可 | `_internal/webview/lib/Microsoft.Web.WebView2.*.dll`、`.../runtimes/win-*/native/WebView2Loader.dll` |
+
+> 说明：`frontend/dist` 是**构建产物**（不入库）。它由 `frontend/src/**` 编译而来，其中
+> Vue 的 MIT 许可文本未随产物再分发 —— 若对外分发本工具，请在 `frontend/dist/`
+> 内附一份 `Vue-LICENSE.txt`（内容取自 vue 包内的 `LICENSE`），或在此目录保留本文件。

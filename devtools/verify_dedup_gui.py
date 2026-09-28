@@ -119,7 +119,8 @@ try:
     app.prefix = prefix
 
     print("\n== 1) 扫描 + 渲染 ==")
-    app._dedup_worker(list(paths), 0.04)
+    app.svc.dedup_scan("dedup", list(paths), threshold=0.04,
+                       prefix=app.prefix)
     kind, rep = drain(app)
     if kind != "dedup_done":
         print("  ✗ 扫描失败:", rep)
@@ -196,7 +197,7 @@ try:
     del eng
     n_before_move = len(IndexFiles(prefix).load_coarse()["paths"])
     print(f"  新图入库后索引行数 {n_before_move}")
-    app._dedup_worker(cur, 0.04)
+    app.svc.dedup_scan("dedup", cur, threshold=0.04, prefix=app.prefix)
     kind, rep2 = drain(app)
     print(f"  重新扫描：{len(rep2.groups)} 组")
     win2 = G.DedupWindow(app, rep2)

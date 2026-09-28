@@ -34,7 +34,7 @@ from typing import List, Optional
 
 from .config import Config
 from .engine import Hit, HybridEngine, Outcome
-from .io_utils import LOGGER, setup_logging
+from .io_utils import LOGGER, drain_stderr_noise, setup_logging
 from .visuals import save_contact_sheet
 
 
@@ -80,9 +80,13 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
                          "GPU 前向重叠）")
     sp.add_argument("--torch-threads", type=int, default=0,
                     help="torch 推理线程数（0=保持默认）")
+    # ⚠️ 默认 None = **不覆盖** Config（见 _apply_feature_args）：
+    # 各子命令的 argparse 默认值必须与 config.py 对齐，否则会出现
+    # “build 写进 meta 的参数 ≠ stats/compact 读到的一致性基准” → 索引被拒绝打开。
     sp.add_argument("--png-decoder", choices=["cv2", "imagecodecs", "pillow", "libdeflate"],
-                    default="cv2",
-                    help="PNG 解码器：cv2=OpenCV/libpng（默认）；imagecodecs="
+                    default=None,
+                    help="PNG 解码器（不指定时用 Config 默认值，现为 libdeflate）；"
+                         "cv2=OpenCV/libpng；imagecodecs="
                          "libpng 1.6.58+zlib-ng（实测大 PNG 快 21%%、小 PNG 快 11%%，"
                          "输出逐位一致，需 pip install imagecodecs，缺库自动回退）；"
                          "pillow=安静但慢（0.70~0.74x）；libdeflate=libdeflate 解 IDAT + "
@@ -99,7 +103,8 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
                     help="瓦片建库 GPU 批最长等待毫秒（小=批碎，大=批整）")
     sp.add_argument("--fast-load", action="store_true",
                     help="新索引用侧车 .npy 存储（可 mmap：加载更快、常驻内存"
-                         "更省；已有索引可用 compact 就地转换）")
+                         "更省；**不指定时用 Config 默认**，现为开；"
+                         "已有索引可用 compact 就地转换）")
     sp.add_argument("--no-prep-cache", action="store_true",
                     help="关闭预处理缓存（默认开启：重复建库跳过读盘与解码）")
     sp.add_argument("--no-silence-png", action="store_true",
@@ -141,7 +146,8 @@ def _apply_feature_args(cfg: Config, a: argparse.Namespace) -> None:
     cfg.tile_decode_slots = int(_val(a, "tile_decode_slots",
                                      cfg.tile_decode_slots))
     cfg.tile_flush_ms = int(_val(a, "tile_flush_ms", cfg.tile_flush_ms))
-    cfg.fast_load = bool(_flag(a, "fast_load", cfg.fast_load))
+    if _flag(a, "fast_load", False):          # store_true：只在显式传参时覆盖 Config
+        cfg.fast_load = True
     cfg.silence_png_warnings = not _flag(a, "no_silence_png")
     cfg.prep_cache = not _flag(a, "no_prep_cache")
     cfg.coarse_k = int(_val(a, "coarse_k", cfg.coarse_k))
@@ -746,6 +752,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         LOGGER.error("%s", e)
         return 2
+    finally:
+        # 退出前把还压在 C 层 stderr 管道里的内容转发完（否则最后几行会随进程消失）
+        drain_stderr_noise()
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ import os
 import re
 import sys
 import threading
+import time
 import warnings
 from typing import Iterable, List, Optional, Tuple
 
@@ -83,11 +84,25 @@ class _StderrNoiseFilter:
         self._saved_fd: Optional[int] = None
         self._read_fd: Optional[int] = None
         self._thread: Optional[threading.Thread] = None
+        # 保存下来的“真终端”文本流（Python 侧日志直接写它，绕开管道；见 stderr_log_stream）
+        self._orig_stream = None
+        # 泵线程最近一次读到数据的时刻（drain_stderr_noise 用它判断管道是否已吐空）
+        self._last_read_at = time.monotonic()
 
     # -- 安装/统计 ----------------------------------------------------
     @property
     def installed(self) -> bool:
         return self._installed
+
+    @property
+    def original_stream(self):
+        """保存的“真终端”流；未安装/打开失败时退回 `sys.stderr`。"""
+        return self._orig_stream if self._orig_stream is not None else sys.stderr
+
+    @property
+    def last_read_at(self) -> float:
+        """泵线程最近一次读到数据的时刻（单调时钟）。"""
+        return self._last_read_at
 
     def install(self) -> bool:
         if self._installed:
@@ -103,6 +118,11 @@ class _StderrNoiseFilter:
             self._saved_fd = os.dup(2)          # pythonw 下 fd 2 可能无效
             os.dup2(write_fd, 2)
             os.close(write_fd)
+            # 再 dup 一份真终端 fd 并包成**行缓冲**文本流：Python 侧日志（见 _StderrLogProxy）
+            # 直接写它，不进管道 → 进程退出时不会因为 daemon 泵线程未及转发而丢最后几行。
+            self._orig_stream = os.fdopen(os.dup(self._saved_fd), "w",
+                                          encoding="utf-8", errors="replace",
+                                          buffering=1)
             self._read_fd = read_fd
             self._thread = threading.Thread(target=self._pump,
                                             name="stderr-noise-filter",
@@ -131,6 +151,7 @@ class _StderrNoiseFilter:
                 break
             if not chunk:
                 break
+            self._last_read_at = time.monotonic()
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
@@ -157,6 +178,57 @@ class _StderrNoiseFilter:
 
 
 _stderr_filter = _StderrNoiseFilter()
+
+
+class _StderrLogProxy:
+    """给 logging 但写时再解析目标的输出代理：**始终写“真终端”**。
+
+    为什么需要它：`setup_logging()` 在 CLI 启动时就执行，而噪音过滤要等
+    `set_png_decoder()` 才安装；若那时直接把 `sys.stderr` 交给 StreamHandler，
+    之后 fd 2 会被 `dup2` 到管道上，而泵线程是 daemon —— 进程退出时可能还没转发完，
+    **最后几行（往往正是错误正文）会凭空消失**（排障时表现为“报错无输出”）。
+    """
+
+    def write(self, text: str) -> int:
+        try:
+            return _stderr_filter.original_stream.write(text)
+        except Exception:                       # noqa: BLE001 —— 无控制台时丢弃
+            return len(text)
+
+    def flush(self) -> None:
+        try:
+            _stderr_filter.original_stream.flush()
+        except Exception:                       # noqa: BLE001
+            pass
+
+    def isatty(self) -> bool:
+        try:
+            return bool(_stderr_filter.original_stream.isatty())
+        except Exception:                       # noqa: BLE001
+            return False
+
+
+_LOG_PROXY = _StderrLogProxy()
+
+
+def stderr_log_stream():
+    """给 `logging.StreamHandler` 用的输出流：始终指向真终端（见 `_StderrLogProxy`）。"""
+    return _LOG_PROXY
+
+
+def drain_stderr_noise(timeout: float = 0.3, quiet: float = 0.05) -> None:
+    """等噪音过滤的泵线程把管道里剩余内容吐完（进程退出前调用，best-effort）。
+
+    判据：泵线程连续 `quiet` 秒没再读到数据 → 认为管道已空；
+    最多等 `timeout` 秒，避免异常情况下卡住退出。
+    """
+    if not _stderr_filter.installed:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if time.monotonic() - _stderr_filter.last_read_at >= quiet:
+            return
+        time.sleep(0.01)
 
 
 def silence_png_noise(enable: bool = True) -> bool:
@@ -197,9 +269,13 @@ except Exception:  # noqa: BLE001 —— 版本差异时忽略
 
 
 def setup_logging(verbose: bool = False) -> None:
-    """配置根日志：统一时间/级别/消息格式，输出到 stderr。"""
+    """配置根日志：统一时间/级别/消息格式，输出到**真终端**（见 `_StderrLogProxy`）。
+
+    注意用 `stderr_log_stream()` 而不是 `sys.stderr`：后者在 PNG 噪音过滤安装后
+    会被 dup2 接到管道上，进程退出时最后几行日志可能丢（见 `_StderrLogProxy` 的说明）。
+    """
     level = logging.DEBUG if verbose else logging.INFO
-    handler = logging.StreamHandler(sys.stderr)
+    handler = logging.StreamHandler(stderr_log_stream())
     handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)-5s %(message)s", "%H:%M:%S"))
     root = logging.getLogger()
     root.handlers[:] = [handler]

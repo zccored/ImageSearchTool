@@ -1,0 +1,20 @@
+{
+  "name": "image-search-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ImageSearchTool Web 界面（Vue3 + Vite）；所有检索逻辑在 Python 侧 hybrid_search/service.py",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node scripts/copy-licenses.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.0",
+    "vite": "^6.0.0"
+  }
+}

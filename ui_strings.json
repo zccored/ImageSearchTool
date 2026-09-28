@@ -1,0 +1,19 @@
+{
+  "_comment": "外置文案（随包分发，优先于内置默认，改它不用重新构建）。这里只列最常用的键：未列出的键一律回落 src/ 里的内置默认；删掉本文件即完全使用内置文案。注意 app.title 是**系统窗口标题**（页面内不再重复显示产品名）。",
+  "app.title": "二值法粗筛 + ResNet精排 · 混合图库检索",
+  "tab.list": "图片列表",
+  "tab.search": "以图搜图",
+  "tab.params": "参数",
+  "tab.logs": "日志 / 可视化",
+  "toolbar.dir": "图库目录",
+  "btn.scan": "扫描图库",
+  "btn.build": "① 全部入库并建索引",
+  "btn.add": "② 增量入库",
+  "btn.tiles": "③ 子图(瓦片)索引",
+  "btn.search": "开始检索",
+  "btn.theme_light": "☀ 亮色",
+  "btn.theme_dark": "🌙 暗色",
+  "btn.theme_hint": "切换亮色 / 暗色（记住选择；配色可用 ui_theme.css 覆盖）",
+  "params.save": "应用参数",
+  "params.reload": "恢复为服务层默认"
+}

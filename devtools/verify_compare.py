@@ -113,7 +113,7 @@ try:
     app.dir_var.set(work)
     app.all_images = list(paths)
     app.prefix = prefix
-    app._dedup_worker(paths, 0.02)
+    app.svc.dedup_scan("dedup", paths, threshold=0.02, prefix=app.prefix)
     kind, rep = drain(app)
     print(f"扫描：{len(rep.groups)} 组 / {rep.n_images} 张")
     win = G.DedupWindow(app, rep)
