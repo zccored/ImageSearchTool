@@ -211,8 +211,11 @@ PNG 无法域缩放、大 JPEG 熵解码占主导），**不是显存或 IO 调�
 </details>
 
 <details>
-  <summary>旧版可视化界面（日常使用推荐）</summary>
-
+  <summary>可视化界面</summary>
+  
+> 小贴士：初入这个软件还不会使用CLI指令时，可以快速跟着下面的指引过一遍所有功能，再去开发属于你的工作流吧。
+> 
+  
 <details>
   <summary>新界面（Web 版，Bu Ling~Bu Ling 好看的界面，以后可视化的主要更新中心）</summary>
 与上一节**功能一致的现代化界面**：Python 侧只有一层壳 `gui_web.py`（pywebview 6 + 自建只读
@@ -270,10 +273,6 @@ Microsoft Edge WebView2 Runtime）。界面只起一个**只读**本地服务、
 
 <details>
   <summary>可视化界面（日常使用推荐）</summary>
-
-> 小贴士：初入这个软件还不会使用CLI指令时，可以快速跟着下面的指引过一遍所有功能，再去开发属于你的工作流吧。
-> 
-
 
 ```bat
 python gui.py   :: bash启动
