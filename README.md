@@ -6,7 +6,7 @@
 提供两种使用方式：**可视化界面 `gui.py`**（推荐日常使用）与命令行 `main.py`。
 
 > 许可证：**AGPL-3.0-only**（GNU Affero General Public License v3.0）——见 [LICENSE](LICENSE)；
-> 全部源文件头均带版权与许可声明（SPDX: `AGPL-3.0-only`），详见文末「开源协议」
+> 全部源文件头均带**中英双语**版权与许可声明（AGPL-3.0-only），详见文末「开源协议」
 > （2026-09-12 由 MIT 变更）。
 
 ```
@@ -39,8 +39,8 @@
 
 | 场景 | 实测结果 |
 | :--- | :--- |
-| **整图全量建库（约 3.8 万 张）** | **543 s → 69.4 张/秒**（CPU 12.7 核，单遍解码出粗筛+ResNet） |
-| **瓦片全量建库（约 4 万 张 → 约 44.4 万 块）** | **1843.5 s → 21.7 张/秒 · 241 块/秒**（CPU 7.5 核 / GPU 均值 26% / 写盘 1.17 s） |
+| **整图全量建库（约 3.8 万 张）** | **483.8 s → 82.4 张/秒**（2026-09-26 优化后；优化前 543.2 s / 69.4 张/秒） |
+| **瓦片全量建库（约 4 万 张 → 约 44.4 万 块）** | **1033.6 s → 38.6 张/秒**（2026-09-26 优化后；优化前 1843.5 s / 21.7 张/秒 · 241 块/秒） |
 | 整图索引加载（约 3.8 万 张） | **0.09 s** |
 | 整图检索（库 约 3.8 万 张，热态） | **125 ms / 次**（中位数；首查含模型加载 2.8 s） |
 | 瓦片索引加载（约 44.4 万 块） | **0.71 s** |
@@ -54,27 +54,41 @@
 | 索引常驻内存 | 444k 瓦片库 **+76 MB**（旧 npz 格式为 +1.18 GB） |
 
 > 两次全量建库的完整时间轴见下节「性能图」；瓦片建库的耗时大头是**每张图必须完整
-> 解码一次**（要 512px 瓦片，无法复用 224 预处理缓存）——按 346 ms CPU/张 拆分，
-> 解码约 150~250 ms、13 块 ×（指纹/PIL 预处理 ~5 ms + 逐块 MD5 ~4.6 ms）。
-> 已知的命中框坐标系偏差见「已知问题」。
+> 解码一次**（要 512px 瓦片，无法复用 224 预处理缓存）——09-12 口径按 346 ms CPU/张 拆分，
+> 解码约 150~250 ms、13 块 ×（指纹/PIL 预处理 ~5 ms + **逐块 MD5 ~4.6 ms**）；
+> 2026-09-26 一轮正是把最后一项改成「每图只哈希一次」（`tile_md5_reuse`，哈希微基准 15.1×），
+> 逐项开关名与 A/B 数字见 `docs/perf-plan.md` §一。已知的命中框坐标系偏差见「已知问题」。
 
 复现命令：`python devtools/bench_real_index.py`、`python main.py bench <目录> --limit 400`、
 `python devtools/dedup_scan_real.py <图库根目录>`、`python devtools/verify_thumb_perf.py`、
 `python devtools/verify_tile_index.py "<图库根目录>\.gallery_index\gallery_tiles" --root <图库根目录>`。
 
-## 性能图：本机实测报告（整页渲染 + 原始 HTML/JSON）
+> **口径**：上表两行建库数据是 **2026-09-26 一轮优化后**的本机实测，其余各行仍是
+> 2026-09-12 口径（属未被 09-26 改动覆盖的部分）。**性能类结论以 `docs/perf-plan.md` 为
+> 唯一事实来源**；该文件引用的 A/B 基准脚本（`ab_build_bench.py`、`bench_png_decoders.py` 等）
+> **未随仓库发布**，需要时按其中的「验证方式」列自备脚本复现。
+
+> **设备无关性**：本项目**不绑定显卡品牌** —— `device=auto` 时能用 CUDA 就用 GPU，
+> 否则自动走 CPU（**AMD / Intel 显卡在 Windows 上也属"走 CPU"这一档**：功能完全一致，
+> 建库与检索明显更慢）；`nvidia-ml-py`/pynvml 只服务 NVIDIA 显存采样，非 NVIDIA 机器只是
+> 性能图里没有 GPU 曲线。因此**上表所有数字都只属于上面那台测试机**（14 核 20 线程 / 16GB /
+> RTX 4060 Laptop / NVMe），换机器（尤其换显卡或在 AMD 机器上跑）数字会明显不同 ——
+> 想量自己的机器请用 `python main.py bench <目录>`。
+
+## 性能图：本机实测报告（读数摘要；报告本体不随仓库分发）
 
 下面几份都是**真实任务导出**的报告（GUI 勾选「索引阶段导出性能图」，或
-`perfscope.py` / `devtools/` 脚本生成）。图是报告的整页截图（Chrome 无头渲染，
-按 GitHub 正文宽度 1012px 出图，1:1 显示）；点链接可看原始 HTML 与逐 0.4s 采样 JSON。
-GitHub 不执行 HTML，**想在线看可交互渲染版**用 raw.githack 链接。
+`perfscope.py` / `devtools/` 脚本生成）。
+
+> ⚠️ **公开发布版不含报告本体**（`docs/perf/*.html|json|png` 已移除）：报告由本机真实图库
+> 生成，页面内含本机绝对路径、文件名等隐私信息。想看完整报告请**在本机重新生成**——
+> 建库时勾选「索引阶段导出性能图」会写到仓库根的 `perf_reports/`（详见 `docs/perf/README.md`）。
+> 下面保留的是**读数摘要**（数字即当时实测值），判读口径见 `docs/perf-plan.md`。
 
 ### ① 瓦片索引全量建库 · 约 44.4 万 块（2026-09-12）
 
 
-- [原始 HTML](docs/perf/tiles_full_build_20260912.html) ·
-  [原始采样 JSON](docs/perf/tiles_full_build_20260912.json) ·
-  [在线渲染版](https://raw.githack.com/zccored/ImageSearchTool/main/docs/perf/tiles_full_build_20260912.html)
+- 报告本体：本机 `perf_reports/tiles_full_build_20260912.*`（**未随仓库分发**）
 - 场景：`<图库根目录>` 约 4 万 张 → 约 44.4 万 块；提取阶段 1839.7 s + 写盘 1.2 s（共 1843.5 s）。
 - 读数：CPU 均值 **7.5 核**（P90 10.3）、GPU 均值 **26%**（≥75% 的采样仅 1%）、
   读盘均值 **74 MB/s**（NVMe 远远未饱和）、RSS 峰值 4.4 GB/16 GB。
@@ -84,18 +98,23 @@ GitHub 不执行 HTML，**想在线看可交互渲染版**用 raw.githack 链接
 ### ② 整图索引全量建库 · 约 3.8 万 张（2026-09-12）
 
 
-- [原始 HTML](docs/perf/full_build_20260912.html) ·
-  [原始采样 JSON](docs/perf/full_build_20260912.json) ·
-  [在线渲染版](https://raw.githack.com/zccored/ImageSearchTool/main/docs/perf/full_build_20260912.html)
-- 场景：单遍解码同时产出粗筛指纹与 ResNet 输入；**543.2 s → 69.4 张/秒**。
+- 报告本体：本机 `perf_reports/full_build_20260912.*`（**未随仓库分发**）
+- 场景：单遍解码同时产出粗筛指纹与 ResNet 输入；**543.2 s → 69.4 张/秒**（09-26 优化后 **483.8 s / 82.4 张/秒**）。
 
 ### ③ 瓦片建库基准（无界面 · 优化前后对照，2026-09-09）
 
 
-- [原始 HTML](docs/perf/tiles_benchmark_20260909.html) ·
-  [在线渲染版](https://raw.githack.com/zccored/ImageSearchTool/main/docs/perf/tiles_benchmark_20260909.html)
+- 报告本体：本机 `perf_reports/tiles_benchmark_20260909.*`（**未随仓库分发**）
 - 场景：1,500 张 / 12,704 块的实验样本，两级任务池改造后 **86 → 385 块/秒**。
 - 这份报告章节最全：逐文件解码窗、逐批前向"锯齿/空窗"诊断、解码器对照。
+
+### ④ 2026-09-26 性能一轮（P0/P1 落地，无独立报告页）
+
+- 靶子仍是真实图库：**瓦片全量 1843.5 s → 1033.6 s（−44%）**、**整图全量 543.2 s → 483.8 s（−11%）**。
+- 逐项开关与实测（600 张样本 A/B，含索引一致性验证）：块 MD5 复用 `tile_md5_reuse`（−37% wall）、
+  cv2 直出 RGB `cv2_rgb_direct`、重复内容预筛 `dedup_prefilter`、归一化搬 GPU `norm_on_gpu`、
+  CUDA 自动批 64→256（`tile_fwd_batch` 把瓦片路径解耦）；**含两项被证伪的假设**（"超大 PNG 单张并行解码"、
+  "投递分块屏障"）与 **GDeflate/nvCOMP 出局**的结论 → 全部见 `docs/perf-plan.md`。
 
 
 ## 〇、可视化界面（日常使用推荐）
@@ -105,6 +124,9 @@ GitHub 不执行 HTML，**想在线看可交互渲染版**用 raw.githack 链接
 ```bat
 python gui.py
 ```
+
+> 🆕 **另有 Web 版新界面**（pywebview + Vue3，功能一致、界面更现代）：见「**〇·八、新界面（Web 版）**」。
+> 两套界面共用同一服务层，索引与检索结果完全一样，可随时切换；本节的界面（tkinter 版）作为保底保留。
 
 界面操作流（左侧两页参数、右侧列表与检索页、底部日志/进度条）：
 
@@ -217,8 +239,8 @@ python main.py compact --prefix <前缀> --delete-legacy                 :: 顺�
 ```
 
   GUI 里等价按钮为工具栏 **⏩ 优化索引存储**（同时处理整图与瓦片两套索引，
-  旧 npz 默认保留可回退）。新建索引用 `--fast-load`（或“建库参数”页
-  “新索引用侧车 .npy 存储”勾选）直接写成新格式。
+  旧 npz 默认保留可回退）。**新建索引默认就写成侧车格式**（`Config.fast_load=True`，
+  GUI 与 CLI 一致；`--fast-load` 是保留开关，不指定即用 Config 默认值）。
 
 ### 局部（瓦片）索引与混合检索
 
@@ -344,8 +366,8 @@ img_server（下载方）完成下载与哈希校验后，在其 UI 按按钮：
 自动打开本管理器并增量建库（校验 + 路径/MD5 去重，全程可视），
 完成后写 `result_*.json` 回审计目录。
 
-- 协议全文：`docs/HANDOFF_PROTOCOL.md`
-- img_server 侧接入需求（可直接交给对方智能体）：`docs/img_server_接入需求.md`
+- 协议文档：**`docs/HANDOFF_PROTOCOL.md`** —— request/result 字段表、校验规则、
+  图库根自动定位、错误与 `notices` 语义、排查清单（改协议时与实现一起改）
 - 本侧组件：
   - `handoff_launcher.py`：过渡进程（等待 img_server 退出 → 打开 GUI）
   - `hybrid_search/handoff.py`：request 校验 / 图库根自动定位 / 增量执行 / result 回写
@@ -354,7 +376,7 @@ img_server（下载方）完成下载与哈希校验后，在其 UI 按按钮：
 - **图库根自动定位**：请求 roots 是图库根下的子目录（如新下载批落在
   `<图库根目录>\<子图集>`）时，自动沿祖先目录向上找到含 `.gallery_index` 的
   图库根，把新图增量并入既有索引，不会在子目录里另建一套；
-  `prefix` 留空即启用该行为（详见 `docs/HANDOFF_PROTOCOL.md` §4.5）。
+  `prefix` 留空即启用该行为（实现见 `hybrid_search/handoff.py` 的 `locate_gallery_root()`）。
 - 无参启动 GUI/CLI 行为与平时完全一致（不影响正常打开与处理流程）。
 
 ## 〇·七、切换启动全栈图库管理器（两套程序互切）
@@ -380,6 +402,49 @@ check|register|launch` 可命令行调用）+ GUI 按钮。目标用 **python.ex
 通过后才关闭本程序；启动失败会保留本程序并给出 stderr 尾部原因。
 main.py 启动后会弹**启动确认框**（人工点击后才进主程序）——属预期，
 点确认即可；此前把等待该确认误判为“卡死”的形态（SW_HIDE）勿再使用。
+
+## 〇·八、新界面（Web 版，可选）
+
+与上一节**功能一致的现代化界面**：Python 侧只有一层壳 `gui_web.py`（pywebview 6 + 自建只读
+WSGI），界面本体在 `frontend/`（Vue3 + Vite，本质是一个本地网页）。两套界面共用同一服务层
+`hybrid_search/service.py`（命令、事件、参数取值只有这一份），所以**建出来的索引完全一样**，
+随时可以切回上一节。
+
+```bat
+:: 源码运行（首次需构建前端；只改文案/配色不需要，见下）
+cd frontend
+pnpm install
+pnpm build
+cd ..
+python -E gui_web.py
+
+:: 打包版：双击与 ImageSearchGUI.exe 并列的 ImageSearchWeb.exe
+:: 注意：该 exe 只出现在用当前版打包配置（image-search.spec）构建的包里；
+::       2026-09-07 及更早的分发包里只有 GUI + CLI（见 packaging_README_分发说明.txt）
+ImageSearchWeb.exe
+```
+
+**页面**（能力与上一节的界面操作流一致）：图片列表（✔/· 已索引标记、缩略图网格）、以图搜图
+（Top-K 网格 + 命中详情 + 打开原图 / 复制路径 / 导出总览图）、去重审查（分组 + 虚拟滚动 +
+批量删除 / 移动 + 报告就地更新）、参数（两页，默认值只来自 `hybrid_search/config.py`）、
+日志·可视化（阶段进度 + 实时帧 + 性能图导出）；**页签行右端可切换亮色 / 暗色**（记住选择）；
+双击任意命中 / 重复图 = 页内**大图对比覆盖层**（双区独立缩放与平移、成员条拖放换区、
+`F11` 全屏、`Esc` 关闭）。
+
+**运行期要求**：Windows 的 **WebView2** 运行时（Win10 1803+ 一般已内置；缺失时会提示去装
+Microsoft Edge WebView2 Runtime）。界面只起一个**只读**本地服务、**只监听 127.0.0.1**，
+仅暴露前端产物与缩略图 / 原图缓存；命令不经过 HTTP（走 pywebview 的 js_api，每个方法先校验 token）。
+
+### 改文案 / 改配色：不用 Node、不用重新打包
+
+| 想改什么 | 怎么做（文件放**包根目录**，即 exe 旁边） |
+| :--- | :--- |
+| 文案 | `ui_strings.json`：只写要覆盖的键（其余回落内置）；删掉该文件 = 全用内置。**窗口标题也在里面**（`app.title`，页面内不再重复显示产品名） |
+| 配色 / 圆角 / 字号 | `ui_theme.css`：只写要覆盖的 CSS 变量（变量名见 `frontend/src/theme.css`）。**亮/暗两套分别写**：暗色 `:root {…}`、亮色 `:root[data-theme="light"] {…}` |
+| 布局 / 交互 | 改 `frontend/src/**` → `pnpm build` → 重新发布（**只有这一档需要 Node**） |
+
+三条路径都只碰界面：检索 / 建库 / 去重 / 参数的逻辑照旧改 Python（`hybrid_search/*`）。
+维护细节见 `frontend/README.md`；分发给最终用户的说明见 `packaging_README_分发说明.txt` 第六节。
 
 ## 一、快速开始（5k 张模拟测试）
 
@@ -440,7 +505,7 @@ python main.py build-fine --prefix E:\index\gallery
 
 | 参数 | 默认 | 说明 |
 | :--- | :--- | :--- |
-| `--prefix` | `./gallery` | 索引前缀，产出 `<前缀>.meta.json / .coarse.npz / .fine.npz` |
+| `--prefix` | `./gallery` | 索引前缀，产出 `<前缀>.meta.json` + 侧车 `.npy`（关掉 `fast_load` 才是旧 `.coarse.npz / .fine.npz`） |
 | `--coarse-size` | `64` | 二值指纹边长（64=4096bit/张；尺寸需和建库一致） |
 | `--blur` | `5` | 二值化前高斯模糊核（奇数） |
 | `--no-hu / --no-fp` | 都开 | 关掉 Hu 矩 / 二值指纹这一路特征 |
@@ -455,7 +520,7 @@ python main.py build-fine --prefix E:\index\gallery
 | `--workers N` | `0` | 粗筛特征并行线程：0=自动(≤8)，1=串行 |
 | `--decode-workers N` | `0` | 精排解码/预处理并行线程：0=自动(≤8)，与 GPU 前向重叠 |
 | `--torch-threads N` | `0` | torch 推理线程：0=默认（多数 CPU 上 1 线程最快） |
-| `--png-decoder` | `cv2` | PNG 解码器：cv2=libpng 全尺寸（快~1.3x；个别坏 iCCP 文件有零星 stderr 警告）/ pillow=安静较慢 |
+| `--png-decoder` | 见 `config.py`（现为 `libdeflate`） | PNG 解码器：`libdeflate`=自建旁路（缺原生扩展 `_pngfast` 时自动回退 cv2）/ `cv2`=OpenCV 捆绑 libpng（快~1.3x；坏 iCCP 的 stderr 警告默认已被过滤）/ `imagecodecs`=可选需另装 / `pillow`=安静较慢。**不指定即用 Config 默认值** |
 | `--limit N` | 无 | 只处理前 N 张（冒烟测试） |
 | `--no-exclude-self` | 剔除自身 | 查询图正好在库里时，是否把“自己”从结果中剔除 |
 | `--no-progress` | 开 | 关闭实时进度（默认开启，见下节） |
@@ -495,10 +560,12 @@ python main.py build-fine --prefix E:\index\gallery
 - **解码器域缩放（JPEG 大图关键）**：真实照片（12MP+）JPEG 解码不再全尺寸
   解出，解码器直接输出 ~2048 最长边（采样域 1/2/1/4/1/8 缩放）——
   12MP JPEG 单张 52ms → 31ms，大图库建库再快 ~2.3×；
-- **PNG 走 libpng（cv2 全尺寸）**：PNG 的域缩放不省时（必须先解完整条
-  IDAT 流），真正收益来自解码器实现：OpenCV 捆绑 libpng 比 Pillow 快 ~1.3×，
-  且与 Pillow 逐像素一致（实测指纹汉明差 0%、ResNet 余弦 1.0000）；
-  代价是个别坏 iCCP 文件的零星 stderr 警告（可用 `--png-decoder pillow` 切回）；
+- **PNG 解码器可换**：PNG 的域缩放不省时（必须先解完整条 IDAT 流），真正收益来自
+  解码器实现：OpenCV 捆绑 libpng 比 Pillow 快 ~1.3×，且与 Pillow 逐像素一致
+  （实测指纹汉明差 0%、ResNet 余弦 1.0000）。`Config.png_decoder` 默认 `libdeflate`
+  （libdeflate 解 IDAT + 原生 SIMD 反滤波；**缺原生扩展 `_pngfast` 时自动回退 cv2**），
+  坏 iCCP 文件的零星 stderr 警告**默认已被噪音过滤吞掉**（见下条），
+  想彻底不产生噪音可切 `--png-decoder pillow`（慢一些）；
 - **解码线程供给**：GPU 场景自动放宽到 ≤20 线程（解码/熵解码每张单核，
   20 核机器全核供给）；CPU-only 场景自动 8 线程（与前向平衡）；
 - **cudnn.benchmark**：GPU 场景自动开启，固定输入尺寸下挑选最快卷积内核；
@@ -556,8 +623,10 @@ python main.py bench D:\我的图库\壁纸 --limit 500 --fine-sample 64
   二值指纹(OTSU 自适应阈值)天然抵消了全局亮度/对比度差异，是廉价且稳定的“内容布局”指纹。
 - **OTSU 会不会在极端图（纯色）上崩？** 不会——OTSU 对单峰直方图会退化为全 0/全 255，
   Hu 矩退化为零向量、指纹全 0/全 1，这类图在粗筛里自然排后，由精排兜底。
-- **PNG 解码怎么选？** 默认 `--png-decoder cv2`（OpenCV 捆绑 libpng，比 Pillow 快
-  ~1.3×，与 Pillow 逐像素一致：实测指纹汉明差 0%、ResNet 余弦 1.0000）；个别坏 iCCP
+- **PNG 解码怎么选？** 默认由 `config.py` 的 `png_decoder` 决定（现为 `libdeflate`；
+  缺原生扩展时自动回退 **cv2** = OpenCV 捆绑 libpng，比 Pillow 快 ~1.3×，与 Pillow 逐像素
+  一致：实测指纹汉明差 0%、ResNet 余弦 1.0000；CLI 不传 `--png-decoder` 就用 Config 默认
+  ——参数默认值只在 `config.py` 写一次）；个别坏 iCCP
   文件刷出的 `libpng warning: iCCP: known incorrect sRGB profile` 现在**默认被过滤**
   ——C 层 fd 2 改接管道 + 抽取线程，只吞已知噪音行、**其余原样转发**（实测一次解码
   51 行噪音被吞、1 行真实告警正常透出），避免刷屏挤占终端/日志；要完全关掉过滤加
@@ -587,15 +656,21 @@ python main.py bench D:\我的图库\壁纸 --limit 500 --fine-sample 64
 
 ```
 image-search/
-├── gui.py                           # 可视化界面（tkinter 自带，零额外 GUI 依赖）
+├── gui.py                           # 可视化界面（tkinter 自带，零额外 GUI 依赖；保底/可选）
+├── gui_web.py                       # Web 版界面壳（pywebview + 只读 WSGI；界面源码见 frontend/）
 ├── main.py                          # 命令行 CLI 入口
 ├── perfscope.py                     # 只读观测仪（档案/解码效能/CPU·GPU 时间轴 HTML）
 ├── perfwatch.py                     # GUI 内阶段画像（索引/搜图，可选导出 HTML+JSON）
 ├── compare_view.py                  # 重复图大图对比窗（左右双图缩放/拖动/联动勾选）
+├── frontend/                        # Web 版界面源码（Vue3 + Vite；dist 不入库，随包分发）
+├── ui_strings.json / ui_theme.css   # 可选：外置文案 / 主题（放包根即可覆盖，免重新构建）
 ├── make_test_dataset.py             # 模拟图库生成器（分组近重复 + 查询集）
 ├── LICENSE                          # AGPL-3.0（2026-09-12 由 MIT 变更）
 ├── peer_manifest.json               # 「切换启动」白名单哈希
-├── docs/perf/                       # 收录的性能图（整页 PNG + 原始 HTML + 采样 JSON）
+├── docs/perf/                       # 性能图说明（报告本体不随仓库分发；本机报告落在 perf_reports/）
+├── docs/perf-plan.md                # 性能优化唯一事实来源（实测数字 + 开关名 + 被证伪的假设）
+├── docs/HANDOFF_PROTOCOL.md         # 跨进程交接协议（img_server → 增量建库 的字段表与语义）
+├── CONTRIBUTING.md                  # 代码约定 / 验证命令 / 提交前检查
 ├── docs/brand/                      # 品牌图（banner/social/logo/icon，SVG 矢量 + PNG 渲染）
 ├── devtools/                        # 开发期回归/基准脚本（见下）
 ├── requirements.txt
@@ -610,6 +685,8 @@ image-search/
     ├── dedup.py                     # 重复图查验（MD5 完全重复 + 指纹近似重复）
     ├── tile_index.py                # 瓦片(局部)索引：切块建库 + LSH 候选 + 切块聚合检索
     ├── engine.py                    # 两级检索流水线 + 索引生命周期
+    ├── service.py                   # 前端无关的编排层（GUI/Web 共用；命令带 task_id + 事件流）
+    ├── handoff.py                   # 跨进程交接（img_server → 增量建库）：校验/定位/回写
     ├── visuals.py                   # Top-K 总览图输出
     ├── progress.py                  # CLI 双阶段进度渲染（计数/百分比/吞吐/ETA）
     └── cli.py                       # argparse 子命令
@@ -626,6 +703,8 @@ image-search/
 | `watch_running_build.py` | 非侵入观测正在运行的建库进程（读速/CPU/内存 → 张·块每秒） |
 | `make_brand_svg.py` | 生成品牌图 SVG（banner / social / logo / icon），确定性输出、可复现 |
 | `verify_stderr_filter.py` | libpng 噪音过滤的"吞噪音/透告警"回归验证 |
+| `verify_service.py` · `verify_web_gui.py` | 服务层端到端回归（真实链路 + 事件契约）/ Web 界面回归（无头 + 真窗口） |
+| `verify_cli_defaults.py` | CLI 各子命令的 argparse 默认值 vs `Config` 漂移检查（判据 `漂移: 0/11`） |
 
 ## 八、写给后续扩展（4TB / 200 万张路线）
 
@@ -641,6 +720,8 @@ image-search/
 4. **以文搜图**：把 ResNet 换成或更改为双框架/并联 CLIP 双塔即可获得文本查询能力，检索骨架不动。
 
 ## 九、已知问题与改进项（2026-09-12 索引核查发现）
+
+> 标注 **✅ 已修（日期）** 的条目是后续某一轮已落地的修复，原文保留以便追溯。
 
 用 `devtools/verify_tile_index.py` 对刚建好的 约 44.4 万 块瓦片库做自检：**索引本身可用**
 （各 `.npy` 行数一致、块 md5 全部唯一、精排 L2 范数 1.000000、抽 12 张重算
@@ -659,7 +740,10 @@ image-search/
 - 修法：建库时把框乘回解码缩放系数（或检索侧返回"参考尺寸"、GUI 按 `w/ref_w` 换算）
   ——需重建瓦片索引。
 
-### 2) 性能图 img/s 计数口径被"块数"污染（本轮引入，只影响报告可读性）
+### 2) 性能图 img/s 计数口径被"块数"污染（09-12 那轮引入，只影响报告可读性）✅ 已修（2026-09-26）
+
+- ✅ **修法已落地**：`tile_index` 中途进度改报**图片数**（`progress(n_img_done, n)`），
+  `_phase()` 只发阶段边界 → 报告不再出现块数被当成张数的假尖峰。
 
 - `tile_index._phase()` 复用了同一个进度回调，把 `added`（块数）当 `(done,total)` 上报；
   而 `perfwatch._img_per_s()` 算的是 Δ计数器/Δt → 末尾采样出现 `imgps = 1,006,685`
@@ -668,7 +752,11 @@ image-search/
 - 影响面：仅报告里的 img/s 曲线与阶段"计数"文案；索引与进度条正常。
 - 修法：`_phase()` 不再 `bump()`，块数放进 `mark(info=...)`。
 
-### 3) 每块都对整份文件字节做 MD5（可优化，约占建库 15%）
+### 3) 每块都对整份文件字节做 MD5（约占建库 15%）✅ 已修（2026-09-26）
+
+- ✅ **修法已落地**：块标识改由「每图算一次的 `md5(文件字节)`」派生（`tile_md5_reuse`，
+  哈希微基准 **15.1×**、瓦片建库 **−37% wall / −24% CPU**；块 md5/指纹/Hu 逐位一致）。
+  ⚠️ 这**改变了库内块取值** → 该轮重建了瓦片索引（真正的收益在 `docs/perf-plan.md` §一）。
 
 - `_tile_md5(data, box)` = `md5(整份文件字节 + 框)`：一张图 11.79 块就要把同一份字节
   哈希 11.79 次，还附送一次整块拷贝。
@@ -684,11 +772,49 @@ image-search/
 - 两套索引的路径集合有 13/11 张不一致（同内容多副本"谁先入库谁留下"的顺序不同，
   占 0.03%）：hybrid 模式可能返回只有一边有特征的路径，另一路分数显示 NaN，
   不影响命中与显示。
-- `docs/perf/` 里两份 GUI 报告的 img/s 曲线尾部有 #2 造成的假尖峰。
+- 旧 `docs/perf/` 里两份 GUI 报告的 img/s 曲线尾部有 #2 造成的假尖峰（**报告本体已移除、
+  #2 已修**，此条仅存档）。
 
 ## 十、更新日志
 
-### 2026-09-12（本轮）
+### 2026-09-27（新界面一轮）
+
+- **新增 Web 版界面（可选，与 tkinter 版并存）**：`gui_web.py`（pywebview 6 + 自建只读 WSGI）
+  + `frontend/`（Vue3 + Vite）。页面：图片列表 / 以图搜图 / 去重审查（虚拟滚动 + 批量删除与移动）
+  / 参数 / 日志·可视化，另加页内**大图对比覆盖层**（双区缩放平移、拖放换区、`F11`、`Esc`）；
+  详见「〇·八、新界面（Web 版）」。
+- **抽出服务层 `hybrid_search/service.py`**：两套界面共用的**唯一编排层**（命令带 `task_id`；
+  事件 `log` / `progress` / `phase_boundary(save|done)` / `viz_frame` / `perf_report` /
+  `task_done` / `task_error`）；`gui.py` 相应瘦身（−352 行），只留 UI 与线程调度。
+  **检索与索引行为不变**（仍是同一份 `engine`）；回归脚本 `devtools/verify_service.py` /
+  `devtools/verify_web_gui.py`。
+- **免构建改文案 / 配色**：包根放 `ui_strings.json` / `ui_theme.css` 即可覆盖（缺失则回落内置），
+  改完刷新界面即可 —— 不需要 Node，也不需要重新打包（见「〇·八」的小节）。
+- **打包**：`image-search.spec` 增第三入口 `ImageSearchWeb`（GUI / Web / CLI 三入口，共享
+  binaries/datas）、`frontend/dist` 随包；`SRC` 改为 `ISE_SRC`/`SPECPATH` 推导（不再硬编码
+  绝对路径）。实测 onedir 包 778 MB，其中 **Web 层增量 ≈ 4.6 MB**，起包后只监听回环。
+  > ⚠️ **包体随"torch 变体"与机器变化**：该 778 MB 是**本机口径**（AMD RX 6700 XT +
+  > `torch 2.14.0+**cpu**`，即纯 CPU 版；`torch/lib/torch_cpu.dll` 291.7 MB 占大头）。
+  > 装 **CUDA 版 torch** 的机器打包会**大得多** —— 实测对比：**CUDA 版发布包 4.01 GB**
+  > （2026-09-07 那个包）vs 本机 CPU 版 778 MB。而 Web 层增量
+  > （pythonnet / clr_loader / webview / `frontend/dist`）与显卡无关，基本恒定 ≈ 4.6 MB。
+- **依赖与合规**：新增 `pywebview` / `pythonnet` / `bottle`（`requirements.txt` 的「新 Web 界面」组），
+  运行期需系统 **WebView2**；`frontend/LICENSE-NOTICE` 列明随包的第三方组件，
+  `pnpm build` 自动产出 `frontend/dist/Vue-LICENSE.txt`。
+
+- **CLI 参数默认值订正（两处一致性缺陷）**：`--png-decoder` 的 argparse 默认从 `cv2` 改为
+  **不覆盖 Config**（`default=None`），`--fast-load` 改为**仅显式传参才覆盖** —— 此前
+  `stats` / `compact` / `bench` 会因「CLI `build` 写进 meta 的 `png_decoder` ≠ 读索引时的基准」
+  而**拒绝打开自己刚建的索引**（rc=2），`--fast-load` 还会把 CLI 建库悄悄写回旧 npz 格式。
+  另修：PNG 噪音过滤（fd 2 接管成管道 + daemon 泵线程）会**吞掉进程退出前的最后几行日志**
+  （报错时终端只剩 INFO 行、正文丢失）→ 日志改为直写真终端 fd，退出前再 drain 管道。
+  这两条已固化为回归：**`python -E devtools/verify_cli_defaults.py`**（判据 `漂移: 0/11`）。
+  > 口径仍是**参数默认值只在 `config.py` 写一次**：CLI 各子命令现在都不改 Config 默认值
+  > （用 `--xxx` 显式覆盖），因此 GUI / Web / CLI 建的索引参数一致、可互相打开。
+- **新界面细节**：窗口标题栏已显示产品名 → **页内不再重复标题**；运行状态徽标（`空闲` / `处理中…`）
+  移到**底部状态栏左侧**；**页签行右端新增亮色 / 暗色切换**（选择记住，`ui_theme.css` 可分别覆盖两套配色）。
+
+### 2026-09-12（上一轮）
 
 - **预处理缓存（L2 内存 + L3 磁盘）**：缓存"PIL 处理后的 224 裁剪 + 粗筛特征 + MD5"
   （键 = 路径 + 大小 + mtime，带模型/尺寸签名），重复建库跳过读盘与解码——1500 张实测
@@ -700,7 +826,8 @@ image-search/
   上报，GUI 状态与性能图不再误判成"ResNet 还没跑完就出性能图"。
 - **瓦片索引全量重建实测**：约 4 万 张 → 约 44.4 万 块，**1843.5 s（21.7 张/秒 · 241 块/秒）**，
   CPU 7.5 核 / GPU 均值 26% / 写盘 1.17 s；报告与整页截图收录进 `docs/perf/`
-  并在 README 中渲染。
+  并在 README 中渲染（⚠️ 该轮报告本体已在公开发布版移除，见「性能图」章节；
+  2026-09-26 一轮重建后为 **1033.6 s**）。
 - **新增 `devtools/verify_tile_index.py`**：瓦片索引体检（行数/范数/框合法性/内容复核/
   去重账/命中框坐标系），据此记录上面「已知问题」三条。
 - **开源协议由 MIT 变更为 AGPL-3.0**（`LICENSE` 已整体替换，见下节）；**52 个源文件
@@ -741,12 +868,14 @@ image-search/
 [LICENSE](LICENSE)。2026-09-12 起由 MIT 变更为 AGPL-3.0：**此前已发布的副本仍适用当时
 的 MIT 条款**，此后版本与后续提交适用 AGPL-3.0。
 
-**源码文件头声明**：仓库内全部 52 个源文件（`main.py`、`gui.py`、`perfscope.py`、
-`perfwatch.py`、`compare_view.py`、`handoff_launcher.py`、`peer_launcher.py`、
-`hybrid_search/*.py`、`devtools/*.py`、`image-search.spec` 等）已在文件头标注
-`Copyright (C) 2026 zccored` 与 SPDX 标识 `AGPL-3.0-only`（英文 + 中文双语声明），
-插入时保留原有 BOM 与换行风格、模块 docstring 不受影响。第三方依赖（PyTorch /
-torchvision / OpenCV / Pillow / numpy 等）文件夹内不带本声明，仍按其原协议。
+**源码文件头声明**：仓库内全部源文件（本机实测 **75 个** —— `main.py`、`gui.py`、`gui_web.py`、
+`perfscope.py`、`perfwatch.py`、`compare_view.py`、`handoff_launcher.py`、`peer_launcher.py`、
+`pyinstall_runtime_*.py`、`hybrid_search/*.py`、`devtools/*.py`、`image-search.spec`、
+`frontend/**` 的 `.vue/.js/.css/.json/.mjs`）已在文件头标注 `Copyright (C) 2026 zccored`
+与 **AGPL-3.0-only** 的**英文 + 中文双语**声明；本项目**不使用** SPDX
+`SPDX-License-Identifier:` 行，文件头即许可声明本身（插入时保留原有 BOM 与换行风格、
+模块 docstring 不受影响）。第三方依赖（PyTorch / torchvision / OpenCV / Pillow / numpy、
+以及 `frontend/` 构建的 Vue 等，见 `frontend/LICENSE-NOTICE`）文件内不带本声明，仍按其原协议。
 
 ```text
 Copyright (C) 2026 zccored
