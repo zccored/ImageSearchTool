@@ -24,6 +24,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -37,12 +38,13 @@ from hybrid_search.config import Config  # noqa: E402
 from hybrid_search.coarse import extract_binary_features  # noqa: E402
 from hybrid_search.fine import ResNetExtractor, _PRE_DOWNSCALE_PX, _PRE_DOWNSCALE_SIDE  # noqa: E402
 from hybrid_search.io_utils import collect_images, decode_gray, read_bytes  # noqa: E402
+from paths import GALLERY_ROOT  # noqa: E402
 
 PROC = psutil.Process()
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 300
 DO_THREADS = "--threads" in sys.argv
 cfg = Config()
-paths = collect_images(r"F:\视频", cfg.extensions, limit=N)
+paths = collect_images(GALLERY_ROOT, cfg.extensions, limit=N)
 print(f"样本 {len(paths)} 张（建库同序前缀）")
 
 

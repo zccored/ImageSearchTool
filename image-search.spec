@@ -30,11 +30,13 @@ image-search 工具包打包配置（onedir，双入口，CPU+CUDA 全量）。
     全栈图库管理器 main.py 而自动禁用（独立工具包语义），本机则可用。
 
 构建：  pyinstaller --noconfirm --clean image-search.spec
-            --distpath F:\PLC\dist --workpath F:\PLC\pyi_build
+            --distpath <项目>/dist --workpath <项目>/pyi_build
+        （输出根可用环境变量 PYI_OUT 覆盖，默认即仓库根）
 """
 import os
 
-SRC = r"D:\code\新的代码\全栈图库管理器 v3.2bata\image-search"
+SRC = os.path.dirname(os.path.abspath(SPECPATH))
+PYI_OUT = os.environ.get("PYI_OUT", SRC)
 WEIGHTS_DIR = os.path.join(os.environ.get("USERPROFILE", ""),
                            ".cache", "torch", "hub", "checkpoints")
 

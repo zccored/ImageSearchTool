@@ -19,6 +19,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -30,10 +31,11 @@ from hybrid_search.config import Config  # noqa: E402
 from hybrid_search.coarse import extract_binary_features  # noqa: E402
 from hybrid_search.fine import ResNetExtractor  # noqa: E402
 from hybrid_search.io_utils import collect_images, read_bytes  # noqa: E402
+from paths import GALLERY_ROOT  # noqa: E402
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 40
 cfg = Config()
-paths = collect_images(r"F:\视频", cfg.extensions, limit=N)
+paths = collect_images(GALLERY_ROOT, cfg.extensions, limit=N)
 print(f"样本 {len(paths)} 张（前 {N} 个自然序）")
 
 ex = ResNetExtractor(cfg)

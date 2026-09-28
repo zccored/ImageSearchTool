@@ -112,7 +112,7 @@ def locate_gallery_root(path: str) -> Optional[Dict]:
                         if base.endswith(".meta.json") else base)
                 return {"root": cand, "prefix": os.path.join(idx_dir, name)}
         parent = os.path.dirname(cand)
-        if parent == cand:                 # 到达文件系统根（如 F:\），没有宿主
+        if parent == cand:                 # 到达文件系统根（如 <盘符>:\），没有宿主
             return None
         cand = parent
 

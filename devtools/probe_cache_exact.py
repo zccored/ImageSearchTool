@@ -23,6 +23,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -35,11 +36,12 @@ from PIL import Image  # noqa: E402
 from hybrid_search.config import Config  # noqa: E402
 from hybrid_search.fine import ResNetExtractor, _PRE_DOWNSCALE_PX, _PRE_DOWNSCALE_SIDE  # noqa: E402
 from hybrid_search.io_utils import collect_images, decode_rgb, read_bytes  # noqa: E402
+from paths import GALLERY_ROOT  # noqa: E402
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 24
 cfg = Config()
 ex = ResNetExtractor(cfg)
-paths = collect_images(r"F:\视频", cfg.extensions, limit=N)
+paths = collect_images(GALLERY_ROOT, cfg.extensions, limit=N)
 
 rows = {"png": [], "jpg97": [], "jpg95": []}
 sizes = {k: [] for k in rows}

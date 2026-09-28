@@ -229,3 +229,6 @@ thumbs/
 # 3) Python 字节码与打包中间产物
 *.pyc
 *.pyo
+# 4) devtools 本机路径（真实图库根 / 靶子图 / 仓库绝对路径；不要入库）
+#    模板与取值优先级见 devtools/paths.py，本机初始化：python -E devtools/paths.py --init
+devtools/local_paths.py

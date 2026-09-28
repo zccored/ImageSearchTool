@@ -20,6 +20,7 @@ import time
 import tkinter as tk
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -28,6 +29,7 @@ import psutil  # noqa: E402
 
 import gui as G  # noqa: E402
 from compare_view import CompareWindow  # noqa: E402
+from paths import GALLERY_ROOT  # noqa: E402
 
 if "--cold" in sys.argv:
     # 冷启动：把缩略图缓存指到空目录，测“首次打开”的真实代价
@@ -79,8 +81,8 @@ root.geometry("+12000+12000")
 root.deiconify()
 try:
     app = G.App(root)
-    app.dir_var.set(r"F:\视频")
-    app.prefix = r"F:\视频\.gallery_index\gallery"
+    app.dir_var.set(GALLERY_ROOT)
+    app.prefix = os.path.join(GALLERY_ROOT, ".gallery_index", "gallery")
 
     print("\n== 1) 审查窗构建 + 首屏缩略图 ==")
     t0 = time.time()

@@ -13,10 +13,10 @@
 perfscope —— 图库只读观测仪（档案 / 效能画像 / CPU·GPU 时间轴 / 建议）
 
 用法：
-  python perfscope.py F:\\视频                       # 扫描档案 + 分层抽样解码效能 + 小型融合建库画像
-  python perfscope.py F:\\视频 --scan-only          # 只做档案（最快）
-  python perfscope.py F:\\视频 --no-fused           # 跳过融合建库时间轴
-  python perfscope.py F:\\视频 --max-scan 5000      # 扫描上限（大库调试用）
+  python perfscope.py <图库根>                       # 扫描档案 + 分层抽样解码效能 + 小型融合建库画像
+  python perfscope.py <图库根> --scan-only          # 只做档案（最快）
+  python perfscope.py <图库根> --no-fused           # 跳过融合建库时间轴
+  python perfscope.py <图库根> --max-scan 5000      # 扫描上限（大库调试用）
 
 严格只读：本工具不会创建/修改/移动/删除图库里的任何文件；
 全部中间产物（扫描缓存、临时索引、HTML 报告）只写当前工作目录。

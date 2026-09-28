@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
 # ImageSearchTool · 图库检索管理器 — 复核真实侧车索引：加载耗时/RSS + 三种检索模式可用性
 # Copyright (C) 2026 zccored
@@ -20,17 +20,19 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import psutil  # noqa: E402
 
 from hybrid_search.config import Config  # noqa: E402
 from hybrid_search.engine import HybridEngine  # noqa: E402
 from hybrid_search import tile_index as TI  # noqa: E402
+from paths import GALLERY_ROOT, TARGET_IMAGE  # noqa: E402
 
-ROOT = r"F:\视频"
+ROOT = GALLERY_ROOT
 FP = os.path.join(ROOT, ".gallery_index", "gallery")
 TP = os.path.join(ROOT, ".gallery_index", "gallery_tiles")
-Q = r"F:\靶子\77C93F54F2277365732D6E39B73878E4.png"
+Q = TARGET_IMAGE
 PROC = psutil.Process()
 
 

@@ -13,7 +13,7 @@
 
 只读索引、只读图片，不写任何索引与图库文件；建议每次瓦片建库后跑一次。用法：
 
-    python devtools/verify_tile_index.py "F:\\视频\\.gallery_index\\gallery_tiles" --root F:\\视频
+    python devtools/verify_tile_index.py "<图库根>\\.gallery_index\\gallery_tiles" --root <图库根>
     python devtools/verify_tile_index.py <瓦片前缀> --root <图库目录> --samples 300
 
 检查项：

@@ -9,7 +9,7 @@
 # v3.0 (AGPL-3.0-only), WITHOUT ANY WARRANTY. See the LICENSE file for terms.
 # ---------------------------------------------------------------------------
 
-"""真实规模（F:\\视频，6600 组 / 2.7 万张）下审查窗口的构建与滚动性能。
+"""真实规模（<图库根>，6600 组 / 2.7 万张）下审查窗口的构建与滚动性能。
 
 首次运行会做一次只读扫描（约 90s）并缓存报告；之后复用缓存秒开。
 用法: python devtools/verify_dedup_scale.py [--rescan]
@@ -22,6 +22,7 @@ import time
 import tkinter as tk
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -32,8 +33,9 @@ import gui as G  # noqa: E402
 from hybrid_search import dedup as DD  # noqa: E402
 from hybrid_search.config import Config  # noqa: E402
 from hybrid_search.io_utils import collect_images  # noqa: E402
+from paths import GALLERY_ROOT  # noqa: E402
 
-ROOT = r"F:\视频"
+ROOT = GALLERY_ROOT
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "perf_reports")
 CACHE = os.path.join(CACHE_DIR, "dedup_report_F视频.pkl")

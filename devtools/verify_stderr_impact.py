@@ -22,6 +22,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -29,13 +30,14 @@ for _s in (sys.stdout, sys.stderr):
 from hybrid_search.config import Config  # noqa: E402
 from hybrid_search.engine import HybridEngine  # noqa: E402
 from hybrid_search.io_utils import collect_images  # noqa: E402
+from paths import GALLERY_ROOT  # noqa: E402
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 600
 MODE = sys.argv[2] if len(sys.argv) > 2 else "on"
 
 cfg = Config()
 cfg.silence_png_warnings = (MODE == "on")
-paths = collect_images(r"F:\视频", cfg.extensions, limit=N)
+paths = collect_images(GALLERY_ROOT, cfg.extensions, limit=N)
 print(f"[{MODE}] 样本 {len(paths)} 张，silence_png_warnings={cfg.silence_png_warnings}")
 
 tmp = tempfile.mkdtemp(prefix="impact_")

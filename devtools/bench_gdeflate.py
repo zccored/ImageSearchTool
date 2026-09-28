@@ -41,12 +41,14 @@ if not torch.cuda.is_available():
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _HERE)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
 
+from paths import GALLERY_ROOT, THIRD_PARTY_LIBDEFLATE  # noqa: E402
+
 REPO = _HERE
-GALLERY_ROOT = r"F:\视频"
 EXTS = [".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"]
 N_EACH = int(sys.argv[1]) if len(sys.argv) > 1 else 6
 ROUNDS = int(sys.argv[2]) if len(sys.argv) > 2 else 3
@@ -56,7 +58,7 @@ CT = {0: "灰度", 2: "RGB", 3: "调色板", 4: "灰度+a", 6: "RGBA"}
 BPP = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
 DLL_CANDIDATES = [
     os.environ.get("IMAGE_SEARCH_LIBDEFLATE_DLL", ""),
-    r"D:\code\剩余存储\baidudownload\BaiduNetdisk\module\ImageViewer\libdeflate.dll",
+    THIRD_PARTY_LIBDEFLATE,
 ]
 
 STATE = {"stage": "初始化", "detail": "", "done": 0, "total": 1, "best": "", "peak_mb": 0.0}

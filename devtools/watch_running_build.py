@@ -27,7 +27,7 @@ import psutil  # noqa: E402
 
 PID = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 DUR = float(sys.argv[2]) if len(sys.argv) > 2 else 40.0
-AVG_IMG_MB = 1.94          # 抽样实测：F:\视频 前 400 张平均 1.94MB
+AVG_IMG_MB = 1.94          # 抽样实测：<图库根> 前 400 张平均 1.94MB
 TILES_PER_IMG = 10.47      # 全库 444,235 瓦片 / 42,414 张
 
 p = psutil.Process(PID)

@@ -12,8 +12,8 @@
 """
 peer_launcher —— “切换启动”全栈图库管理器（跨程序互切，配合 img_server 按钮闭环）。
 
-本图库检索管理器（image-search）可与“全栈图库管理器”（D:\\code\\新的代码\\全栈图库
-管理器 v3.2bata\\main.py，PySide6 独立程序）互相切换：
+本图库检索管理器（image-search）可与“全栈图库管理器”（<全栈图库管理器主程序路径，
+请按本机填写，例如 …\\全栈图库管理器 v3.2bata\\main.py>，PySide6 独立程序）互相切换：
   * img_server 侧按钮：关全栈管理器 → 打开本检索管理器（见 handoff 流程）；
   * 本侧“切换启动”按钮：关本程序 → 打开全栈管理器 main.py（本模块实现）。
 
@@ -39,9 +39,11 @@ import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
-# 全栈图库管理器绝对位置（可用环境变量 IMG_PEER_DIR 覆盖——换机/迁移时用）
-PEER_DIR = os.environ.get("IMG_PEER_DIR") or \
-    r"."
+# 全栈图库管理器绝对位置：默认取**本仓库的上级目录**（两者的常规布局就是
+# <...>\全栈图库管理器 v3.2bata\main.py 与 <...>\全栈图库管理器 v3.2bata\image-search\）。
+# 需要换机/换布局时用环境变量 IMG_PEER_DIR 覆盖 —— 不要把本机绝对路径写回源码，
+# 本文件随公开仓库分发。
+PEER_DIR = os.environ.get("IMG_PEER_DIR") or os.path.dirname(BASE)
 PEER_MAIN = os.path.join(PEER_DIR, "main.py")
 PEER_NAME = "main.py"
 
@@ -127,10 +129,11 @@ def register() -> dict:
         return {"ok": False, "reason": f"切换目标不存在：{PEER_MAIN}"}
     cur = _sha256_file(PEER_MAIN)
     manifest = load_manifest()
+    # 注意：**不写 path 字段**。清单随本包分发（公开仓库），写进去等于把本机绝对路径
+    # 带回去；而 check() 只读 sha256 / registered_at，path 从未被消费。
     (manifest.setdefault("files", {}))[PEER_NAME] = {
         "sha256": cur,
         "registered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "path": PEER_MAIN,
     }
     save_manifest(manifest)
     return {"ok": True, "sha256": cur,

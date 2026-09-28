@@ -12,15 +12,16 @@
 """命令行查验去重（只读，不删除/移动任何文件）。
 
 用法:
-  python devtools/dedup_scan_real.py F:\\视频            # 默认阈值 4%
-  python devtools/dedup_scan_real.py F:\\视频 3          # 阈值 3%
-  python devtools/dedup_scan_real.py F:\\视频 --top 20   # 只列前 20 组
+  python devtools/dedup_scan_real.py <图库根>            # 默认阈值 4%
+  python devtools/dedup_scan_real.py <图库根> 3          # 阈值 3%
+  python devtools/dedup_scan_real.py <图库根> --top 20   # 只列前 20 组
 """
 import os
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -30,6 +31,7 @@ import psutil  # noqa: E402
 from hybrid_search import dedup as DD  # noqa: E402
 from hybrid_search.config import Config  # noqa: E402
 from hybrid_search.io_utils import collect_images  # noqa: E402
+from paths import GALLERY_ROOT  # noqa: E402
 
 
 def human(n: float) -> str:
@@ -41,7 +43,7 @@ def human(n: float) -> str:
 
 
 def main() -> int:
-    root = sys.argv[1] if len(sys.argv) > 1 else r"F:\视频"
+    root = sys.argv[1] if len(sys.argv) > 1 else GALLERY_ROOT
     threshold = 0.04
     top = 15
     args = sys.argv[2:]

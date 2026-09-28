@@ -17,7 +17,8 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, r"D:\code\新的代码\全栈图库管理器 v3.2bata\image-search")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -27,6 +28,7 @@ from hybrid_search.config import Config  # noqa: E402
 from hybrid_search.engine import HybridEngine  # noqa: E402
 from hybrid_search import tile_index as TI  # noqa: E402
 from hybrid_search.store import IndexFiles, compact  # noqa: E402
+from paths import GALLERY_ROOT, TARGET_IMAGE  # noqa: E402
 
 PROC = psutil.Process()
 
@@ -173,10 +175,10 @@ try:
     print("\n== 8) 真实 444k 瓦片索引（npz，只读）回归 ==")
     eng = HybridEngine(cfg)
     t0 = time.time()
-    eng.open(r"F:\视频\.gallery_index\gallery_tiles")
+    eng.open(os.path.join(GALLERY_ROOT, ".gallery_index", "gallery_tiles"))
     print(f"  open={time.time() - t0:.2f}s 存储={eng._storage} n={eng.coarse.size}")
     o = TI.search_tiles_tiled(
-        eng, r"F:\靶子\77C93F54F2277365732D6E39B73878E4.png",
+        eng, TARGET_IMAGE,
         top_k=3, coarse_k=300)
     for h in o.hits[:2]:
         print(f"  {os.path.basename(h.path)} cos={h.fine_score:.4f} box={h.box}")

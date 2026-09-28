@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
 # ImageSearchTool · 图库检索管理器 — 回归：引擎缓存与内存释放、性能图导出、add_tiles 增量正确性
 # Copyright (C) 2026 zccored
@@ -21,7 +21,8 @@ import tempfile
 import threading
 import time
 
-sys.path.insert(0, r"D:\code\新的代码\全栈图库管理器 v3.2bata\image-search")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -32,10 +33,11 @@ import psutil  # noqa: E402
 from hybrid_search.config import Config  # noqa: E402
 import gui as G  # noqa: E402
 import perfwatch as PW  # noqa: E402
+from paths import GALLERY_ROOT, TARGET_IMAGE  # noqa: E402
 
 PROC = psutil.Process()
-ROOT = r"F:\视频"
-Q = r"F:\靶子\77C93F54F2277365732D6E39B73878E4.png"
+ROOT = GALLERY_ROOT
+Q = TARGET_IMAGE
 
 
 def rss():

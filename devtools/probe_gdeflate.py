@@ -15,11 +15,13 @@ if not torch.cuda.is_available():
     raise SystemExit(0)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
 
 from nvidia import nvcomp                                            # noqa: E402
+from paths import GALLERY_ROOT                                       # noqa: E402
 
 print("nvcomp", nvcomp.__version__, "cuda", nvcomp.__cuda_version__)
 print("gpu", torch.cuda.get_device_name(0))
@@ -92,7 +94,7 @@ if enc is not None:
             print("       roundtrip identical:", got == payload.tobytes())
 
 # ---------------------------------------------------------------- 3) 真实 PNG IDAT
-ROOT = r"F:\视频"
+ROOT = GALLERY_ROOT
 png = None
 for dp, _dn, fn in os.walk(ROOT):
     for f in fn:

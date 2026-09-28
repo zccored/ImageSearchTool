@@ -20,6 +20,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -27,11 +28,12 @@ for _s in (sys.stdout, sys.stderr):
 from hybrid_search.config import Config  # noqa: E402
 from hybrid_search.engine import HybridEngine  # noqa: E402
 from hybrid_search import tile_index as TI  # noqa: E402
+from paths import GALLERY_ROOT, TARGET_IMAGE  # noqa: E402
 
-ROOT = r"F:\视频"
+ROOT = GALLERY_ROOT
 FP = os.path.join(ROOT, ".gallery_index", "gallery")
 TP = os.path.join(ROOT, ".gallery_index", "gallery_tiles")
-CROP = r"F:\靶子\77C93F54F2277365732D6E39B73878E4.png"
+CROP = TARGET_IMAGE
 cfg = Config()
 
 
