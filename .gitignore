@@ -236,3 +236,7 @@ devtools/local_paths.py
 #    （`frontend/dist` 也被上面模板里的 `dist/` 覆盖，这里显式写一遍便于理解）
 frontend/node_modules/
 frontend/dist/
+
+# 本地会话边界文件与旧分支快照（含本机路径 / 非源码），不入库
+AGENTS.md
+branch/
