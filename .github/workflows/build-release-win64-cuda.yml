@@ -70,9 +70,12 @@ jobs:
       - name: 安装 CUDA 版 torch / torchvision
         shell: pwsh
         run: |
+          # ⚠ 必须写成**单行**：GitHub 会把 run 块落成一个 .ps1 再执行，
+          #   PowerShell 的反引号续行在这个环节会被写坏（实测报
+          #   "File ...ps1 cannot be found"，整个 step exit 1）。
           python -m pip install --upgrade pip
-          python -m pip install --no-cache-dir torch==2.4.0 torchvision `
-            --index-url $env:TORCH_INDEX
+          python -m pip install --no-cache-dir torch==2.4.0 torchvision --index-url $env:TORCH_INDEX
+          python -c "import torch;print('torch',torch.__version__,'cuda',torch.version.cuda)"
 
       - name: 安装其余依赖与 PyInstaller
         shell: pwsh
