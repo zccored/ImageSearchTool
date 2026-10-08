@@ -138,7 +138,7 @@ python gui_web.py        :: Web 版界面（另需系统 WebView2 运行时）
 | 整图索引加载（约 3.8 万 张） | **0.09 s** |
 | 整图检索（库 约 3.8 万 张，热态） | **125 ms / 次**（中位数；首查含模型加载 2.8 s） |
 | 瓦片索引加载（约 44.4 万 块） | **0.71 s** |
-| 局部（瓦片）检索（444k 块） | **2.2 s 首查**（含模型加载 + LSH 建表 ~1.9 s）→ 引擎常驻后 **~1 s / 次** |
+| 局部（瓦片）检索（455,175 块，2026-10-03 召回修复） | 全覆盖评分：进程首查约 **4.10 s**，常驻热查约 **0.80 s**；旧 LSH 会漏图，历史延迟不可作为等正确性对照，见 `docs/perf-plan.md` 第 20 节 |
 | 局部命中精度（靶子＝整图横切 24%） | Top1 命中原图，**余弦 0.9987**，命中框 (1045,384)-(1557,896) |
 | 重复图查验（42,414 张，阈值 2%） | **89 s** → 6,899 组 / 23,906 张 / 可释放 **72.9 GB** |
 | 审查窗口（2.4 万行） | 构建 **0.5 s**；冷启动首屏 **0.7 s**；二次打开 **<0.1 s**；内存 **~110 MB** |
@@ -379,9 +379,13 @@ GUI 里等价操作为工具栏 **④ 子图索引(512 切块·建/增量)**，�
 
 要点：
 
-- **查询侧也会切块**：查询图 ≥768 时按同一协议切块，逐块取候选后按“原图”聚合
-  （任一块与任一瓦片的余弦取最大），再对聚合出的原图做全瓦片 × 全部查询块的矩阵精排，
-  避免 LSH 漏行；小查询自动退回单块路径。
+- **查询侧也会切块**：从索引 meta 恢复建库协议（缺省长边 ≥768 时切块），
+  缩放后的查询使用对应坐标切块。全库瓦片 × 全部查询块做有界分块余弦评分，
+  按原图取最大分，不再使用 LSH 桶截断或指纹硬过滤；小查询退回单块。
+  `--cand lsh/coarse` 仅保留兼容，实际也走全覆盖评分；`--lsh-*` 不再改变召回。
+  `coarse_k` 仍影响整图检索，不再限制瓦片原图数量；瓦片输出由 `top_k` 决定。
+  全覆盖是已有特征的精确排名保证，不代表任意小裁切都能匹配语义。
+  **旧索引可直接使用，无需重建**；运行中的程序需重启以载入修复。
 - **结果带命中框**：命中项返回命中框（缩略图叠加红框），详情栏显示
   `命中框 (x0,y0)-(x1,y1)`；命中类型标注 `局部 / 整图 / 双`。
   > ⚠️ **已知偏差**：长边 >2560 的 JPEG 解码时会做域缩放（1/2、1/4、1/8，见
@@ -389,7 +393,7 @@ GUI 里等价操作为工具栏 **④ 子图索引(512 切块·建/增量)**，�
   > → 这类图（本图库实测占 **53.2%**）的红框会按 1/2 或 1/4 偏位；长边 ≤2560
   > 的图不受影响。**检索本身不受影响**（查询图走同一条解码路径，尺度一致）。
   > 自检脚本：`devtools/verify_tile_index.py`，详见「已知问题」。
-- **性能**（约 44.4 万 块瓦片库、RTX 4060 Laptop）：索引加载 **0.71 s**；首个查询含
+- **历史性能（旧 LSH 路径，非当前召回口径）**（约 44.4 万 块瓦片库、RTX 4060 Laptop）：索引加载 **0.71 s**；首个查询含
   ResNet 模型加载 + LSH 建表（~1.9 s）合计 **2.2 s**，引擎常驻后 **~1 s / 次**；
   全量建库 约 4 万 张 → 约 44.4 万 块耗时 **1843.5 s（21.7 张/秒 · 241 块/秒）**；
   靶子用例（整图横切 ~24% 高度）Top1 命中原图、余弦 **0.9987**、
@@ -514,22 +518,43 @@ python perfscope.py <图库根目录> --rescan        :: 强制重扫（忽略�
 ## 与 img_server 的自动交接（下载完成 → 增量建库）
 
 img_server（下载方）完成下载与哈希校验后，在其 UI 按按钮：
-写 `request_*.json` → 启动过渡进程 → img_server 及上级主程序退出 →
-自动打开本管理器并增量建库（校验 + 路径/MD5 去重，全程可视），
-完成后写 `result_*.json` 回审计目录。
+先弹出**交接方案**勾选框（整图增量 / 子图(瓦片)增量，默认都勾选）→ 写 `request_*.json`
+→ 启动过渡进程 → img_server 及上级主程序退出 → 自动打开本管理器并**按勾选的方案
+顺序增量建库**（整图在前、子图在后；校验 + 路径/MD5 去重，全程可视），完成后写
+`result_*.json` 回审计目录。
 
+- **交接方案（request 的 `modes`，schema v2）**：
+
+  | `modes` | 做什么 | 产出 |
+  | :--- | :--- | :--- |
+  | `["full","tiles"]`（缺省 / 老请求 / 两个都勾） | 整图增量 → 子图瓦片增量，顺序连做 | `<图库根>\.gallery_index\gallery.*` 与 `…\gallery_tiles.*` |
+  | `["full"]` | 只做整图增量 | 只有 `gallery.*` |
+  | `["tiles"]` | 只做子图瓦片增量 | 只有 `gallery_tiles.*`（首次会自动切块构建 512px） |
+
+  两边都没勾 / 选了「暂不处理」/ 直接关窗 → img_server 不发起交接，改为把本批落盘
+  信息暂存为 `<管理器目录>\handoff\pending_<时间戳>.json`，并在其「未处理项目」列表
+  里提供**立即交接**与红 × 删除（pending 文件由 img_server 侧读写，本程序不读不写）。
+- **img_server 侧第二十轮起会自己打理这些文件**（本程序无需任何配合）：
+  重开交接弹框时**回读** `result_*.json`（顶部「最近一次交接结果」+ 历史下拉 + 未处理列表每行的结果标注与
+  「查看结果」明细），未处理列表支持**分页**（每页 20）与多词 **搜索**；`pending_*.json` 按
+  **TTL 30 天 / 上限 200 条**自动清理（另有「清理过期」按钮），只动 pending 与崩溃残留的 `*.json.tmp`，
+  不碰 `request_*.json` / `result_*.json` / 图片。
 - 协议全文：`docs/HANDOFF_PROTOCOL.md`
 - img_server 侧接入需求（可直接交给对方智能体）：`docs/img_server_接入需求.md`
 - 本侧组件：
   - `handoff_launcher.py`：过渡进程（等待 img_server 退出 → 打开 GUI）
-  - `hybrid_search/handoff.py`：request 校验 / 图库根自动定位 / 增量执行 / result 回写
+  - `hybrid_search/handoff.py`：request 校验 / modes 归一化 / 图库根自动定位 / 增量执行 / result 回写
   - GUI 自动模式：`python gui.py --auto-handoff <request.json>`
-  - CLI 无界面模式：`python main.py ingest <request.json>`
+  - CLI 无界面模式：`python main.py ingest <request.json>`（可加 `--modes full,tiles`
+    覆盖请求里的方案，便于手工补做某一项）
 - **图库根自动定位**：请求 roots 是图库根下的子目录（如新下载批落在
   `<图库根目录>\<子图集>`）时，自动沿祖先目录向上找到含 `.gallery_index` 的
   图库根，把新图增量并入既有索引，不会在子目录里另建一套；
-  `prefix` 留空即启用该行为（详见 `docs/HANDOFF_PROTOCOL.md` §4.5）。
+  `prefix` 留空即启用该行为（详见 `docs/HANDOFF_PROTOCOL.md` §4）。
 - 无参启动 GUI/CLI 行为与平时完全一致（不影响正常打开与处理流程）。
+- 自检：`python devtools/verify_handoff_modes.py`（modes 归一化 / 只整图 / 只子图 /
+  两个都做 / 幂等 / 子目录并入宿主 / CLI `--modes` 覆盖 / 服务层 `handoff()` 事件流 /
+  `handoff_launcher.py` cli 模式端到端 / 启动器等待超时分支，共 80 项断言）。
 
 ## 〇·七、切换启动全栈图库管理器（两套程序互切）
 >图库管理器相关项目详情参考https://github.com/zccored/Library_Manager_zc_cored
@@ -812,6 +837,7 @@ image-search/
 ├── docs/perf/                       # 收录的性能图（整页 PNG + 原始 HTML + 采样 JSON）
 ├── docs/brand/                      # 品牌图（banner/social/logo/icon，SVG 矢量 + PNG 渲染）
 ├── docs/HANDOFF_PROTOCOL.md         # 与 img_server 的交接协议全文
+├── docs/img_server_接入需求.md       # 交给 img_server 侧的接入清单（弹框/pending/参数）
 ├── devtools/                        # 开发期回归/基准脚本（见下）
 ├── requirements.txt
 └── hybrid_search/
@@ -825,9 +851,9 @@ image-search/
     ├── thumbs.py                    # 缩略图磁盘缓存（96px，供重复图审查页秒开）
     ├── prep_cache.py                # 预处理缓存（重复建库跳过解码：25× 提速/省 99% CPU）
     ├── dedup.py                     # 重复图查验（MD5 完全重复 + 指纹近似重复）
-    ├── tile_index.py                # 瓦片(局部)索引：切块建库 + LSH 候选 + 切块聚合检索
+    ├── tile_index.py                # 瓦片(局部)索引：切块建库 + 全覆盖分块评分 + 原图聚合
     ├── engine.py                    # 两级检索流水线 + 索引生命周期
-    ├── handoff.py                   # img_server 交接：request 校验/图库根定位/增量/回写
+    ├── handoff.py                   # img_server 交接：request 校验/modes 归一化/图库根定位/整图+子图增量/回写
     ├── visuals.py                   # Top-K 总览图输出
     ├── progress.py                  # CLI 双阶段进度渲染（计数/百分比/吞吐/ETA）
     └── cli.py                       # argparse 子命令
@@ -853,6 +879,61 @@ image-search/
 
 <details>
   <summary>更新日志</summary>
+
+### 2026-10-03（瓦片召回修复：LSH 桶截断 → 全覆盖评分；性能档案归档）
+
+- **瓦片（局部）检索不再漏图**：旧路径靠 LSH 桶取候选 + 指纹硬过滤，桶外/指纹不同的
+  正确瓦片会被直接丢掉。现在改为 **全库瓦片 × 全部查询块的有界分块余弦评分**，
+  按原图取最大分 —— 这是**已有特征下的精确排名**，不再有桶截断带来的漏召回。
+- **开关语义变化（重要）**：`--cand lsh/coarse` **仅保留兼容**，实际也走全覆盖评分；
+  `--lsh-*` 系列参数**不再改变召回结果**。`coarse_k` 仍影响**整图**检索，但不再限制
+  瓦片候选的原图数量；瓦片输出条数由 `top_k` 决定。
+- **性能口径随之变化**（靶子库 455,175 块）：全覆盖评分进程首查约 **4.10 s**，
+  引擎常驻后热查约 **0.80 s / 次**。⚠ 旧 LSH 路径的历史延迟（2.2 s 首查 / ~1 s 热查）
+  **不是等正确性对照**，别拿来对比。
+- **旧索引可直接使用，无需重建**；正在运行的程序需**重启**以载入修复。
+- **新增 `docs/perf-plan.md`**：性能优化的**唯一事实来源** —— 每条都带本机实测数字、
+  开关名与验证方式，并且**保留被证伪的假设**（附反证数据），避免以后重复踩。
+  涵盖 P0/P1 已落地项（块 md5 复用 −37% wall、重复内容预过滤、归一化搬 GPU、
+  批大小 64→256 −24% wall 等）、未采纳项（瓦片 tick 20→120 ms 无收益）与后续计划。
+- **`devtools/` 基准/回归脚本成体系**：`ab_build_bench.py`（A/B 建库基准）、
+  `bench_*.py`、`probe_*.py`、`verify_*.py`（含 `verify_tile_index.py` 瓦片索引自检）。
+
+### 2026-10-02（交接协议 v2：整图 / 子图 可选或都做）
+
+- **交接方案可选（`modes`，schema v2）**：img_server 按交接按钮后先让用户勾
+  「整图增量 / 子图(瓦片)增量」（默认都勾），请求里写 `"modes": ["full","tiles"]`；
+  本侧按 `full → tiles` 固定顺序连做，逐阶段上报进度（`fused` / `tiles`），
+  result 里给出 `modes`、`stages[]`、`total_added`、`total_tiles_added`。
+  schema v1 老请求仍被接受（等价于两个都做）；两边都没勾则由 img_server 侧暂存
+  `handoff/pending_<时间戳>.json`（本程序不读不写）。
+- **CLI 可覆盖方案**：`python main.py ingest <request.json> --modes full,tiles`
+  （也接受 `--modes tiles` 手工补做子图），用于重跑或补做漏掉的阶段。
+- **img_server 侧第二十轮补齐（本侧零改动）**：交接弹框现在会**回读** `result_*.json`
+  （顶部「最近一次交接结果」摘要 + 历史下拉 + 未处理列表每行的结果标注与「查看结果」明细），
+  未处理列表支持**分页**（每页 20 条）与多词（AND）**搜索**（可搜时间戳 / request_id / reason /
+  modes / 根路径 / 结果状态）；`pending_*.json` 按 **TTL 30 天 / 上限 200 条**自动清理
+  （另有「清理过期」按钮），只动 pending 与崩溃残留的 `*.json.tmp`。协议与 result 字段均未变。
+- **`handoff.py` 重构**：新增 `normalize_modes()` / `mode_labels()` /
+  `_stage_progress()`；`run_ingest(req, progress, modes)` 每根目录产出
+  `stages[] = [{mode, label, prefix, added, build_mode, secs, total_in_index|total_tiles}]`
+  （两个阶段都用 `added` 报本次新增数：整图=张、子图=瓦片块）；
+  阶段边界事件（save/done）统一归到当前阶段，避免整图做完就显示"全部完成"。
+- **GUI / CLI / 过渡进程同步**：结果提示形如
+  `自动增量完成（整图+子图）：新增 X 张 / Y 瓦片，耗时 Zs -> <前缀>`。
+- **新增 `devtools/verify_handoff_modes.py`**：modes 归一化 / 只整图 / 只子图 /
+  两个都做 / 幂等 / `locate_gallery_root` 定位规则 / 子目录新图并入宿主 /
+  CLI `--modes` 覆盖 / 服务层 `handoff()` 事件流 / `handoff_launcher.py` cli 模式
+  端到端 / 启动器等待超时分支，共 80 项断言全绿（ALL PASS）。
+  > 注意：该脚本默认把工作目录放在索引器**上一级目录**的 `_handoff_verify\`
+  > （本机 `F:\` 根上有一套 2026-09 建的旧索引，而系统 TMP 在 `F:\Revit`，
+  > 用系统临时目录会被祖先链定位命中并污染用例）。
+- **启动器超时分支修正**：`expect_exit` 里的进程超过 `--wait` 仍未退出时，那条
+  `ok:false` 的错误 result 现在写进 **request 所在目录**（img_server 的 `handoff\`），
+  不再落到本程序自己的 `image-search\handoff\` —— 之前 img_server 侧看不到这条失败记录。
+- **文档**：`docs/HANDOFF_PROTOCOL.md` 整体升到 schema v2（新增 §交接方案、
+  §pending 暂存说明、排查清单两项）；新增 `docs/img_server_接入需求.md`（给
+  img_server 侧的接入清单，含弹框 / pending 文件字段 / 启动参数）。
 
 ### 2026-09-28（合并一轮：Web 版并入主线 + 路径治理 + 全量复测）
 
