@@ -109,6 +109,7 @@ frontend/
 | **Gate 3** | HTTP **只监听 127.0.0.1** |
 | **Gate 4** | 错误 token 的调用被拒 |
 | **Gate 5** | 一屏缩略图全部落定（吞吐 / 失败计数，前端自检钩子 `__ise_selftest`） |
+| **Gate 6** | 亮/暗主题两套配色都真的生效（`body` 背景色不同）+ 点击按钮即切（真窗口；前端自检钩子 `__ise_selftest_theme`） |
 
 改动界面后至少跑一次无头；涉及桥/窗口/静态资源时跑真窗口模式。
 
@@ -146,7 +147,7 @@ frontend/
 2. **不能在界面里复制参数默认值**：参数页一律读 `get_config_schema()`（默认值只在
    `hybrid_search/config.py` 写一次）。
 
-## 9. 许可
+## 10. 许可
 
 `frontend/**` 的源文件带与项目一致的**中英双语 AGPL-3.0-only 声明**（见各文件头与
 `frontend/LICENSE-NOTICE`）。
