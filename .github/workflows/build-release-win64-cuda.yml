@@ -36,6 +36,12 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 120
+    # GitHub 会把 run 块落成 .ps1 再 dot-source 执行，实测该 runner 的
+    # ExecutionPolicy 会挡住（"running scripts is disabled on this system"）。
+    # 统一给默认 shell 加 -ExecutionPolicy Bypass -File，省得每个 step 各写一遍。
+    defaults:
+      run:
+        shell: pwsh -ExecutionPolicy Bypass -File {0}
 
     env:
       # 与本地构建保持一致（本地实测 torch 2.4.0+cu124 / Python 3.12）
@@ -49,7 +55,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 腾磁盘空间（runner 默认只剩 ~14 GB，装完 torch + 打包会不够）
-        shell: pwsh
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
           foreach ($p in @('C:\Android', 'C:\hostedtoolcache\windows\Java_*',
@@ -68,23 +73,22 @@ jobs:
           cache: 'pip'
 
       - name: 安装 CUDA 版 torch / torchvision
-        shell: pwsh
+        # 用 cmd 而不是 pwsh：GitHub 会把 run 块落成 .ps1 再 dot-source 执行，
+        # 实测该 runner 的 ExecutionPolicy 会挡住它
+        # （"cannot be loaded because running scripts is disabled on this system"）。
+        # cmd 没有执行策略这回事，最省事。变量用 %VAR%。
+        shell: cmd
         run: |
-          # ⚠ 必须写成**单行**：GitHub 会把 run 块落成一个 .ps1 再执行，
-          #   PowerShell 的反引号续行在这个环节会被写坏（实测报
-          #   "File ...ps1 cannot be found"，整个 step exit 1）。
           python -m pip install --upgrade pip
-          python -m pip install --no-cache-dir torch==2.4.0 torchvision --index-url $env:TORCH_INDEX
+          python -m pip install --no-cache-dir torch==2.4.0 torchvision --index-url %TORCH_INDEX%
           python -c "import torch;print('torch',torch.__version__,'cuda',torch.version.cuda)"
 
       - name: 安装其余依赖与 PyInstaller
-        shell: pwsh
         run: |
           python -m pip install --no-cache-dir -r requirements.txt
           python -m pip install --no-cache-dir pyinstaller==6.15.0
 
       - name: 准备 resnet18 预训练权重（仓库里没有，spec 从用户目录读）
-        shell: pwsh
         run: |
           # image-search.spec 的 WEIGHTS_DIR 指向 %USERPROFILE%\.cache\torch\hub\checkpoints，
           # 打包时把里面的 resnet18 权重塞进 _internal/torch_home/，实现"离线也能建精排索引"。
@@ -96,7 +100,6 @@ jobs:
           Get-Item $dst | ForEach-Object { "  权重 $($_.Name)  $([math]::Round($_.Length/1MB,1)) MB" }
 
       - name: 打包（image-search.spec → GUI / CLI / Web 三个 exe）
-        shell: pwsh
         run: |
           python -m PyInstaller --noconfirm --clean image-search.spec
           if (-not (Test-Path 'dist\ImageSearch')) { throw '打包产物 dist\ImageSearch 不存在' }
@@ -105,7 +108,6 @@ jobs:
           "  产物：$n 个文件 / $sz MB"
 
       - name: 打包后自检（三个 exe 都在、权重已内置）
-        shell: pwsh
         run: |
           foreach ($e in 'ImageSearchGUI.exe', 'ImageSearchCLI.exe', 'ImageSearchWeb.exe') {
             if (-not (Test-Path "dist\ImageSearch\$e")) { throw "缺少 $e" }
@@ -116,7 +118,6 @@ jobs:
 
       - name: 解析版本号
         id: ver
-        shell: pwsh
         run: |
           $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
             '${{ github.event.inputs.tag }}'
@@ -125,7 +126,6 @@ jobs:
           "  发布 tag = $tag"
 
       - name: 切卷压缩（GitHub 附件上限 2 GiB）
-        shell: pwsh
         run: |
           $tag = '${{ steps.ver.outputs.tag }}'
           $base = "ImageSearchTool-$tag-win64-cuda"
