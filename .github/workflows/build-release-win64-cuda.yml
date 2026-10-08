@@ -49,6 +49,11 @@ jobs:
       TORCH_INDEX: 'https://download.pytorch.org/whl/cu124'
       # Release 附件硬上限是 2 GiB，切 1900 MB 留出余量
       VOLUME_SIZE: '1900m'
+      # runner 的控制台编码是 cp1252，而 image-search.spec 里有中文 print()，
+      # 不加这个会在 spec 执行阶段抛 UnicodeEncodeError（'charmap' codec can't
+      # encode characters）→ 打包直接失败。PYTHONUTF8 再兜一层保险。
+      PYTHONIOENCODING: 'utf-8'
+      PYTHONUTF8: '1'
 
     steps:
       - name: 取出源码
