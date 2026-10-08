@@ -57,11 +57,19 @@ jobs:
       - name: 腾磁盘空间（runner 默认只剩 ~14 GB，装完 torch + 打包会不够）
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
-          foreach ($p in @('C:\Android', 'C:\hostedtoolcache\windows\Java_*',
-                           'C:\hostedtoolcache\windows\Ruby', 'C:\hostedtoolcache\windows\node',
-                           'C:\Program Files\Google', 'C:\Program Files (x86)\Google',
-                           'C:\Program Files\Mozilla Firefox', 'C:\Program Files\Microsoft SQL Server',
-                           'C:\Program Files\dotnet', 'C:\Program Files\PowerShell')) {
+          # ⚠ 千万别删 C:\Program Files\PowerShell —— 那是 runner 跑这些 step 用的
+          #   pwsh.exe **自己的安装目录**。删了它，后续 step 会在加载
+          #   Microsoft.PowerShell.Management 模块时失败
+          #   （实测 "The 'Test-Path' command was found ... but the module could not
+          #   be loaded"），而且要到**几步之后**才发作，非常难查。
+          foreach ($p in @('C:\Android',
+                           'C:\hostedtoolcache\windows\Java_*',
+                           'C:\hostedtoolcache\windows\Ruby',
+                           'C:\hostedtoolcache\windows\node',
+                           'C:\Program Files\Google',
+                           'C:\Program Files (x86)\Google',
+                           'C:\Program Files\Mozilla Firefox',
+                           'C:\Program Files\Microsoft SQL Server')) {
             if (Test-Path $p) { Remove-Item $p -Recurse -Force }
           }
           Get-PSDrive C | ForEach-Object { "C: 可用 $([math]::Round($_.Free/1GB,1)) GB" }
