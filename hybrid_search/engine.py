@@ -95,6 +95,8 @@ def _phase(progress, done: int, total: int, phase: str) -> None:
 class HybridEngine:
 
     def __init__(self, cfg: Config):
+        from .runtime import configure_opencv_threads
+        self.opencv_threads = configure_opencv_threads(cfg.opencv_threads)
         self.cfg = cfg
         # 让解码层跟随配置的 PNG 解码器（cv2 全尺寸 / pillow）
         from .io_utils import (set_big_decode_limit, set_cv2_rgb_direct,
@@ -322,22 +324,22 @@ class HybridEngine:
                                      seen_lock=_seen_lock)
 
         def on_batch(ok_paths, tensors, payloads):
-            # 1) 粗筛特征入库（结果顺序 = 追加顺序）
-            accepted = self.coarse.add_results(ok_paths, payloads)
-            keep = [i for i, a in enumerate(accepted) if a]
-            if not keep:
-                return [], None
-            sub_ok = [ok_paths[i] for i in keep]
-            sub_ts = [tensors[i] for i in keep]
-            # 2) 只对新增图做 GPU 前向
-            feats = ex._forward(sub_ts)              # noqa: SLF001 —— 同模块协作
-            if feats is None:
-                return [], None
-            rows = feats.astype(np.float32)
-            norms = np.linalg.norm(rows, axis=1, keepdims=True)
-            norms[norms < 1e-8] = 1.0
-            rows /= norms
-            return sub_ok, rows
+            with self.coarse.append_transaction():
+                # 去重后仅对新增图前向；任何失败均撤回本批粗筛追加。
+                accepted = self.coarse.add_results(ok_paths, payloads)
+                keep = [i for i, a in enumerate(accepted) if a]
+                if not keep:
+                    return [], None
+                sub_ok = [ok_paths[i] for i in keep]
+                sub_ts = [tensors[i] for i in keep]
+                feats = ex._forward(sub_ts)         # noqa: SLF001 同模块协作
+                if feats is None or feats.ndim != 2 or len(feats) != len(keep):
+                    raise RuntimeError("融合精排返回空结果或特征行数不匹配")
+                rows = feats.astype(np.float32)
+                norms = np.linalg.norm(rows, axis=1, keepdims=True)
+                norms[norms < 1e-8] = 1.0
+                rows /= norms
+                return sub_ok, rows
 
         return ex.stream_decode(paths, prep=prep, progress=progress,
                                 on_batch=on_batch)

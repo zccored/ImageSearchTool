@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
@@ -309,6 +310,31 @@ class CoarseIndex:
             if progress:
                 progress(done, len(paths))
         return accepted
+
+    @contextmanager
+    def append_transaction(self):
+        """融合消费线程的追加事务：精排失败时撤回本批粗筛与去重登记。
+
+        事务内仅允许追加，不调用 finalize/load_state，不与其他写线程并发。
+        正常路径只保存列表长度；失败路径才重建去重集合，不复制全库矩阵。
+        """
+        lists = (self.paths, self.md5s, self.boxes,
+                 self._hu_parts, self._fp_parts)
+        lengths = tuple(len(items) for items in lists)
+        had_empty_md5 = "" in self._md5_set
+        try:
+            yield
+        except BaseException:
+            for items, length in zip(lists, lengths):
+                del items[length:]
+            self._md5_set.clear()
+            self._md5_set.update(m for m in self.md5s if m)
+            if had_empty_md5:
+                self._md5_set.add("")
+            self._path_set.clear()
+            self._path_set.update(os.path.normcase(os.path.abspath(p))
+                                  for p in self.paths)
+            raise
 
     def finalize(self) -> None:
         """把累积的新分块与既有矩阵合并（既有矩阵来自内存增量或磁盘加载），

@@ -26,6 +26,7 @@ inflate 长度不符、缺少原生模块或 libdeflate DLL）一律返回 None�
 import os
 import struct
 import threading
+import weakref
 import zlib
 from typing import Dict, Optional, Tuple
 
@@ -67,6 +68,31 @@ _scratch_used = 0
 _budget_lock = threading.Lock()
 _STATS: Dict[str, int] = {}
 _STATS_LOCK = threading.Lock()
+
+
+def _return_scratch_budget(size):
+    global _scratch_used
+    with _budget_lock:
+        _scratch_used -= size[0]
+
+
+class _ThreadResources:
+    """线程退出时归还预算和原生句柄；终结器不捕获本对象，避免引用环。"""
+
+    def __init__(self):
+        self.buffers = {}
+        self.cached_bytes = [0]
+        self.handle = None
+        self.compressors = {}
+        weakref.finalize(self, _return_scratch_budget, self.cached_bytes)
+
+
+def _thread_resources():
+    resources = getattr(_TL, "resources", None)
+    if resources is None:
+        resources = _ThreadResources()
+        _TL.resources = resources
+    return resources
 
 
 def _bump(key: str, n: int = 1) -> None:
@@ -135,13 +161,33 @@ def _load_libdeflate():
                 continue
             try:
                 lib = ctypes.CDLL(p)
+                lib.libdeflate_alloc_decompressor.argtypes = []
                 lib.libdeflate_alloc_decompressor.restype = ctypes.c_void_p
                 lib.libdeflate_free_decompressor.argtypes = [ctypes.c_void_p]
+                lib.libdeflate_free_decompressor.restype = None
                 lib.libdeflate_zlib_decompress_ex.argtypes = [
                     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
                     ctypes.c_void_p, ctypes.c_size_t,
                     ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
                 lib.libdeflate_zlib_decompress_ex.restype = ctypes.c_int
+                # 必须在发布共享 CDLL 前声明签名。getattr 找得到符号不代表已配置；
+                # ctypes 默认 c_int 会截断 64 位句柄，缓存写入可能因此失败。
+                lib._image_search_compression_ready = False
+                try:
+                    lib.libdeflate_alloc_compressor.argtypes = [ctypes.c_int]
+                    lib.libdeflate_alloc_compressor.restype = ctypes.c_void_p
+                    lib.libdeflate_free_compressor.argtypes = [ctypes.c_void_p]
+                    lib.libdeflate_free_compressor.restype = None
+                    lib.libdeflate_zlib_compress_bound.argtypes = [
+                        ctypes.c_void_p, ctypes.c_size_t]
+                    lib.libdeflate_zlib_compress_bound.restype = ctypes.c_size_t
+                    lib.libdeflate_zlib_compress.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                        ctypes.c_void_p, ctypes.c_size_t]
+                    lib.libdeflate_zlib_compress.restype = ctypes.c_size_t
+                    lib._image_search_compression_ready = True
+                except AttributeError:
+                    pass                         # 仅解压 DLL 仍可用于解码
                 _LDF = (lib, p)
                 return _LDF
             except Exception as e:                 # noqa: BLE001
@@ -154,7 +200,8 @@ def _load_libdeflate():
 
 def _ensure_handle():
     """线程本地 (lib, 解压器句柄, ao 结构体)。"""
-    h = getattr(_TL, "handle", None)
+    resources = _thread_resources()
+    h = resources.handle
     if h is not None:
         return h
     pair = _load_libdeflate()
@@ -166,7 +213,8 @@ def _ensure_handle():
     if not handle:
         return None
     h = (lib, handle, ctypes.c_size_t())
-    _TL.handle = h
+    weakref.finalize(resources, lib.libdeflate_free_decompressor, handle)
+    resources.handle = h
     return h
 
 
@@ -297,7 +345,8 @@ def _scratch_acquire(need: int, slot: str = "scratch"):
     这里用全局预算把总量钳住：预算内复用（省反复分配的 12~14%），超预算的图用完即弃。
     """
     global _scratch_used
-    buf = getattr(_TL, slot, None)
+    resources = _thread_resources()
+    buf = resources.buffers.get(slot)
     if buf is not None and buf.size >= need:
         return buf
     old = buf.size if buf is not None else 0
@@ -307,11 +356,16 @@ def _scratch_acquire(need: int, slot: str = "scratch"):
             if _scratch_used - old + need <= _SCRATCH_TOTAL:
                 _scratch_used += need - old
                 keep = True
-    new = np.empty(need, dtype=np.uint8)
-    if keep:
-        setattr(_TL, slot, new)
-    elif old:                                      # 原来缓存的还在用，别丢
-        return buf if buf.size >= need else new
+    try:
+        new = np.empty(need, dtype=np.uint8)
+        if keep:
+            resources.buffers[slot] = new
+            resources.cached_bytes[0] += need - old
+    except BaseException:
+        if keep:
+            with _budget_lock:
+                _scratch_used -= need - old
+        raise
     return new
 
 
@@ -326,33 +380,25 @@ def ldf_compress(data: bytes, level: int = 6):
     实测（devtools/probe_cache_codec.py，256×256 缓存载荷）：level6 写侧与 PNG 打平、
     读侧 3.0~3.2×、体积仅 +8%；level1 写侧 1.7×、体积 +15%。
     """
-    global _LDF_COMP
     pair = _load_libdeflate()
     if not pair:
         return None
     lib = pair[0]
-    if getattr(lib, "libdeflate_zlib_compress", None) is None:
-        try:
-            import ctypes
-            lib.libdeflate_alloc_compressor.restype = ctypes.c_void_p
-            lib.libdeflate_alloc_compressor.argtypes = [ctypes.c_int]
-            lib.libdeflate_zlib_compress_bound.restype = ctypes.c_size_t
-            lib.libdeflate_zlib_compress_bound.argtypes = [ctypes.c_void_p,
-                                                           ctypes.c_size_t]
-            lib.libdeflate_zlib_compress.restype = ctypes.c_size_t
-            lib.libdeflate_zlib_compress.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
-                ctypes.c_void_p, ctypes.c_size_t]
-        except Exception:                          # noqa: BLE001
-            return None
+    if not lib._image_search_compression_ready:
+        return None
     try:
         import ctypes
-        comp = getattr(_TL, "comp", None)
+        level = int(level)
+        if not 0 <= level <= 12:
+            return None
+        resources = _thread_resources()
+        comp = resources.compressors.get(level)
         if comp is None:
-            comp = lib.libdeflate_alloc_compressor(int(level))
+            comp = lib.libdeflate_alloc_compressor(level)
             if not comp:
                 return None
-            _TL.comp = comp
+            weakref.finalize(resources, lib.libdeflate_free_compressor, comp)
+            resources.compressors[level] = comp
         n = len(data)
         bound = lib.libdeflate_zlib_compress_bound(ctypes.c_void_p(comp), n)
         buf = np.empty(bound, dtype=np.uint8)

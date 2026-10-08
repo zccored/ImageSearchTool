@@ -80,6 +80,9 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
                          "GPU 前向重叠）")
     sp.add_argument("--torch-threads", type=int, default=0,
                     help="torch 推理线程数（0=保持默认）")
+    sp.add_argument("--opencv-threads", type=int, default=None,
+                    help="OpenCV 内部线程数（0=保留外部设置；不传用 Config 默认）；"
+                         "进程首次任务前生效，修改需重启；外层解码仍并行")
     # ⚠️ 默认 None = **不覆盖** Config（见 _apply_feature_args）：
     # 各子命令的 argparse 默认值必须与 config.py 对齐，否则会出现
     # “build 写进 meta 的参数 ≠ stats/compact 读到的一致性基准” → 索引被拒绝打开。
@@ -138,6 +141,8 @@ def _apply_feature_args(cfg: Config, a: argparse.Namespace) -> None:
     cfg.workers = int(_val(a, "workers", cfg.workers))
     cfg.decode_workers = int(_val(a, "decode_workers", cfg.decode_workers))
     cfg.torch_threads = int(_val(a, "torch_threads", cfg.torch_threads))
+    if _val(a, "opencv_threads", None) is not None:
+        cfg.opencv_threads = int(a.opencv_threads)
     if _val(a, "png_decoder", None):         # CLI 显式指定时才覆盖 Config 默认
         cfg.png_decoder = a.png_decoder
     cfg.png_fast_scratch_mb = float(_val(a, "png_fast_scratch_mb",
@@ -279,8 +284,9 @@ def cmd_search(cfg: Config, a: argparse.Namespace) -> int:
         _print_outcome(out)
         _dump_json(out, a.json) if a.json else None
         return 0
-    tiles_prefix = os.path.abspath(_val(a, "tiles_prefix", "./gallery_tiles"))
-    cand = _val(a, "cand", "lsh")
+    from .tile_index import tiles_prefix_of
+    tiles_prefix = os.path.abspath(_val(a, "tiles_prefix") or tiles_prefix_of(a.prefix))
+    cand = "exact"  # 历史 --cand 名称兼容，生产瓦片入口统一全覆盖评分。
     if mode == "tiles":
         eng = HybridEngine(cfg)
         eng.open(tiles_prefix)
@@ -318,7 +324,7 @@ def _search_tiles_mode(eng, a: argparse.Namespace, tiles_prefix: str) -> Outcome
 
     return search_tiles_tiled(
         eng, a.query, top_k=a.top_k, coarse_k=a.coarse_k,
-        method=_val(a, "cand", "lsh"),
+        method=_val(a, "cand") or "exact",
         lsh_bits=int(_val(a, "lsh_bits", 12)),
         lsh_tables=int(_val(a, "lsh_tables", 8)))
 
@@ -584,23 +590,41 @@ def cmd_ingest(cfg: Config, a: argparse.Namespace) -> int:
         LOGGER.error("交接文件不存在: %s", req_path)
         return 2
 
+    # --modes 覆盖请求里的方案（缺省用 request.modes；老请求 = 整图+子图都做）
+    modes = getattr(a, "modes", None)
+    if modes:
+        modes = [m.strip() for m in str(modes).replace("，", ",").split(",")
+                 if m.strip()]
+
     def prog(done, total, phase):
         LOGGER.info("ingest %s：%d/%d", phase, done, total)
 
-    print(f"[ingest] 处理交接: {req_path}", flush=True)
-    result = process_request_file(req_path, progress=prog)
-    print(f"[ingest] ok={result.get('ok')} | 新增 {result.get('total_added', 0)} 张"
+    print(f"[ingest] 处理交接: {req_path}"
+          + (f"（命令行覆盖方案: {'+'.join(modes)}）" if modes else ""), flush=True)
+    result = process_request_file(req_path, progress=prog, modes=modes)
+    print(f"[ingest] ok={result.get('ok')}"
+          f" | 方案 {'+'.join(result.get('modes') or [])}"
+          f" | 整图新增 {result.get('total_added', 0)} 张"
+          f" | 子图新增 {result.get('total_tiles_added', 0)} 块"
           f" | 耗时 {result.get('total_secs', 0)}s | 前缀 {result.get('prefix')}",
           flush=True)
     for st in result.get("steps", []):
-        flag = "OK " if "error" not in st else "ERR"
         where = st.get("gallery_root") or st.get("root", "")
         locate = ("" if st.get("located")
                   else "（该根自身即图库位置）" if where == st.get("root")
                   else "")
-        print(f"    [{flag}] {st.get('root')}  +{st.get('added', 0)} 张 "
-              f"({st.get('secs', 0)}s) -> {where}{locate}"
-              + (f"  {st['error']}" if "error" in st else ""), flush=True)
+        print(f"    [根] {st.get('root')}  新增 {st.get('added', 0)} 张 / "
+              f"{st.get('tiles_added', 0)} 瓦片 ({st.get('secs', 0)}s)"
+              f" -> {where}{locate}", flush=True)
+        for sg in st.get("stages", []):
+            flag = "OK " if "error" not in sg else "ERR"
+            print(f"        [{flag}] {sg.get('label')}"
+                  f"（{sg.get('build_mode') or '-'}）"
+                  f" +{sg.get('added', 0)} ({sg.get('secs', 0)}s)"
+                  f" -> {sg.get('prefix')}"
+                  + (f"  {sg['error']}" if "error" in sg else ""), flush=True)
+        if "error" in st and not st.get("stages"):   # 兼容无 stages 的旧结果
+            print(f"        [ERR] {st.get('error')}", flush=True)
     for nt in result.get("notices", []):
         print(f"    [提示] {nt}", flush=True)
     if result.get("errors"):
@@ -681,13 +705,12 @@ def build_parser() -> argparse.ArgumentParser:
                     default="full",
                     help="full=整图索引；tiles=局部(瓦片)索引；hybrid=两者并搜"
                          "（按原图去重取最高分）")
-    sp.add_argument("--tiles-prefix", default="./gallery_tiles",
-                    help="瓦片索引前缀（--mode tiles/hybrid 时使用）")
-    sp.add_argument("--cand", choices=["lsh", "coarse"], default="lsh",
-                    help="tiles 候选获取：lsh=多表 LSH 近似(默认)；"
-                         "coarse=全库指纹线性扫描对照")
-    sp.add_argument("--lsh-bits", type=int, default=12, help="LSH 桶位数")
-    sp.add_argument("--lsh-tables", type=int, default=8, help="LSH 表数")
+    sp.add_argument("--tiles-prefix", default=None,
+                    help="瓦片索引前缀；缺省由 --prefix 推导同目录 gallery_tiles")
+    sp.add_argument("--cand", choices=["exact", "lsh", "coarse"], default=None,
+                    help="tiles 使用全库分块余弦；lsh/coarse 为兼容别名，不再截断候选")
+    sp.add_argument("--lsh-bits", type=int, default=12, help="旧参数兼容，不再影响瓦片召回")
+    sp.add_argument("--lsh-tables", type=int, default=8, help="旧参数兼容，不再影响瓦片召回")
     sp.set_defaults(func=cmd_search)
 
     # ---- eval
@@ -704,6 +727,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser(
         "ingest", help="处理 img_server 交接 request JSON，自动增量建库")
     sp.add_argument("request", help="交接文件路径（request_*.json / working_*.json）")
+    sp.add_argument("--modes", default=None,
+                    help="覆盖请求里的交接方案：full=整图 / tiles=子图，"
+                         "逗号分隔（如 full,tiles；缺省用 request.modes，"
+                         "老请求等于两个都做）")
     sp.set_defaults(func=cmd_ingest)
 
     # ---- bench
@@ -752,6 +779,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     cfg = Config()
     _apply_feature_args(cfg, args)
     try:
+        from .runtime import configure_opencv_threads
+        configure_opencv_threads(cfg.opencv_threads)
         return int(args.func(cfg, args))
     except KeyboardInterrupt:
         LOGGER.error("已中断")

@@ -1067,13 +1067,20 @@ class App:
         self._prog_phase = None
         ok = result.get("ok")
         added = result.get("total_added", 0)
+        tiles = result.get("total_tiles_added", 0)
         secs = result.get("total_secs", 0)
+        modes = result.get("modes") or []
         prefix = result.get("prefix", self.prefix)
         self.prefix = prefix
         roots = result.get("roots") or []
         if roots:            # 服务层定位到的图库根（可能由子目录上溯到宿主）
             self.dir_var.set(roots[0])
-        msg = (f"自动增量完成：新增 {added} 张，耗时 {secs}s -> {prefix}"
+        plan = "整图+子图" if set(modes) == {"full", "tiles"} else (
+            "仅整图" if modes == ["full"] else "仅子图" if modes == ["tiles"] else "")
+        detail = (f"新增 {added} 张" if "tiles" not in modes
+                  else f"新增 {added} 张 / {tiles} 瓦片")
+        head = f"自动增量完成（{plan}）" if plan else "自动增量完成"
+        msg = (f"{head}：{detail}，耗时 {secs}s -> {prefix}"
                if ok else "自动增量完成但存在错误（见日志/result 文件）")
         self._set_busy(False, msg)
         self._log("【自动交接】" + msg)
@@ -1352,11 +1359,19 @@ class App:
     def _peer_refresh_state(self):
         info = self.svc.peer_state()
         st, codes = info["state"], info["codes"]
-        self._svc_peer_main = info["main"]
+        self._svc_peer_main = info.get("target_path") or info["main"]
+        self._svc_peer_target = info.get("target")
+        self._svc_peer_label = info.get("target_label") or "全栈图库管理器"
         self._peer_ok = bool(st["ok"])
+        # 按钮文字跟着"这次到底会开哪个"走：有 main.py 就是全栈图库管理器，
+        # 只有端口画板时就是端口画板 —— 避免用户以为点了会开主程序。
+        try:
+            self.btn_peer_switch.configure(text=f"⇄ 切换启动：{self._svc_peer_label}")
+        except tk.TclError:
+            pass
         self._peer_apply_state()
         if self._peer_ok:
-            self.peer_state_var.set("切换目标就绪，可切换")
+            self.peer_state_var.set(f"切换目标就绪（{self._svc_peer_label}），可切换")
             self.peer_state_lbl.configure(foreground="#1a7f37")
         else:
             short = {codes["missing"]: "目标不存在（本包独立分发时禁用）",
@@ -1519,6 +1534,10 @@ class App:
                       0, 128,
                       tooltip="CPU前向线程数。多数机型1线程最快\n"
                               "(实测多线程反而慢)，GPU场景无需设置")
+        self._add_int(page_build, "OpenCV内部线程(0=保留外部设置)", "opencv_threads",
+                      Config().opencv_threads, 0, 128,
+                      tooltip="外层图片解码仍并行；进程首次任务(含扫描)前生效。\n"
+                              "使用后修改需重启，在首次操作前设置；0=由宿主管理。")
         self._add_text(page_build, "图片格式(逗号分隔)",
                        "extensions", "jpg,jpeg,png,bmp,tif,tiff,webp",
                        tooltip="扫描与建索引支持的扩展名，改完重新扫描生效")

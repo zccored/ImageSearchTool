@@ -219,6 +219,11 @@ PARAM_FIELDS: Tuple[Dict, ...] = (
      "cli": "--tile-flush-ms",
      "tip": "瓦片不足一批时的最长等待毫秒。\n小(如10)：批更碎(1-2行小批唤醒多)；"
             "大(如30)：批更整、唤醒更少"},
+    {"key": "opencv_threads", "label": "OpenCV内部线程(0=保留外部设置)", "kind": "int",
+     "page": "build", "group": "解码并发(建库吞吐调优)", "min": 0, "max": 128,
+     "cli": "--opencv-threads",
+     "tip": "只限制 OpenCV 内部并行，外层图片解码仍并行。进程级设置：首次任务(含扫描)前生效；"
+            "使用后修改需重启应用，并在首次操作前设置。0=由宿主管理，不恢复原值。"},
     {"key": "torch_threads", "label": "torch推理线程(0=默认)", "kind": "int",
      "page": "build", "group": "解码并发(建库吞吐调优)", "min": 0, "max": 128,
      "cli": "--torch-threads",
@@ -559,6 +564,9 @@ class SearchService:
         `err_prefix` 让错误文案与旧界面一致（如“扫描失败：…”）。
         """
         try:
+            # 扫描校验也会解码；必须在任何任务体进入 OpenCV 前固定策略。
+            from .runtime import configure_opencv_threads
+            configure_opencv_threads(self.cfg.opencv_threads)
             result = fn()
         except TaskCancelled as e:                           # noqa: BLE001
             self._emit(EVENT_TASK_ERROR, task_id, op=op, error=str(e),
@@ -611,6 +619,9 @@ class SearchService:
                 v = self.parse_extensions(v)
             else:
                 v = str(v)
+            if k == "opencv_threads":
+                from .runtime import check_opencv_threads
+                check_opencv_threads(v)
             setattr(self.cfg, k, v)
             applied[k] = _json_value(v)
         return applied
@@ -1171,7 +1182,7 @@ class SearchService:
                                   瓦片数=eng.coarse.size)
                         prof.mark("瓦片检索(切块聚合+精排)")
                     out = TI.search_tiles_tiled(eng, query, top_k=top_k,
-                                                coarse_k=coarse_k, method="lsh")
+                                                coarse_k=coarse_k)
                 elif mode == "hybrid":
                     # 两路各取 HYBRID_TOP_K 再合并（同一原图去重取高分）
                     tp = TI.tiles_prefix_of(prefix)
@@ -1191,7 +1202,7 @@ class SearchService:
                     if prof:
                         prof.mark("瓦片检索")
                     o_t = TI.search_tiles_tiled(eng_t, query, top_k=HYBRID_TOP_K,
-                                                coarse_k=coarse_k, method="lsh")
+                                                coarse_k=coarse_k)
                     out = TI.merge_hybrid(o_full, o_t, query, top_k=HYBRID_TOP_K)
                 else:
                     raise ValueError(f"未知检索模式：{mode}"
@@ -1323,9 +1334,18 @@ class SearchService:
                             "（子目录自身无索引，增量并入上级图库索引）",
                             roots[0], loc0["root"])
             LOGGER.info("    索引前缀 : %s", prefix)
+            LOGGER.info("    交接方案 : %s（顺序执行）",
+                        H.mode_labels(req.get("modes")))
             LOGGER.info("开始校验并增量建库（路径+MD5 去重，重复内容自动跳过）…")
             self._progress(task_id, 0, 1, PHASE_FUSED)
-            cb = self._progress_cb(task_id, None, default_phase=PHASE_FUSED)
+
+            def cb(done, total, phase=None):
+                # 交接可能是「整图 + 子图」两段：阶段名随 handoff 层透传
+                # （它已把 save/done 边界归一成阶段名），缺省按整图段显示。
+                self._progress(task_id, done, total,
+                               phase if phase in (PHASE_FUSED, PHASE_TILES)
+                               else PHASE_FUSED)
+
             result = dict(H.process_request_file(p, progress=cb))
             result["roots"] = roots          # 界面据此更新“图库目录”输入框
             return result
@@ -1370,9 +1390,18 @@ class SearchService:
 
     @staticmethod
     def peer_state() -> Dict:
-        """“切换启动”目标状态（peer_launcher.check()：存在性 + 哈希白名单）。"""
+        """“切换启动”目标状态（peer_launcher.check()：目标优先级 + main.py 哈希白名单）。
+
+        目标优先级（有 main.py 就只用 main.py，否则用端口画板）由 peer_launcher 决定，
+        这里原样透传给界面，界面据此改按钮文字。
+        """
         import peer_launcher as PL
-        return {"state": PL.check(), "main": PL.PEER_MAIN, "name": PL.PEER_NAME,
+        st = PL.check()
+        return {"state": st, "main": PL.PEER_MAIN, "name": PL.PEER_NAME,
+                "target": st.get("target"),
+                "target_path": st.get("target_path"),
+                "target_how": st.get("target_how"),
+                "target_label": PL.target_label(st.get("target")),
                 "codes": {"ok": PL.ST_OK, "missing": PL.ST_MISSING,
                           "unregistered": PL.ST_UNREGISTERED,
                           "mismatch": PL.ST_MISMATCH}}

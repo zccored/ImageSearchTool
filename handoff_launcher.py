@@ -89,13 +89,16 @@ def main() -> int:
         return 2
 
     req_id = req.get("request_id", "unknown")
+    # result 一律写回 request 所在目录（= img_server 的 handoff\），否则会落到
+    # 本程序默认目录 image-search\handoff 里，img_server 侧永远看不到这条失败记录。
+    req_dir = os.path.dirname(os.path.abspath(a.request))
     print(f"[launcher] 等待 img_server 退出（≤{a.wait:.0f}s）…", flush=True)
     if not wait_processes_exit(req, a.wait):
-        H.write_result(req_id, {
+        fp_to = H.write_result(req_id, {
             "request_id": req_id, "ok": False,
             "fatal_error": "等待 img_server 退出超时，已放弃自动流程（未强制结束）",
-        })
-        print("[launcher] 超时放弃", flush=True)
+        }, handoff_dir=req_dir)
+        print(f"[launcher] 超时放弃（错误 result 已写 {fp_to}）", flush=True)
         return 1
 
     mode = req.get("open_mode", "gui")
@@ -104,12 +107,13 @@ def main() -> int:
         req_path = os.path.abspath(a.request)
         result = H.process_request_file(req_path)
         print(f"[launcher] ingest ok={result.get('ok')} "
-              f"新增 {result.get('total_added', 0)} 张", flush=True)
+              f"方案 {'+'.join(result.get('modes') or [])} "
+              f"新增 {result.get('total_added', 0)} 张 / "
+              f"{result.get('total_tiles_added', 0)} 瓦片", flush=True)
         return 0 if result.get("ok") else 1
 
     # gui 模式：转 working 后交给 gui.py --auto-handoff
-    d = os.path.dirname(os.path.abspath(a.request))
-    working = H.mark_working(os.path.abspath(a.request), d)
+    working = H.mark_working(os.path.abspath(a.request), req_dir)
     gui = os.path.join(BASE, "gui.py")
     print(f"[launcher] 启动图库检索管理器（自动增量）：{gui}", flush=True)
     subprocess.Popen([sys.executable, "-X", "utf8", gui,

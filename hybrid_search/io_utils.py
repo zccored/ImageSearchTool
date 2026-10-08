@@ -13,9 +13,8 @@
 通用 IO / 图像解码 / 日志工具。
 
 解码策略（兼顾速度、内存与“安静”）：
-  * PNG 一律走 Pillow —— OpenCV 内嵌 libpng 会对真实世界 PNG 的
-    iCCP/cHRM/巨型 chunk 刷 stderr 警告（用户图库里大量出现），
-    而 Pillow 自带 PNG 解码器无此噪音，且支持巨型长图；
+  * PNG 按配置走 libdeflate/cv2/imagecodecs，Pillow 兜底；普通 PNG 的
+    文件头探测跳过像素解码，带方向元数据的文件保留 Pillow 的 EXIF 语义；
   * 其余格式（JPEG/WebP/TIFF/BMP…）走 OpenCV 快速路径（EXIF 检测后回退 Pillow）；
   * 超大图保护：超过 MAX_IMAGE_PIXELS 的图直接跳过不解码；
     较大图（>12M 像素）的解码由全局信号量限制并发，防内存峰值爆掉；
@@ -342,16 +341,47 @@ def read_bytes(path: str) -> Optional[bytes]:
         return None
 
 
+def _png_needs_exif_load(data: bytes) -> bool:
+    """只遍历 chunk 边界；可能含方向信息/结构异常时保留 Pillow 的完整探测。
+
+    PNG 的 eXIf、XMP 和 raw EXIF profile 可以位于 IDAT 后，不能只查文件头。
+    不解压 IDAT 或文本，不截取整个载荷；普通文本不会携带 getexif 使用的方向。
+    """
+    pos = 8
+    size = len(data)
+    while pos + 12 <= size:
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        end = pos + 8 + length
+        if end + 4 > size:
+            return True
+        if kind in (b"eXIf", b"acTL", b"fcTL", b"fdAT"):
+            return True
+        if kind in (b"tEXt", b"zTXt", b"iTXt"):
+            sep = data.find(b"\x00", pos + 8, min(end, pos + 88))
+            if sep < 0 or data[pos + 8:sep] in (
+                    b"XML:com.adobe.xmp", b"Raw profile type exif"):
+                return True
+        if kind == b"IEND":
+            return length != 0
+        pos = end + 4
+    return True
+
+
 def _probe(data: bytes) -> Optional[Tuple[str, Tuple[int, int], int]]:
     """
     只读文件头：返回 (PIL格式名, (宽, 高), EXIF方向1..8)。
-    失败返回 None。该步骤不会触发像素解码，因此没有任何解码噪音。
+    普通 PNG 不触发像素解码；含方向元数据/异常结构的 PNG 保留 Pillow 探测。
+    失败返回 None。
     """
     try:
         with Image.open(io.BytesIO(data)) as im:
             orient = 1
             try:
-                orient = int(im.getexif().get(0x0112, 1))
+                # Pillow PNG getexif() 在未发现 EXIF 时调用 load()，原先每张
+                # 普通 PNG 都在真正的解码器前被额外解码一次（且未经过并发门）。
+                if im.format != "PNG" or _png_needs_exif_load(data):
+                    orient = int(im.getexif().get(0x0112, 1))
             except Exception:  # noqa: BLE001 —— 无/坏 EXIF 视为方向 1
                 orient = 1
             return im.format, (im.width, im.height), orient

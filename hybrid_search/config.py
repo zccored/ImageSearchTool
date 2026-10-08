@@ -144,6 +144,10 @@ class Config:
     # torch 推理线程数（0=保持 torch 默认；CPU 单线程前向通常最优，
     # GPU 场景该值无影响，由 CUDA 流自动调度）
     torch_threads: int = 0
+    # OpenCV 内部并行：外层仍按 decode_workers 并发。首次任务/引擎初始化生效；
+    # 0=不接管外部设置，修改需重启。opencv_threads=1：4320 张瓦片建库
+    # 墙钟 -11.79%、CPU 核秒 -37.89%，本机实测见 docs/perf-plan.md 第十节。
+    opencv_threads: int = 1
     # 支持的图片扩展名
     extensions: tuple = field(default_factory=lambda: DEFAULT_EXTENSIONS)
 

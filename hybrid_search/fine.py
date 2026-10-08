@@ -282,6 +282,17 @@ class ResNetExtractor:
             transforms.CenterCrop(224),
             transforms.ToTensor(),
         ] + _tail)
+        # 子图流水线以 uint8 交接：省去逐块 float 扩容/除法及 3/4 的 H2D 字节。
+        # 常规 transform 保留，整图预处理缓存仍使用原来的 float 张量协议。
+        self.tile_transform = self.transform
+        self._tile_scale_lut = None
+        if self.norm_on_gpu:
+            self.tile_transform = transforms.Compose(
+                self.transform.transforms[:2] + [transforms.PILToTensor()])
+            # CUDA 的 x/255 与 CPU ToTensor 的舍入不完全一致；256 项查表精确保留
+            # CPU 结果，之后仍走原有 GPU float32 归一化。实测见 perf-plan 第十节。
+            self._tile_scale_lut = torch.arange(
+                256, dtype=torch.float32, device="cpu").div_(255).to(self.device)
 
     def prep(self, rgb: np.ndarray):
         """numpy RGB -> ResNet 输入张量。
@@ -296,14 +307,18 @@ class ResNetExtractor:
     def _forward(self, tensors) -> Optional[np.ndarray]:
         """一组 CPU 张量 -> 归一化前特征矩阵（单次前向，autocast 可选）。
 
-        norm_on_gpu 模式：张量是"未归一化"的 uint8/255 浮点（transform 不含
-        Normalize），在这里以 float32 做 (x-mean)/std —— 放在 autocast 之外，
-        保证与 CPU 归一化数值一致；随后 H2D 与卷积才走 fp16。
+        norm_on_gpu 模式接受普通 transform 的 [0,1] 浮点张量，或子图的 uint8
+        张量；后者以 uint8 传到 GPU，再查表恢复 CPU ToTensor 的准确浮点值。
+        (x-mean)/std 以 float32 在 autocast 外执行，模型前向才按配置使用 fp16。
         """
         import torch
         try:
             with torch.no_grad():
                 batch_t = torch.stack(tensors, dim=0).to(self.device)
+                if batch_t.dtype == torch.uint8:
+                    if self._tile_scale_lut is None:
+                        raise ValueError("uint8 瓦片输入需要 CUDA 归一化路径")
+                    batch_t = self._tile_scale_lut[batch_t.long()]
                 if self.norm_on_gpu:
                     # float32 精确归一化（不进入 autocast，避免 fp16 舍入漂移）
                     batch_t = batch_t.sub(self._mean_t).div_(self._std_t)

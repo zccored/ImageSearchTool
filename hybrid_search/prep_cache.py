@@ -89,6 +89,7 @@ class PrepCache:
                            _CODEC if _CODEC_OK[0] else "png1")
         self._mem_bytes = int(mem_bytes)
         self._mem: "OrderedDict[str, tuple]" = OrderedDict()
+        self._mem_sizes: dict[str, int] = {}
         self._mem_used = 0
         self._lock = threading.Lock()
         self.hits = 0
@@ -255,12 +256,14 @@ class PrepCache:
 
         size = 602 * 1024 if "torch" in sys.modules else 0
         with self._lock:
+            previous_size = self._mem_sizes.get(key, 0)
             self._mem[key] = item
             self._mem.move_to_end(key)
-            self._mem_used += size
-            while self._mem_used > self._mem_bytes and len(self._mem) > 1:
+            self._mem_sizes[key] = size
+            self._mem_used += size - previous_size
+            while self._mem_used > self._mem_bytes and self._mem:
                 _k, _v = self._mem.popitem(last=False)
-                self._mem_used -= size
+                self._mem_used -= self._mem_sizes.pop(_k)
 
     # ---- 统计/维护 ---------------------------------------------------
     def stats(self) -> dict:
@@ -293,5 +296,6 @@ class PrepCache:
                     pass
         with self._lock:
             self._mem.clear()
+            self._mem_sizes.clear()
             self._mem_used = 0
         return n

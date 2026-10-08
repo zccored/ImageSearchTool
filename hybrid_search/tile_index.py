@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # ---------------------------------------------------------------------------
-# ImageSearchTool · 图库检索管理器 — 瓦片(局部)索引：512px+25% 切块建库、LSH 候选、切块聚合检索与命中框回传
+# ImageSearchTool · 图库检索管理器 — 瓦片(局部)索引：切块建库、全覆盖分块评分与命中框回传
 # Copyright (C) 2026 zccored
 #
 # 本程序是自由软件：你可以再发布和/或修改它，但必须遵守 GNU Affero 通用公共
@@ -17,20 +17,13 @@
   gallery        —— 整图索引（每图 1 条，原流程不变）
   gallery_tiles  —— 瓦片索引（本模块）
 每条瓦片 = 一个条目：粗筛指纹(hu+fp) + ResNet 特征 + 原图路径 + 原图像素框 box。
-小图（较短边 < min_side）不切，1 条整图框入库 —— 保证任意尺寸查询都有覆盖。
+小图（长边 < min_side）不切，1 条整图框入库。
 
-检索管线（三级漏斗，供局部/混合模式）：
-  1) LSH 近似候选   —— 对瓦片 ResNet 特征做多表随机投影（SRP 式 LSH），
-                       亚秒内取“近似最近邻”候选瓦片行（概率性召回，不保证全）；
-  2) hash 特征查验 —— 对候选瓦片做二值指纹 Hamming 复核（64×64 打包指纹），
-                       是“近似概率”内容查验：把 LSH 漏召/误召按内容哈希校准，
-                       过滤后按原图聚合取组内最优瓦片；
-  3) 整图切片收敛   —— 候选原图的全部瓦片特征切片与查询特征做精确余弦
-                       （GPU matmul，CPU 回退），组内 max 得原图分 + 最优框。
-性能画像（建库：解码每图一次，瓦片在解码图上复用；检索：LSH+复核为 CPU，
-收敛精排为 GPU/CPU 矩阵运算）由 perfscope 局部索引档位量化。
-
-注：LSH 是近似检索，召回以“概率”计；第 2/3 级保证最终排名的准确度。
+检索：查询按索引协议切块，全部已存瓦片×全部查询块分块精确余弦，
+按原图取最大分及命中框。原 LSH 桶截断及指纹硬过滤会丢失真实裁切图，
+后续组内精排无法挽回漏掉的原图，因此生产入口不再使用该漏斗。
+全覆盖保证的是已有特征的 max 排名，并非任意裁切/变换都能语义命中。
+LSH 工具仅保留供历史对照审计，不参与 CLI/服务层正常检索。
 """
 from __future__ import annotations
 
@@ -55,7 +48,7 @@ from .store import IndexFiles, meta_of
 # ---------------------------------------------------------------------------
 TILE_DEFAULT = 512          # 瓦片边长（px，处理图空间）
 OVERLAP_DEFAULT = 0.25      # 相邻瓦片重叠比例
-MIN_SIDE_DEFAULT = 768      # 较短边低于该值的图不切（整图 1 块入库）
+MIN_SIDE_DEFAULT = 768      # 长边低于该值的图不切（整图 1 块入库）
 PRE_MAX_SIDE = 2048         # 解码后先统一缩放到 ≤2048 长边再做瓦片（超大图）
 TILES_META_KEY = "tiles"    # meta.json 顶层键：{"tile","overlap","min_side",
 #                             "pre_max","kind":"tile"} 存在即瓦片索引
@@ -90,7 +83,7 @@ def tiles_of_rgb(rgb: np.ndarray, tile: int, overlap: float,
                  min_side: int, pre_max: int) -> Tuple[np.ndarray, List[tuple], float]:
     """
     解码图 -> (处理图(≤pre_max 长边), 瓦片框列表(原图像素空间), 缩放比)。
-    较短边 < min_side 的图只返回整图单块；坐标始终为原图像素。
+    长边 < min_side 的图只返回整图单块；坐标始终为原图像素。
     """
     h, w = rgb.shape[:2]
     if max(w, h) < min_side:
@@ -337,6 +330,7 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
     files = IndexFiles(prefix)
     old_n = engine.coarse.size
     ex = engine._get_extractor()
+    tile_transform = getattr(ex, "tile_transform", ex.transform)
     workers = max(1, ex.decode_workers)
     n = len(todo)
     if n == 0:
@@ -410,37 +404,38 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
                             nb = 0
                         trace.on_file(t_a, t_b, len(crops), nb, path)
                     with lock:
-                        n_img_done += 1
-                        n_img_active -= 1
                         n_tile_inflight += len(crops)
                     for rgb_crop, box, data, first in crops:
                         task_q.put(("tile", path, rgb_crop, box, data, first))
-                    if progress:
-                        try:
-                            progress(n_img_done, n)
-                        except Exception:          # noqa: BLE001
-                            pass
-                    feed_next()
-                    maybe_send_end()
                 else:
                     path, rgb_crop, box, base, first = (item[1], item[2],
                                                         item[3], item[4],
                                                         item[5])
                     out = _feature_one_tile(path, rgb_crop, box, base, first,
-                                            engine.cfg, ex.transform,
+                                            engine.cfg, tile_transform,
                                             frame_sink)
-                    with lock:
-                        n_tile_inflight -= 1
                     if out is not None:
                         ready_q.put((path, [out]))
-                    maybe_send_end()
             except Exception as e:                  # noqa: BLE001 —— 单项失败不中断
                 LOGGER.debug("瓦片任务异常 %s: %r", item, e)
-                if kind == "tile":
+            finally:
+                if kind == "img":
+                    # 成功、重复和异常都结束该原图任务，否则名额泄漏会永远等不到 done。
+                    with lock:
+                        n_img_done += 1
+                        n_img_active -= 1
+                        done = n_img_done
+                    if progress:
+                        try:
+                            progress(done, n)
+                        except Exception:          # noqa: BLE001
+                            pass
+                    feed_next()
+                elif kind == "tile":
+                    # 必须先把结果入队再计为完成，防止超时守护/其他 worker 提前结束。
                     with lock:
                         n_tile_inflight -= 1
-                    maybe_send_end()
-            finally:
+                maybe_send_end()
                 task_q.task_done()
 
     threads = [threading.Thread(target=worker, daemon=True)
@@ -467,19 +462,20 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
             return
         paths, tensors, recs = acc_paths, acc_ts, acc_recs
         acc_paths, acc_ts, acc_recs = [], [], []
-        acc_t0 = time.monotonic()
         try:
-            accepted = engine.coarse.add_results(paths, recs)
-            keep = [i for i, a in enumerate(accepted) if a]
-            if keep:
-                sub_paths = [paths[i] for i in keep]
-                sub_ts = [tensors[i] for i in keep]
-                tb0 = time.monotonic()
-                feats = ex._forward(sub_ts)     # noqa: SLF001 同项目协作
-                tb1 = time.monotonic()
-                if trace is not None:
-                    trace.on_batch(tb0, tb1, len(sub_ts))
-                if feats is not None:
+            with engine.coarse.append_transaction():
+                accepted = engine.coarse.add_results(paths, recs)
+                keep = [i for i, a in enumerate(accepted) if a]
+                if keep:
+                    sub_paths = [paths[i] for i in keep]
+                    sub_ts = [tensors[i] for i in keep]
+                    tb0 = time.monotonic()
+                    feats = ex._forward(sub_ts)     # noqa: SLF001 同项目协作
+                    tb1 = time.monotonic()
+                    if trace is not None:
+                        trace.on_batch(tb0, tb1, len(sub_ts))
+                    if feats is None or feats.ndim != 2 or len(feats) != len(keep):
+                        raise RuntimeError("瓦片精排返回空结果或特征行数不匹配")
                     rows = feats.astype(np.float32)
                     norms = np.linalg.norm(rows, axis=1, keepdims=True)
                     norms[norms < 1e-8] = 1.0
@@ -488,6 +484,10 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
                     all_ok.extend(sub_paths)
         except Exception as e:                   # noqa: BLE001 —— 单批失败跳过
             LOGGER.warning("瓦片批次处理失败（%d 块）已跳过: %r", len(paths), e)
+        finally:
+            # 下一批的收集计时从本批处理结束开始，不能把 GPU 耗时计入等待。
+            # 否则前向超过 TICK 后，下一个结果会立刻被发送为单行小批。
+            acc_t0 = time.monotonic()
 
     while not ended:
         try:
@@ -729,7 +729,7 @@ def _bucketize(keys: np.ndarray, cap: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 检索：LSH 候选 -> hash 复核 -> 原图聚合 -> 整图切片精排
+# 检索：全覆盖分块余弦 -> 原图聚合 -> Top-K + 命中框
 # ---------------------------------------------------------------------------
 def group_origins(paths: List[str]) -> Tuple[np.ndarray, dict]:
     """把瓦片行按“原图(origin)”分组 —— 兼容任意完成顺序（两级流水下
@@ -762,336 +762,188 @@ def _matmul_scores(rows: np.ndarray, q: np.ndarray, gpu: bool) -> np.ndarray:
     return np.asarray(rows, dtype=np.float32) @ q.astype(np.float32)
 
 
+def _exact_tile_scores(feats: np.ndarray, queries: np.ndarray,
+                       gpu: bool) -> np.ndarray:
+    """全覆盖余弦 max；按库行和查询块双向分块，不复制整库或常驻 GPU。
+
+    4096×D 行块、至多 32 个查询列是内部临时内存边界，不是召回预算。
+    对 FP16/FP32 索引均在副本上归一化，绝不修改 mmap 原索引。
+    """
+    q = np.array(queries, dtype=np.float32, copy=True)
+    if q.ndim == 1:
+        q = q.reshape(1, -1)
+    if (feats.ndim != 2 or q.ndim != 2 or not len(q)
+            or q.shape[1] != feats.shape[1]):
+        raise RuntimeError("瓦片精排特征维度不一致，请检查索引与模型")
+    norms = np.linalg.norm(q, axis=1, keepdims=True)
+    if not np.isfinite(q).all() or not np.isfinite(norms).all() or np.any(norms < 1e-8):
+        raise RuntimeError("查询图精排特征无效，无法完成瓦片检索")
+    q /= norms
+    scores = np.empty(len(feats), dtype=np.float32)
+    for begin in range(0, len(feats), 4096):
+        rows = np.array(feats[begin:begin + 4096], dtype=np.float32, copy=True)
+        rn = np.linalg.norm(rows, axis=1, keepdims=True)
+        if not np.isfinite(rows).all() or not np.isfinite(rn).all():
+            raise RuntimeError("瓦片精排索引含无效数值，请重建瓦片索引")
+        rows /= np.maximum(rn, 1e-8)
+        best = np.full(len(rows), -np.inf, dtype=np.float32)
+        for qb in range(0, len(q), 32):
+            block = _matmul_scores(rows, np.ascontiguousarray(q[qb:qb + 32].T), gpu)
+            if not np.isfinite(block).all():
+                raise RuntimeError("瓦片余弦评分产生无效数值")
+            np.maximum(best, block.max(axis=1), out=best)
+        scores[begin:begin + len(rows)] = best
+    return scores
+
+
+def _tile_outcome(engine, q_path: str, scores: np.ndarray, top_k: int,
+                  times: dict, started: float, coarse_only: bool = False) -> Outcome:
+    """按原图 max 选框；先去重/排除自身，再填满 Top-K，不截断候选原图。"""
+    coarse = engine.coarse
+    if len(scores) != coarse.size or not np.isfinite(scores).all():
+        raise RuntimeError("瓦片评分与路径行数不一致或含无效值")
+    out = Outcome(query=q_path, db_size=coarse.size, method="tiles",
+                  coarse_only=coarse_only)
+    q_abs = os.path.normcase(os.path.abspath(q_path))
+    seen = set()
+    has_box = coarse.has_boxes()
+    for row in np.argsort(-scores, kind="stable"):
+        origin = coarse.paths[int(row)]
+        key = os.path.normcase(os.path.abspath(origin))
+        if key in seen:
+            continue
+        seen.add(key)
+        if engine.cfg.exclude_self and key == q_abs:
+            out.self_excluded = True
+            continue
+        sc = float(scores[row])
+        out.hits.append(Hit(rank=len(out.hits) + 1, path=origin,
+                            fine_score=float("nan") if coarse_only else sc,
+                            coarse_score=sc, d_hu=float("nan"), d_fp=float("nan"),
+                            box=coarse.box_at(int(row)) if has_box else None,
+                            match_kind="tile"))
+        if len(out.hits) >= top_k:
+            break
+    out.coarse_kept = coarse.size
+    times["total"] = time.time() - started
+    out.times = times
+    return out
+
+
+def _check_tile_search(method: str, top_k: int, coarse_k: int) -> None:
+    # 旧 CLI/API 名称保留可调用性，但不能再启用会按入库顺序漏图的旧漏斗。
+    if method not in ("exact", "lsh", "coarse"):
+        raise ValueError(f"未知瓦片候选方式：{method}")
+    if top_k < 1 or coarse_k < 1:
+        raise ValueError("top_k 和 coarse_k 必须大于 0")
+    if method != "exact":
+        LOGGER.debug("瓦片候选方式 %s 为兼容别名，使用分块全覆盖评分", method)
+
+
 def search_tiles(engine, q_path: str, top_k: int = 10,
-                 coarse_k: int = 300, method: str = "lsh",
+                 coarse_k: int = 300, method: str = "exact",
                  lsh_bits: int = 12, lsh_tables: int = 8,
                  recheck_hits: int = 900, gpu: bool = True) -> Outcome:
+    """单查询块全库评分，原图按最佳瓦片返回；已有索引无需重建。
+
+    lsh/coarse 及其预算参数仅保留旧调用兼容，不再影响精排召回范围。
+    不以指纹阈值否定裁切内容；无 fine 时明确标记为全库指纹回退。
     """
-    局部（瓦片）索引检索。method：
-      lsh    —— LSH 近似候选 + 指纹 hash 复核（默认，亚秒级候选）
-      coarse —— 全库指纹线性扫描做候选（对照基线，不建 LSH 表）
-    三级：候选 -> 指纹复核 -> 原图组 max -> 组内整瓦片切片精确余弦 -> Top-K。
-    """
-    t_all = time.time()
+    _check_tile_search(method, top_k, coarse_k)
+    started = time.time()
     times: dict = {}
-    coarse = engine.coarse
-    paths = coarse.paths
-    n = coarse.size
+    n = engine.coarse.size
+    if n == 0:
+        return Outcome(query=q_path, db_size=0, method="tiles",
+                       times={"total": time.time() - started})
     feats = engine._fine_feats
-    has_box = coarse.has_boxes()          # 框按需解析（可能是 mmap 数组）.boxes
-    out = Outcome(query=q_path, db_size=n, method="tiles")
-
-    # ---- 查询特征：指纹（hash 查验用）+ ResNet（精排用）---------------
     t0 = time.time()
-    q_rec = coarse.query_record(q_path)
-    times["查询图指纹"] = time.time() - t0
-
-    q_abs = os.path.normcase(os.path.abspath(q_path))
-
-    # ---- 1) 候选 ------------------------------------------------------
+    if feats is None:
+        from .coarse import _hamming_distance
+        coarse = engine.coarse
+        rec = coarse.query_record(q_path)
+        if coarse.fp is None or rec.fp is None:
+            raise RuntimeError("瓦片索引既无精排特征也无指纹，请重建索引")
+        scores = np.empty(n, dtype=np.float32)
+        for begin in range(0, n, 4096):
+            xor = np.bitwise_xor(coarse.fp[begin:begin + 4096], rec.fp)
+            scores[begin:begin + len(xor)] = 1.0 - _hamming_distance(xor) / float(coarse.n_bytes * 8)
+        times["全库指纹回退"] = time.time() - t0
+        return _tile_outcome(engine, q_path, scores, top_k, times, started, True)
+    if len(feats) != n:
+        raise RuntimeError("瓦片精排特征与路径行数不一致，请重建瓦片索引")
+    q = _query_fine_feat(engine, q_path, times)  # 每次查询只提取一次
+    if q is None:
+        raise RuntimeError(f"查询图精排特征提取失败：{q_path}")
+    gpu_ok = gpu and getattr(engine._get_extractor(), "device", "") == "cuda"
     t0 = time.time()
-    cand_rows: np.ndarray
-    if method == "lsh":
-        if feats is None:
-            raise RuntimeError("LSH 检索需要瓦片精排索引（fine），请先建全库特征")
-        lsh = _lsh_for(engine, feats, lsh_bits, lsh_tables)
-        cand_rows = lsh.query(q=_query_fine_feat(engine, q_path, times),
-                              top_override=coarse_k * 40)
-    else:
-        cand_rows = np.arange(n, dtype=np.int64)
-    times["LSH/候选获取"] = time.time() - t0
-
-    if cand_rows.size == 0:
-        LOGGER.warning("LSH 无候选（查询与库差异过大）")
-        out.times = {"total": time.time() - t_all}
-        return out
-
-    # ---- 查询特征（指纹 + ResNet）:ResNet 全程只提取一次 ---------------
-    q_cache: dict = {"v": None}
-
-    def get_q():
-        if q_cache["v"] is None:
-            q_cache["v"] = _query_fine_feat(engine, q_path, times)
-        return q_cache["v"]
-
-    # ---- 2) hash 内容查验（近似概率）：过滤明确无关瓦片 -----------------
-    t0 = time.time()
-    from .coarse import _hamming_distance   # noqa: PLC0415 同包复用
-    cand_fp = coarse.fp[cand_rows] if coarse.fp is not None else None
-    if cand_fp is not None and q_rec.fp is not None:
-        xor = np.bitwise_xor(cand_fp, np.asarray(q_rec.fp, dtype=np.uint8))
-        d = _hamming_distance(xor) / float(coarse.n_bytes * 8)
-    else:
-        d = np.zeros(len(cand_rows), dtype=np.float64)
-    keep = d < 0.62                       # 宽松内容过滤（JPEG 重压缩噪声下
-    # 同源瓦片指纹差仍可能 ~0.3-0.5；0.62 只剔除明确不相关内容）
-    cand_rows = cand_rows[keep]
-    cand_d = d[keep]
-    times["hash查验(指纹过滤)"] = time.time() - t0
-    if cand_rows.size == 0:
-        out.times = {"total": time.time() - t_all}
-        return out
-
-    # ---- 3) 原图粗排聚合：候选瓦片精确余弦 -> 组内 max -> coarse_k origins
-    t0 = time.time()
-    o_list: List[Tuple[str, Tuple[float, int]]] = []
-    q_feat = get_q()
-    if q_feat is not None:
-        sub = np.asarray(feats[cand_rows], dtype=np.float32)
-        sub_norm = np.linalg.norm(sub, axis=1, keepdims=True)
-        sub_norm[sub_norm < 1e-8] = 1.0
-        sub = sub / sub_norm
-        gpu_ok = gpu and getattr(engine._get_extractor(), "device", "") == "cuda"
-        cos = _matmul_scores(sub, q_feat, gpu_ok)
-        order = np.argsort(cos, kind="stable")[::-1]
-        seen: set = set()
-        agg: Dict[str, Tuple[float, int]] = {}
-        for pos in order:
-            row = int(cand_rows[pos])
-            origin = paths[row]
-            if origin in seen:
-                continue
-            seen.add(origin)
-            agg[origin] = (float(cos[pos]), row)
-            if len(agg) >= coarse_k:
-                break
-        o_list = sorted(agg.items(), key=lambda kv: kv[1][0], reverse=True)
-    else:
-        # 无精排特征：退回指纹复核分聚合
-        agg2: Dict[str, Tuple[float, int]] = {}
-        order2 = np.argsort(cand_d, kind="stable")
-        for pos in order2:
-            row = int(cand_rows[pos])
-            origin = paths[row]
-            score = 1.0 - float(cand_d[pos])
-            if origin not in agg2 or score > agg2[origin][0]:
-                agg2[origin] = (score, row)
-            if len(agg2) >= coarse_k:
-                break
-        o_list = sorted(agg2.items(), key=lambda kv: kv[1][0], reverse=True)
-    o_list = o_list[:coarse_k]
-    times["原图粗排(瓦片余弦组max)"] = time.time() - t0
-    if not o_list:
-        out.times = {"total": time.time() - t_all}
-        return out
-
-    # ---- 4) 整图切片收敛：候选原图的全部瓦片特征切片精确余弦 ------------
-    t0 = time.time()
-    _orig_names, rows_of = group_origins(paths)
-    o_rows = [(o, rows_of[str(o)]) for o, _score in o_list]
-    sel_rows = np.concatenate([g for _o, g in o_rows]).astype(np.int64)
-
-    if feats is not None:
-        q = q_feat if q_feat is not None else get_q()
-        if q is None:
-            out.coarse_only = True
-        else:
-            sub = np.asarray(feats[sel_rows], dtype=np.float32)
-            sub_norm = np.linalg.norm(sub, axis=1, keepdims=True)
-            sub_norm[sub_norm < 1e-8] = 1.0
-            sub = sub / sub_norm
-            gpu_ok = gpu and getattr(engine._get_extractor(), "device", "") == "cuda"
-            scores = _matmul_scores(sub, q, gpu_ok)
-            times["收敛精排(整图切片×q)"] = time.time() - t0
-            # 组内 max -> (原图分, 最优瓦片行)
-            best: Dict[int, Tuple[float, int]] = {}
-            k = 0
-            for oi, (_o, g) in enumerate(o_rows):
-                cnt = len(g)
-                seg = scores[k:k + cnt]
-                if seg.size:
-                    bi = int(np.argmax(seg))
-                    best[oi] = (float(seg[bi]), int(sel_rows[k + bi]))
-                k += cnt
-            order2 = sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)
-            for rank, (oi, (sc, row)) in enumerate(order2[:top_k], 1):
-                origin = o_list[oi][0]
-                box = coarse.box_at(int(row)) if has_box else None
-                if engine.cfg.exclude_self and \
-                        os.path.normcase(os.path.abspath(origin)) == q_abs:
-                    out.self_excluded = True
-                    continue
-                out.hits.append(Hit(rank=rank, path=origin,
-                                    fine_score=sc,
-                                    coarse_score=o_list[oi][1][0],
-                                    d_hu=float("nan"), d_fp=float("nan"),
-                                    box=box, match_kind="tile"))
-    else:
-        # 无精排：按复核分返回
-        out.coarse_only = True
-        for rank, (o, (sc, row)) in enumerate(o_list[:top_k], 1):
-            box = coarse.box_at(int(row)) if has_box else None
-            if engine.cfg.exclude_self and \
-                    os.path.normcase(os.path.abspath(o)) == q_abs:
-                out.self_excluded = True
-                continue
-            out.hits.append(Hit(rank=rank, path=o, fine_score=float("nan"),
-                                coarse_score=sc,
-                                d_hu=float("nan"), d_fp=float("nan"),
-                                box=box, match_kind="tile"))
-    times["total"] = time.time() - t_all
-    out.times = times
-    out.coarse_kept = len(cand_rows)
-    return out
+    scores = _exact_tile_scores(feats, q, gpu_ok)
+    times["全库分块余弦"] = time.time() - t0
+    return _tile_outcome(engine, q_path, scores, top_k, times, started)
 
 
 def search_tiles_tiled(engine, q_path: str, top_k: int = 10,
-                       coarse_k: int = 300, method: str = "lsh",
+                       coarse_k: int = 300, method: str = "exact",
                        lsh_bits: int = 12, lsh_tables: int = 8,
                        auto_tile: bool = True,
-                       tile: int = TILE_DEFAULT,
-                       overlap: float = OVERLAP_DEFAULT) -> Outcome:
-    """瓦片索引检索（查询侧自动切块版）。
+                       tile: Optional[int] = None,
+                       overlap: Optional[float] = None) -> Outcome:
+    """查询按索引 meta 的建库协议切块，全库×所有查询块取原图 max。
 
-    背景（真实案例）：查询若是一张“较大的局部图”（例如整图横切一半/大半），
-    整图单块会被 Resize 到 224 与库中 512px 瓦片尺度错配，在几十万瓦片库中
-    无法区分（cos≈0.87-0.89 的近邻成片，正确原图排不进来）。
-
-    本函数：查询图按与建库一致的瓦片协议(512px+25% 重叠)切成若干块，
-    每块独立走 LSH/线性候选 + hash 过滤 + 瓦片余弦；跨块按原图聚合取
-    “任一查询块×任一瓦片”的最大余弦；最后对聚合出的 top origins 做全瓦片
-    × 全部查询块矩阵精排（防 LSH 漏行），输出与 search_tiles 相同的 Outcome。
-
-    小查询（较短边 < min_tile_side=768，即与建库“不切块”语义一致）自动
-    回退单块 search_tiles，开销不变。"""
-    from .coarse import _hamming_distance   # noqa: PLC0415
-    t_all = time.time()
+    小图（长边小于 min_side）、auto_tile=False 或无 fine 使用单块入口。
+    tile/overlap 的显式覆盖兼容旧 API；否则恢复 meta，旧库缺省用原协议。
+    """
+    _check_tile_search(method, top_k, coarse_k)
+    started = time.time()
     times: dict = {}
+
+    def single():
+        return search_tiles(engine, q_path, top_k=top_k, coarse_k=coarse_k,
+                            method=method, lsh_bits=lsh_bits, lsh_tables=lsh_tables)
+
+    if not auto_tile or engine.coarse.size == 0 or engine._fine_feats is None:
+        return single()
+    protocol = (getattr(engine, "meta", None) or {}).get(TILES_META_KEY, {})
+    tile = int(protocol.get("tile", TILE_DEFAULT) if tile is None else tile)
+    overlap = float(protocol.get("overlap", OVERLAP_DEFAULT) if overlap is None else overlap)
+    min_side = int(protocol.get("min_side", MIN_SIDE_DEFAULT))
+    pre_max = int(protocol.get("pre_max", PRE_MAX_SIDE))
+    if tile < 1 or min_side < 1 or pre_max < 1 or not 0 <= overlap < 1:
+        raise ValueError("瓦片索引切块协议无效")
     data = read_bytes(q_path)
-    if data is None:
-        return search_tiles(engine, q_path, top_k=top_k, coarse_k=coarse_k,
-                            method=method, lsh_bits=lsh_bits,
-                            lsh_tables=lsh_tables)
-    rgb = decode_rgb(data)
+    rgb = decode_rgb(data) if data is not None else None
     if rgb is None:
-        return search_tiles(engine, q_path, top_k=top_k, coarse_k=coarse_k,
-                            method=method, lsh_bits=lsh_bits,
-                            lsh_tables=lsh_tables)
+        raise RuntimeError(f"查询图片无法读取或解码：{q_path}")
     h, w = rgb.shape[:2]
-    if auto_tile and max(w, h) < MIN_SIDE_DEFAULT:
-        return search_tiles(engine, q_path, top_k=top_k, coarse_k=coarse_k,
-                            method=method, lsh_bits=lsh_bits,
-                            lsh_tables=lsh_tables)
-    coarse = engine.coarse
-    paths = coarse.paths
+    if max(w, h) < min_side:
+        return single()
     feats = engine._fine_feats
-    n = coarse.size
-    if feats is None:
-        raise RuntimeError("瓦片检索需要精排索引（fine）")
-    has_box = coarse.has_boxes()
+    if len(feats) != engine.coarse.size:
+        raise RuntimeError("瓦片精排特征与路径行数不一致，请重建瓦片索引")
     ex = engine._get_extractor()
-    gpu_ok = ex.device == "cuda"
-
-    # ---- 查询切块：与建库同协议（≤2048 处理空间）----------------------
     t0 = time.time()
-    work, qboxes, _sc = tiles_of_rgb(rgb, tile, overlap,
-                                     MIN_SIDE_DEFAULT, PRE_MAX_SIDE)
-    blocks = []                     # (crop_rgb, 指纹fp, q特征)
-    import cv2 as _cv2
-    for b in qboxes:
-        x0, y0, x1, y1 = b
+    work, qboxes, scale = tiles_of_rgb(rgb, tile, overlap, min_side, pre_max)
+    queries = []
+    sh, sw = work.shape[:2]
+    for box in qboxes:
+        # box 在原图空间；必须缩回 work 空间，不能拿原坐标切缩放后的图。
+        x0, y0, x1, y1 = (int(round(v * scale)) for v in box)
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(sw, max(x1, x0 + 1)), min(sh, max(y1, y0 + 1))
         crop = work[y0:y1, x0:x1]
-        if crop.shape[0] < 16 or crop.shape[1] < 16:
+        if crop.shape[0] < 4 or crop.shape[1] < 4:
             continue
-        gray = _cv2.cvtColor(crop, _cv2.COLOR_RGB2GRAY)
-        _bin, _hu, fp = extract_binary_features(gray, engine.cfg)
-        t = ex.transform(Image.fromarray(crop))
-        feat = ex._forward([t])
-        if feat is None:
-            continue
-        qf = np.asarray(feat[0], dtype=np.float32)
-        nn = float(np.linalg.norm(qf))
-        blocks.append((crop, fp, qf / nn if nn > 1e-8 else qf))
+        feat = ex._forward([ex.transform(Image.fromarray(crop))])
+        if feat is None or len(feat) != 1:
+            raise RuntimeError("查询瓦片特征提取失败，未返回不完整的检索结果")
+        queries.append(np.asarray(feat[0], dtype=np.float32))
     times["查询切块×特征"] = time.time() - t0
-    if not blocks:
-        return search_tiles(engine, q_path, top_k=top_k, coarse_k=coarse_k,
-                            method=method, lsh_bits=lsh_bits,
-                            lsh_tables=lsh_tables)
-
-    # ---- 逐块候选 + hash 过滤 + 瓦片余弦 -> 跨块 origin 聚合 -----------
+    if not queries:
+        return single()
     t0 = time.time()
-    n_bytes = coarse.n_bytes
-    agg: Dict[str, Tuple[float, int]] = {}
-    seen_cand = 0
-    for _crop, fp_q, qf in blocks:
-        if method == "lsh":
-            lsh = _lsh_for(engine, feats, lsh_bits, lsh_tables)
-            cand = lsh.query(q=qf, top_override=coarse_k * 40)
-        else:
-            cand = np.arange(n, dtype=np.int64)
-        if cand.size == 0:
-            continue
-        seen_cand += cand.size
-        if fp_q is not None and coarse.fp is not None:
-            xor = np.bitwise_xor(coarse.fp[cand],
-                                 np.asarray(fp_q, dtype=np.uint8))
-            d = _hamming_distance(xor) / float(n_bytes * 8)
-            cand = cand[d < 0.62]
-        if cand.size == 0:
-            continue
-        sub = np.asarray(feats[cand], dtype=np.float32)
-        subn = np.linalg.norm(sub, axis=1, keepdims=True)
-        subn[subn < 1e-8] = 1.0
-        sub = sub / subn
-        cos = _matmul_scores(sub, qf, gpu_ok)
-        for pos in np.argsort(cos, kind="stable")[::-1]:
-            row = int(cand[pos])
-            origin = paths[row]
-            sc = float(cos[pos])
-            prev = agg.get(origin)
-            if prev is None or sc > prev[0]:
-                agg[origin] = (sc, row)
-            if len(agg) >= coarse_k * 4:
-                break
-    times["分块候选聚合"] = time.time() - t0
-    o_list = sorted(agg.items(), key=lambda kv: kv[1][0],
-                    reverse=True)[:coarse_k]
-    if not o_list:
-        out0 = Outcome(query=q_path, db_size=n, method="tiles")
-        out0.times = {"total": time.time() - t_all}
-        return out0
-
-    # ---- 全瓦片 × 全部查询块 矩阵精排（防 LSH/聚合漏行）-----------------
-    t0 = time.time()
-    _og, rows_of = group_origins(paths)
-    o_rows = [(o, rows_of[str(o)]) for o, _s in o_list]
-    sel = np.concatenate([g for _o, g in o_rows]).astype(np.int64)
-    R = np.asarray(feats[sel], dtype=np.float32)
-    Rn = np.linalg.norm(R, axis=1, keepdims=True)
-    Rn[Rn < 1e-8] = 1.0
-    R = R / Rn
-    Q = np.stack([qf for _c, _f, qf in blocks]).astype(np.float32)
-    S = R @ Q.T                       # 行(瓦片) × 列(查询块)
-    times["收敛精排(全瓦片×查询块)"] = time.time() - t0
-    q_abs = os.path.normcase(os.path.abspath(q_path))
-    out = Outcome(query=q_path, db_size=n, method="tiles")
-    best: Dict[int, Tuple[float, int]] = {}
-    k = 0
-    n_qb = Q.shape[0]
-    for oi, (_o, g) in enumerate(o_rows):
-        cnt = len(g)
-        seg = S[k:k + cnt]
-        if seg.size:
-            p = int(np.argmax(seg))
-            bi, _bq = divmod(p, n_qb)          # 瓦片行(组内) × 查询块
-            best[oi] = (float(seg[bi, _bq]), int(sel[k + bi]))
-        k += cnt
-    order2 = sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)
-    for rank, (oi, (sc, row)) in enumerate(order2[:top_k], 1):
-        origin = o_list[oi][0]
-        box = coarse.box_at(int(row)) if has_box else None
-        if engine.cfg.exclude_self and \
-                os.path.normcase(os.path.abspath(origin)) == q_abs:
-            out.self_excluded = True
-            continue
-        out.hits.append(Hit(rank=rank, path=origin, fine_score=sc,
-                            coarse_score=o_list[oi][1][0],
-                            d_hu=float("nan"), d_fp=float("nan"),
-                            box=box, match_kind="tile"))
-    times["total"] = time.time() - t_all
-    out.times = times
-    out.coarse_kept = seen_cand
-    return out
+    scores = _exact_tile_scores(feats, np.stack(queries), ex.device == "cuda")
+    times["全库分块余弦"] = time.time() - t0
+    return _tile_outcome(engine, q_path, scores, top_k, times, started)
 
 
 # engine 级缓存：LSH 表挂在引擎实例上（随引擎一起回收）。
