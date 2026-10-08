@@ -10,19 +10,33 @@
 # ---------------------------------------------------------------------------
 
 """
-peer_launcher —— “切换启动”全栈图库管理器（跨程序互切，配合 img_server 按钮闭环）。
+peer_launcher —— “切换启动”对端：跨程序互切（配合端口画板按钮闭环）。
 
-本图库检索管理器（image-search）可与“全栈图库管理器”（<全栈图库管理器主程序路径，
-请按本机填写，例如 …\\全栈图库管理器 v3.2bata\\main.py>，PySide6 独立程序）互相切换：
-  * img_server 侧按钮：关全栈管理器 → 打开本检索管理器（见 handoff 流程）；
-  * 本侧“切换启动”按钮：关本程序 → 打开全栈管理器 main.py（本模块实现）。
+本图库检索管理器（image-search）可与“全栈图库管理器 / 端口画板”互相切换：
+  * 端口画板侧按钮：关自己 → 打开本检索管理器（见 handoff 流程）；
+  * 本侧“切换启动”按钮：关本程序 → 打开对端（本模块实现）。
 
-激活门槛（防呆/防注入）——不满足任一条即“不予激活”按钮：
+**目标优先级（2026-10-06 起，用户明确指定）**：
+
+  ============  ==================================================  ==============
+  环境里有什么   切换启动会开什么                                      要不要校验
+  ============  ==================================================  ==============
+  main.py       全栈图库管理器主程序（**优先且只用它**）              **要**（sha256 白名单）
+  只有端口画板    端口画板（打包 exe 优先，其次源码入口）              **不要**
+  都没有         按钮不予激活                                        —
+  ============  ==================================================  ==============
+
+  注意“有 main.py 就**只**用 main.py”—— 两者同时存在时不会退而求其次去开端口画板：
+  主程序才是正主，端口画板只是它的一个窗口。
+
+main.py 的激活门槛（防呆/防注入）——不满足任一条即“不予激活”按钮：
   1) 绝对路径下必须真实存在 main.py（本检索管理器被当作独立数据包分发到
      其它位置/机器时，路径上不存在该文件 → 按钮保持禁用）；
   2) 文件内容哈希必须与登记白名单一致（peer_manifest.json，随本包分发）。
      内容被改动/被植入后门 → 哈希矛盾 → 禁用，并给出新/旧哈希供人工判断；
   3) 登记动作只应在用户人工确认文件可信后发生（manifest 记录登记时间留痕）。
+
+端口画板**不走**上面这套：它是可独立分发的工具，不带白名单，也不需要“信任登记”。
 
 可靠性：目标程序由独立进程启动（DETACHED，不随本程序退出而终止）；
 启动后做短暂存活探测，2 秒内即退出视为启动失败并回滚（不关闭本程序）。
@@ -47,6 +61,25 @@ PEER_DIR = os.environ.get("IMG_PEER_DIR") or os.path.dirname(BASE)
 PEER_MAIN = os.path.join(PEER_DIR, "main.py")
 PEER_NAME = "main.py"
 
+# ---------------------------------------------------------------------------
+# 候选 2：**端口画板**（原「平台整合器」，2026-10-06 起正式更名）
+#
+# 为什么要有第二个候选：端口画板现在会**独立打包**成 exe 分发给其它用户，
+# 那个包里通常**没有**全栈图库管理器的 main.py。此时「切换启动」应该能直接开端口画板。
+# 优先级由用户明确指定：
+#   ① 有 main.py            → **优先且只**用 main.py（照旧走 sha256 白名单校验）
+#   ② 没有 main.py，有端口画板 → 用端口画板（**不做哈希校验**：它是可独立分发的工具，
+#                              不带白名单，也不需要"信任登记"这一层）
+#   ③ 都没有                → 按钮不予激活
+# ---------------------------------------------------------------------------
+PANEL_EXE_NAMES = ("端口画板.exe", "Download_To_Draw.exe", "PortPanel.exe", "port_panel.exe")
+PANEL_SRC_NAMES = ("端口画板.py", "port_panel.py")
+
+# 目标种类
+TGT_MAIN = "main"
+TGT_PANEL = "panel"
+TGT_LABEL = {TGT_MAIN: "全栈图库管理器", TGT_PANEL: "端口画板"}
+
 # 登记白名单：随本包分发的受信哈希记录
 MANIFEST_PATH = os.path.join(BASE, "peer_manifest.json")
 
@@ -55,6 +88,41 @@ ST_OK = "ok"
 ST_MISSING = "missing"          # 绝对路径下不存在
 ST_UNREGISTERED = "unregistered"  # 存在但白名单无记录（首次见到，需人工信任）
 ST_MISMATCH = "mismatch"        # 内容哈希与登记不一致（可能被改动/植入）
+
+
+def _find_panel():
+    """在 PEER_DIR 里找端口画板：打包 exe 优先，其次源码入口。返回 (路径, 'exe'|'py')。"""
+    for name in PANEL_EXE_NAMES:
+        p = os.path.join(PEER_DIR, name)
+        if os.path.isfile(p):
+            return p, "exe"
+    for name in PANEL_SRC_NAMES:
+        p = os.path.join(PEER_DIR, name)
+        if os.path.isfile(p):
+            return p, "py"
+    return None, None
+
+
+def resolve_target():
+    """决定这次「切换启动」开哪个。返回 (kind, path, how)：
+    kind ∈ {'main','panel',None}；how ∈ {'py','exe',None}。
+
+    **有 main.py 就只用 main.py**（哪怕端口画板也在）—— 这是用户明确的口径：
+    两者同时存在时，主程序才是"正主"，端口画板只是它的一个窗口。
+    """
+    if os.path.isfile(PEER_MAIN):
+        return TGT_MAIN, PEER_MAIN, "py"
+    panel, how = _find_panel()
+    if panel:
+        return TGT_PANEL, panel, how
+    return None, None, None
+
+
+def target_label(kind=None):
+    """给界面用的人类可读目标名。"""
+    if kind is None:
+        kind = resolve_target()[0]
+    return TGT_LABEL.get(kind) or "（未找到切换目标）"
 
 
 def _sha256_file(path: str) -> str:
@@ -85,17 +153,39 @@ def save_manifest(manifest: dict) -> None:
 def check() -> dict:
     """
     校验“切换目标”是否可激活。
+
+    目标按 resolve_target() 的优先级决定：有 main.py 就**只**用 main.py（走哈希白名单），
+    否则用端口画板（**不校验**）。
+
     返回 {"ok": bool, "code": 状态码, "reason": str,
+          "target": 'main'|'panel'|None, "target_path": str|None, "target_how": 'py'|'exe'|None,
           "current_sha256": str|None, "registered_sha256": str|None,
           "registered_at": str|None}
     """
+    kind, path, how = resolve_target()
     out = {"ok": False, "code": ST_MISSING, "reason": "",
+           "target": kind, "target_path": path, "target_how": how,
            "current_sha256": None, "registered_sha256": None,
            "registered_at": None}
-    if not os.path.isfile(PEER_MAIN):
-        out["reason"] = (f"未检测到绝对路径下的切换目标：\n{PEER_MAIN}\n"
-                         f"（本程序作为独立数据包分发时不含该文件，按钮不予激活）")
+
+    # ---- 端口画板：**不需要**校验，存在即可激活 ----
+    if kind == TGT_PANEL:
+        out["ok"] = True
+        out["code"] = ST_OK
+        out["reason"] = (f"未检测到全栈图库管理器 main.py，改用独立分发的「端口画板」：\n"
+                         f"{path}\n"
+                         f"（端口画板是可独立运行的工具，不做哈希校验）")
         return out
+
+    if kind is None:
+        out["reason"] = (f"未检测到任何可切换的目标。\n"
+                         f"查找位置：{PEER_DIR}\n"
+                         f"  · 全栈图库管理器：{PEER_MAIN}\n"
+                         f"  · 端口画板：{' / '.join(PANEL_EXE_NAMES + PANEL_SRC_NAMES)}\n"
+                         f"（本程序作为独立数据包分发时不含这些文件，按钮不予激活）")
+        return out
+
+    # ---- main.py：照旧走 sha256 白名单 ----
     cur = _sha256_file(PEER_MAIN)
     out["current_sha256"] = cur
     manifest = load_manifest()
@@ -124,7 +214,14 @@ def check() -> dict:
 
 
 def register() -> dict:
-    """人工确认信任后，把当前文件哈希写入登记白名单（留痕）。"""
+    """人工确认信任后，把当前文件哈希写入登记白名单（留痕）。
+
+    只对 **main.py** 有意义 —— 端口画板不参与哈希校验，无需登记。
+    """
+    kind, path, _how = resolve_target()
+    if kind == TGT_PANEL:
+        return {"ok": True, "sha256": None,
+                "reason": f"当前切换目标是「端口画板」，不做哈希校验，无需登记：\n{path}"}
     if not os.path.isfile(PEER_MAIN):
         return {"ok": False, "reason": f"切换目标不存在：{PEER_MAIN}"}
     cur = _sha256_file(PEER_MAIN)
@@ -142,10 +239,13 @@ def register() -> dict:
 
 def launch() -> tuple:
     """
-    以独立进程启动全栈图库管理器 main.py（不随本程序退出而终止）。
+    以独立进程启动对端（不随本程序退出而终止）。
     返回 (proc, None) 或 (None, 错误信息)。
 
-    启动方式说明（实测结论，重要）：
+    开哪个由 resolve_target() 决定：**有 main.py 就只用 main.py**，否则用端口画板
+    （打包 exe 直接起 exe；源码入口走 python）。两种情形都**不做**存活探测之外的处理。
+
+    启动方式说明（实测结论，重要；只对 main.py 那条链路成立）：
       * **不能用 pythonw（无控制台）**——全栈管理器每秒刷新 GPU 性能、
         内部反复 spawn nvidia-smi 等控制台子进程；父进程无控制台时，
         Windows 会为这些子进程不断新建/激活控制台窗口，
@@ -158,9 +258,44 @@ def launch() -> tuple:
       * 补充：main.py 启动后会出现**启动确认弹窗**（带按钮，需人工点击
         后才进入主程序）。GUI 切换按钮的 2 秒存活探测只判断进程未崩溃，
         不等待该人工确认——弹窗出现属预期，点击确认即进入主程序。
+      * 端口画板那条链路没有这些问题：打包 exe 自带 GUI 子系统，
+        源码入口也不 spawn 控制台子进程，所以 exe 用 SW_SHOWNORMAL 正常显示。
     """
-    if not os.path.isfile(PEER_MAIN):
-        return None, f"切换目标不存在：{PEER_MAIN}"
+    kind, path, how = resolve_target()
+    if kind is None:
+        return None, (f"未检测到任何可切换的目标。\n查找位置：{PEER_DIR}\n"
+                      f"  · 全栈图库管理器：{PEER_MAIN}\n"
+                      f"  · 端口画板：{' / '.join(PANEL_EXE_NAMES + PANEL_SRC_NAMES)}")
+    if not os.path.isfile(path):
+        return None, f"切换目标不存在：{path}"
+
+
+    # ---- 端口画板（打包 exe）：直接起 exe，不需要 Python ----
+    if kind == TGT_PANEL and how == "exe":
+        err_log = os.path.join(os.environ.get("TEMP") or ".", "peer_launch_err.log")
+        try:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 1                 # SW_SHOWNORMAL：它自带 GUI，正常显示
+            proc = subprocess.Popen(
+                [path],
+                cwd=os.path.dirname(path) or PEER_DIR,
+                startupinfo=si,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=open(err_log, "w", encoding="utf-8", errors="replace"),
+            )
+            return proc, None
+        except OSError as e:
+            return None, f"启动失败：{e}"
+
+    # ---- main.py / 端口画板源码：走 python.exe ----
+    if kind == TGT_PANEL:
+        target_script = path
+    else:
+        target_script = PEER_MAIN
+
     # 可执行文件必须是 python.exe（带控制台子系统）：
     #   * 源码运行：即使本进程由 pythonw 启动（无控制台），
     #     也换用同目录的 python.exe；
@@ -185,8 +320,8 @@ def launch() -> tuple:
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 6                     # SW_SHOWMINIMIZED：最小化控制台
         proc = subprocess.Popen(
-            [exe, "-X", "utf8", PEER_MAIN],
-            cwd=PEER_DIR,
+            [exe, "-X", "utf8", target_script],
+            cwd=os.path.dirname(target_script) or PEER_DIR,
             startupinfo=si,
             creationflags=subprocess.CREATE_NEW_CONSOLE,
             close_fds=True,
@@ -207,6 +342,7 @@ def main() -> int:
     a = ap.parse_args()
     if a.action == "check":
         st = check()
+        print(f"目标：{target_label(st.get('target'))}")
         print(f"[{st['code']}] {'OK' if st['ok'] else '不可激活'}：{st['reason']}")
         return 0 if st["ok"] else 1
     if a.action == "register":
@@ -217,7 +353,7 @@ def main() -> int:
     if err:
         print(err)
         return 1
-    print(f"已启动：{PEER_MAIN}（pid={proc.pid}）")
+    print(f"已启动：{resolve_target()[1]}（pid={proc.pid}）")
     return 0
 
 
