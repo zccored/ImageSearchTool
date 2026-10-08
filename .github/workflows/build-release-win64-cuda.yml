@@ -1,0 +1,153 @@
+# -*- mode: yaml -*-
+# ---------------------------------------------------------------------------
+# ImageSearchTool · Windows x64 (CUDA) 打包与发布
+# Copyright (C) 2026 zccored  ·  AGPL-3.0-only
+#
+# 为什么用 GitHub Actions 打包：本地打包要下 ~2.5 GB 的 CUDA torch、产出 ~2.6 GB 的包，
+# 再上传一遍——对流量受限的环境（出差/热点）不现实。交给 runner 做，本机只发一个 tag。
+#
+# 触发方式：
+#   · 推送 tag：git push <remote> v3.3.1-beta   → 自动打包并建 Release
+#   · 手动：Actions 页面 → Run workflow，填 tag 名
+#
+# 产物：`ImageSearchTool-<tag>-win64-cuda.zip.001/.002`
+#   GitHub 单个 Release 附件上限 2 GiB，本包约 2.6 GB，所以用 7z 的 -v 直接切卷。
+#   使用者下载两卷后：copy /b xxx.zip.001 + xxx.zip.002 xxx.zip 再解压。
+#
+# 仓库是 public → Actions 分钟数免费且不限量（Windows runner 的 2× 倍率也不计费）。
+# ---------------------------------------------------------------------------
+name: build-release-win64-cuda
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag 名（例如 v3.3.1-beta）'
+        required: true
+        type: string
+
+permissions:
+  contents: write          # 建 Release / 传附件需要
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    env:
+      # 与本地构建保持一致（本地实测 torch 2.4.0+cu124 / Python 3.12）
+      PYTHON_VERSION: '3.12'
+      TORCH_INDEX: 'https://download.pytorch.org/whl/cu124'
+      # Release 附件硬上限是 2 GiB，切 1900 MB 留出余量
+      VOLUME_SIZE: '1900m'
+
+    steps:
+      - name: 取出源码
+        uses: actions/checkout@v4
+
+      - name: 腾磁盘空间（runner 默认只剩 ~14 GB，装完 torch + 打包会不够）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          foreach ($p in @('C:\Android', 'C:\hostedtoolcache\windows\Java_*',
+                           'C:\hostedtoolcache\windows\Ruby', 'C:\hostedtoolcache\windows\node',
+                           'C:\Program Files\Google', 'C:\Program Files (x86)\Google',
+                           'C:\Program Files\Mozilla Firefox', 'C:\Program Files\Microsoft SQL Server',
+                           'C:\Program Files\dotnet', 'C:\Program Files\PowerShell')) {
+            if (Test-Path $p) { Remove-Item $p -Recurse -Force }
+          }
+          Get-PSDrive C | ForEach-Object { "C: 可用 $([math]::Round($_.Free/1GB,1)) GB" }
+
+      - name: 安装 Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 安装 CUDA 版 torch / torchvision
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-cache-dir torch==2.4.0 torchvision `
+            --index-url $env:TORCH_INDEX
+
+      - name: 安装其余依赖与 PyInstaller
+        shell: pwsh
+        run: |
+          python -m pip install --no-cache-dir -r requirements.txt
+          python -m pip install --no-cache-dir pyinstaller==6.15.0
+
+      - name: 准备 resnet18 预训练权重（仓库里没有，spec 从用户目录读）
+        shell: pwsh
+        run: |
+          # image-search.spec 的 WEIGHTS_DIR 指向 %USERPROFILE%\.cache\torch\hub\checkpoints，
+          # 打包时把里面的 resnet18 权重塞进 _internal/torch_home/，实现"离线也能建精排索引"。
+          # 权重文件很大，不进仓库，所以在 CI 里现下。
+          $dir = Join-Path $env:USERPROFILE '.cache\torch\hub\checkpoints'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $dst = Join-Path $dir 'resnet18-f37072fd.pth'
+          Invoke-WebRequest -Uri 'https://download.pytorch.org/models/resnet18-f37072fd.pth' -OutFile $dst
+          Get-Item $dst | ForEach-Object { "  权重 $($_.Name)  $([math]::Round($_.Length/1MB,1)) MB" }
+
+      - name: 打包（image-search.spec → GUI / CLI / Web 三个 exe）
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean image-search.spec
+          if (-not (Test-Path 'dist\ImageSearch')) { throw '打包产物 dist\ImageSearch 不存在' }
+          $n = (Get-ChildItem 'dist\ImageSearch' -Recurse -File).Count
+          $sz = [math]::Round(((Get-ChildItem 'dist\ImageSearch' -Recurse -File | Measure-Object Length -Sum).Sum/1MB),1)
+          "  产物：$n 个文件 / $sz MB"
+
+      - name: 打包后自检（三个 exe 都在、权重已内置）
+        shell: pwsh
+        run: |
+          foreach ($e in 'ImageSearchGUI.exe', 'ImageSearchCLI.exe', 'ImageSearchWeb.exe') {
+            if (-not (Test-Path "dist\ImageSearch\$e")) { throw "缺少 $e" }
+          }
+          $w = Get-ChildItem 'dist\ImageSearch' -Recurse -Filter 'resnet18-*.pth' -ErrorAction SilentlyContinue
+          if (-not $w) { throw '包里没有 resnet18 权重（TORCH_HOME 离线路径会失效）' }
+          "  三个 exe 齐全，权重已内置：$($w[0].Name)"
+
+      - name: 解析版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            '${{ github.event.inputs.tag }}'
+          } else { '${{ github.ref_name }}' }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "  发布 tag = $tag"
+
+      - name: 切卷压缩（GitHub 附件上限 2 GiB）
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $base = "ImageSearchTool-$tag-win64-cuda"
+          # 7z 的 -v 直接产出 xxx.zip.001 / .002 …，使用者 copy /b 合并即可
+          7z a -tzip -mx=5 "-v$env:VOLUME_SIZE" "$base.zip.001" '.\dist\ImageSearch'
+          if ($LASTEXITCODE -ne 0) { throw '7z 压缩失败' }
+          Get-ChildItem "$base.zip.*" | ForEach-Object {
+            "  $($_.Name)  $([math]::Round($_.Length/1MB,1)) MB"
+          }
+          # 逐卷 SHA256 写进 Release 说明，便于使用者核对
+          $lines = Get-ChildItem "$base.zip.*" | ForEach-Object {
+            "$($_.Name)  $(Get-FileHash $_.FullName -Algorithm SHA256 | Select-Object -ExpandProperty Hash)"
+          }
+          $lines | Set-Content 'SHA256SUMS.txt' -Encoding UTF8
+          Get-Content 'SHA256SUMS.txt'
+
+      - name: 创建 Release 并上传分卷
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }} · ImageSearchTool Windows x64 (CUDA)
+          body_path: .github/release-notes.md
+          files: |
+            ImageSearchTool-*.zip.*
+            SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: true
