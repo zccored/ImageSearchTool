@@ -143,7 +143,10 @@ jobs:
           $tag = '${{ steps.ver.outputs.tag }}'
           $base = "ImageSearchTool-$tag-win64-cuda"
           # 7z 的 -v 直接产出 xxx.zip.001 / .002 …，使用者 copy /b 合并即可
-          7z a -tzip -mx=5 "-v$env:VOLUME_SIZE" "$base.zip.001" '.\dist\ImageSearch'
+          # 注意：7z 的 -v 会**自己在名字后面追加卷号**，所以这里传 "$base.zip"
+          # 而不是 "$base.zip.001" —— 传后者会切出 .zip.001.001 / .zip.001.002
+          # （v3.3.1-beta 第一次发就是这么错的，附件名和 README 的 copy /b 说明对不上）。
+          7z a -tzip -mx=5 "-v$env:VOLUME_SIZE" "$base.zip" '.\dist\ImageSearch'
           if ($LASTEXITCODE -ne 0) { throw '7z 压缩失败' }
           Get-ChildItem "$base.zip.*" | ForEach-Object {
             "  $($_.Name)  $([math]::Round($_.Length/1MB,1)) MB"
