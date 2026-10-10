@@ -51,17 +51,21 @@
 ### 一、用打包版（最省事，目标机不需要 Python）
 
 **先下载**：到 [Releases](https://github.com/zccored/ImageSearchTool/releases) 页下最新的打包版
-（`ImageSearchTool-v3.3.0-beta-win64-cuda.zip.001` / `.002`）。GitHub 单个附件上限 2 GiB，
+（当前是 `ImageSearchTool-v3.3.1-beta-win64-cuda.zip.001` / `.002`）。GitHub 单个附件上限 2 GiB，
 所以一个包拆成两卷；两卷放到**同一目录**后，用 `cmd` 合并、再解压：
 
 ```bat
-copy /b ImageSearchTool-v3.3.0-beta-win64-cuda.zip.001 + ImageSearchTool-v3.3.0-beta-win64-cuda.zip.002 ImageSearchTool-v3.3.0-beta-win64-cuda.zip
+copy /b ImageSearchTool-v3.3.1-beta-win64-cuda.zip.001 + ImageSearchTool-v3.3.1-beta-win64-cuda.zip.002 ImageSearchTool-v3.3.1-beta-win64-cuda.zip
 ```
 
-> 合并后的 zip 应为 **2,688.1 MiB**，SHA256
-> `9828f5c61c11f55809a481de1551578e1f2aa2497dbe556271230b79d4287fe4`；
-> 两卷各自的 SHA256 列在 Release 说明里，下载后可自行核对。解压得到 `ImageSearch/`
-> （**4,149 MB / 4,308 个文件**）。
+> 两卷合计 **2,446.0 MiB**（`.001` 1900.0 MiB + `.002` 546.0 MiB）。
+> **各卷的 SHA256 见 Release 附件的 `SHA256SUMS.txt`**，合并/解压前可自行核对。
+> 解压得到 `ImageSearch/`。
+
+> 📦 **从 v3.3.1-beta 起，打包由 GitHub Actions 自动完成**
+> （`.github/workflows/build-release-win64-cuda.yml`）：推一个 tag 就在 runner 上
+> 装 CUDA torch、现下 resnet18 权重、`pyinstaller` 出三个 exe、切卷上传 ——
+> **本机不需要下 2.5 GB 的 torch、也不需要上传 2.4 GB**。
 
 > 🖥️ **一个包，自己选「满血 CUDA」还是「纯 CPU」**：包里带的是 CUDA 版 torch（包体 4.15 GB
 > 几乎全是它），目标机**没有 NVIDIA 显卡/驱动时会自动回退 CPU** 照常运行，只是精排慢一些。
@@ -879,6 +883,19 @@ image-search/
 
 <details>
   <summary>更新日志</summary>
+
+### 2026-10-10（打包全自动化：GitHub Actions 出包并发布）
+
+- **打包从"本机手工"改为"runner 自动"**：推一个 tag 即触发
+  `.github/workflows/build-release-win64-cuda.yml` —— 装 CUDA torch、**现下 resnet18 权重**
+  （它不在仓库里，但 spec 会把它塞进包内供离线建索引）、`pyinstaller` 出 GUI/CLI/Web 三个 exe、
+  打包后自检、`7z -v1900m` 切卷、建 Release 并上传。**本机不用下 2.5 GB torch、也不用传 2.4 GB**。
+  仓库是 public，Actions 分钟数免费不限量。
+- **`v3.3.1-beta` 由此产出**（两个分卷 + `SHA256SUMS.txt`）。
+- 踩过的 CI 环境坑（都写在 workflow 注释里了）：runner 会把 `run` 块落成 `.ps1` 再执行，
+  因此 **PowerShell 反引号续行会被写坏**、且 **ExecutionPolicy 会挡住 dot-source**；
+  runner 控制台是 **cp1252**，spec 里的中文 `print()` 会抛 `UnicodeEncodeError`；
+  清理磁盘时**绝不能删 `C:\Program Files\PowerShell`**（那是跑 step 用的 pwsh 自己的目录）。
 
 ### 2026-10-03（瓦片召回修复：LSH 桶截断 → 全覆盖评分；性能档案归档）
 
