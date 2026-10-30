@@ -34,6 +34,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
@@ -53,7 +54,7 @@ from hybrid_search.service import (
     EVENT_LOG, EVENT_PERF_REPORT, EVENT_PHASE_BOUNDARY, EVENT_PROGRESS,
     EVENT_TASK_DONE, EVENT_TASK_ERROR, EVENT_VIZ_FRAME, OP_ADD, OP_BUILD,
     OP_COMPACT, OP_DEDUP_APPLY, OP_DEDUP_SCAN, OP_HANDOFF, OP_SCAN, OP_SEARCH,
-    OP_TILES, PHASE_LABELS, SearchService)
+    OP_TILES, OP_WHITEN, PHASE_LABELS, SearchService)
 from hybrid_search.thumbs import ThumbCache
 
 # 与 io_utils 保持一致：抬高 Pillow 解压炸弹上限，避免超大图预览直接抛错
@@ -1026,7 +1027,8 @@ class App:
     _SVC_DONE_KIND = {OP_SCAN: "scan_done", OP_BUILD: "indexed",
                       OP_ADD: "indexed", OP_TILES: "tiles_done",
                       OP_COMPACT: "compact_done", OP_SEARCH: "search_done",
-                      OP_DEDUP_SCAN: "dedup_done", OP_HANDOFF: "handoff_done"}
+                      OP_DEDUP_SCAN: "dedup_done", OP_WHITEN: "whiten_done",
+                      OP_HANDOFF: "handoff_done"}
 
     def _on_service_event(self, ev: dict):
         """服务层事件回调（可能来自 worker 线程）：只入队，绝不直接碰 UI。"""
@@ -1307,10 +1309,12 @@ class App:
                                       command=lambda: self._add_new())
         self.btn_dedup = ttk.Button(row3, text="查验去重(找重复图，实验功能，慎开)",
                                     command=self._dedup_check)
+        self.btn_whiten = ttk.Button(row3, text="生成白化侧车(精排提间隔)",
+                                     command=self._whiten_sidecar)
         self.btn_refresh_idx = ttk.Button(row3, text="刷新已索引标记",
                                           command=self._refresh_indexed_state)
         for b in (self.btn_build_all, self.btn_build_sel, self.btn_add_new,
-                  self.btn_dedup, self.btn_refresh_idx):
+                  self.btn_dedup, self.btn_whiten, self.btn_refresh_idx):
             b.pack(side="left", padx=(0, 8))
 
         # 第 3.5 行：子图(局部/瓦片)索引 —— 大图切 512px+25% 重叠瓦片入库
@@ -1491,12 +1495,19 @@ class App:
         self._add_check(page_build, "使用轮廓 Hu 矩特征", "use_hu", True)
         self._add_check(page_build, "使用二值图像指纹特征", "use_fp", True)
         self._add_check(page_build, "白像素过半时取反(白底图库)", "invert_binary", False)
+        self._add_combo(page_build, "二值化前归一化(改动需重建索引)", "binarize_norm",
+                        ["none", "eq", "quantile"])
 
         self._sep(page_build, "ResNet 精排")
         self._add_combo(page_build, "模型", "model",
                         ["resnet18", "resnet34", "resnet50", "resnet101", "resnet152"])
         self._add_combo(page_build, "设备", "device", ["auto", "cuda", "cpu"])
         self._add_int(page_build, "批大小(0=自动)", "batch", 0, 0, 512)
+        self._add_combo(page_build, "预处理实现(cpu=PIL / torch=同源 GPU)", "prep",
+                        ["cpu", "torch"])
+        self._add_int(page_build, "GPU 批量预处理张数(0=逐张)", "prep_batch", 8, 0, 128,
+                      tooltip=">0 时解码线程只交原始 RGB，由单线程在 GPU 上批量 resize/crop；\n"
+                              "全量实测 batch=64 最稳（256 会因 RGB 堆积换页）")
         self._add_check(page_build, "GPU 半精度 FP16", "fp16", True)
         self._add_check(page_build, "预构建 ResNet 全库索引(快/占内存)", "store_fine", True)
         # 「新索引用侧车 .npy」「屏蔽 libpng/iCCP 噪音」已收敛为默认行为（config 默认 True），
@@ -1504,7 +1515,8 @@ class App:
         # 旁路开关：默认 libdeflate（libdeflate 解 IDAT + 原生 SIMD 反滤波，只处理
         # 8bit 非交错 RGBA，其余格式/依赖缺失自动回退 cv2，输出与 cv2 逐位一致）。
         self._add_combo(page_build, "PNG 解码器(旁路)", "png_decoder",
-                        ["libdeflate", "cv2", "imagecodecs", "pillow"])
+                        ["libdeflate", "libdeflate_compat",
+                         "cv2", "imagecodecs", "pillow"])
         self._add_check(page_build, "启用预处理缓存(重复建库更快/占磁盘)",
                         "prep_cache", True)
         self._add_check(page_build, "MD5 内容去重", "dedup", True)
@@ -1551,8 +1563,16 @@ class App:
 
         self._sep(page_search, "检索流程")
         self._add_int(page_search, "粗筛候选数 coarse_k", "coarse_k", 300, 10, 100000)
+        self._add_check(page_search, "检索时使用精排白化(需先生成侧车)",
+                        "fine_whiten", False)
         self._add_int(page_search, "最终返回数 top_k", "top_k", 10, 1, 100)
-        self._add_check(page_search, "剔除查询图自身", "exclude_self", True)
+        self._add_check(page_search, "剔除查询图自身（要定位原图就别勾）",
+                        "exclude_self", False)
+        ttk.Label(page_search,
+                  text="勾选后，若查询图本身就是库内文件，自身的 1.0000 命中会被删掉，"
+                       "只剩同作者的低分图。查“这张图在库里的位置”时保持不勾。",
+                  foreground="#888888", wraplength=520,
+                  font=("Microsoft YaHei UI", 8)).pack(anchor="w", padx=18)
         self._sep(page_search, "索引位置")
         self._add_text(page_search, "索引前缀(留空=自动放图库内)",
                        "prefix", "",
@@ -1900,6 +1920,28 @@ class App:
     # ------------------------------------------------------------------
     # 查验去重（一对多重复图）
     # ------------------------------------------------------------------
+    def _whiten_sidecar(self):
+        """为当前索引生成白化侧车（.whiten.npz + .fine_white.npy）。"""
+        if self.busy:
+            return
+        if not messagebox.askokcancel(
+                "生成白化侧车",
+                "将为当前索引计算 ZCA 白化（侧车约 74 MB），\n"
+                "不改变粗筛、不重建索引；检索页勾选“使用精排白化”后生效。\n\n"
+                "继续？"):
+            return
+        self._run_cmd("生成白化侧车…", self.svc.whiten, "whiten",
+                      prefix=self.prefix)
+
+    def _on_whiten_done(self, rep):
+        self._set_busy(False)
+        if not rep:
+            self._status("白化侧车生成失败（详见日志）")
+            return
+        self._status("白化侧车已生成")
+        messagebox.showinfo("白化", "已生成白化侧车：\n" + str(rep) +
+                           "\n\n检索页勾选“使用精排白化”即可启用。")
+
     def _dedup_check(self):
         """扫描图库找重复图：完全重复(MD5) + 近似重复(指纹汉明)。"""
         if not self._require_scan():
@@ -1956,10 +1998,30 @@ class App:
         self._viz_frames = 0
         self.viz_status_var.set("等待首帧…")
 
+    def _sync_binarize_widget(self) -> None:
+        """把索引 meta 的 binarize_norm 回填到界面下拉（否则打开 eq 索引时显示 none）。"""
+        prefix = self.prefix or self._auto_prefix()
+        try:
+            with open(prefix + ".meta.json", "r", encoding="utf-8") as fh:
+                stored = json.load(fh).get("cfg") or {}
+        except Exception:                                     # noqa: BLE001
+            return
+        # 与 engine 的 fatal_keys 对齐：7 项全部回填，而不只是 binarize_norm
+        for k in ("coarse_size", "coarse_blur", "use_hu", "use_fp",
+                  "invert_binary", "binarize_norm", "png_decoder", "prep"):
+            if k not in stored:
+                continue
+            ent = self.entries.get(k)
+            if not ent:
+                continue
+            var, kind, _ = ent
+            var.set(bool(stored[k]) if kind == "bool" else stored[k])
+
     def _refresh_indexed_state(self):
         if not self.all_images:
             messagebox.showwarning("提示", "请先扫描图库")
             return
+        self._sync_binarize_widget()
         if self._index_exists():
             self._load_indexed_set()
         else:
@@ -2064,9 +2126,9 @@ class App:
         mrow = ttk.Frame(page_q)
         mrow.pack(fill="x", pady=(3, 0))
         ttk.Label(mrow, text="检索模式:").pack(side="left")
-        for val, txt in (("full", "整图索引 (Top≤10)"),
-                         ("tiles", "局部索引·瓦片 (Top≤10)"),
-                         ("hybrid", "混合·两者都搜 (Top≤20)")):
+        for val, txt in (("full", "整图索引"),
+                         ("tiles", "局部索引·瓦片"),
+                         ("hybrid", "混合·两者都搜")):
             ttk.Radiobutton(mrow, text=txt, value=val,
                             variable=self.search_mode_var,
                             command=self._on_search_mode).pack(
@@ -2178,9 +2240,9 @@ class App:
             ok = messagebox.askokcancel(
                 "混合检索 · 性能提示",
                 "混合模式将【整图索引】与【局部(瓦片)索引】同时检索：\n\n"
-                "• 两套索引并行打分，耗时约为单套的 2 倍，需同时载入两套精排特征；\n"
+                "• 两路顺序检索，共享特征提取模型，需载入两套索引；实际耗时随图库而变；\n"
                 "• 同一原图的全图/局部命中去重，相似度取两路较高值重新统计；\n"
-                "• 结果固定返回 20 条（其它模式 10 条）。\n\n"
+                "• 返回条数遵循参数页的 top_k 设置（所有模式一致）。\n\n"
                 "是否继续？")
             if not ok:
                 self.search_mode_var.set("full")
@@ -2352,6 +2414,8 @@ class App:
                     self._on_tiles_done(msg[1])
                 elif kind == "dedup_done":
                     self._on_dedup_done(msg[1])
+                elif kind == "whiten_done":
+                    self._on_whiten_done(msg[1])
                 elif kind == "perf":
                     payload = msg[1]
                     if isinstance(payload, tuple):
@@ -2438,6 +2502,7 @@ class App:
         self._load_indexed_set()
         self._apply_indexed_tag()
         self._drop_engines("索引已改写，缓存失效", silent=True)
+        self._sync_binarize_widget()
         # 可视化：进入快放模式，把排队帧 1 秒内播完（不再像“还在处理 ResNet”）
         if self._viz_busy():
             self._viz_fast = True
@@ -2473,7 +2538,9 @@ class App:
                 else "混合(仅粗筛)"
         info = (f"库 {data['db']} 张 | 候选 {data['kept']} 张 | "
                 f"{mode} | 合计 {ms('total')}"
-                + (" | 已剔除查询图自身" if data["self_excluded"] else "")
+                + (" | ⚠ 查询图本身就在库内：已按设置剔除自身，"
+                   "所以看不到 1.0000 的原图命中 —— 取消勾选「剔除查询图自身」后重查即可"
+                   if data["self_excluded"] else "")
                 + (f" | {no_preview} 个无预览" if no_preview else ""))
         self.result_info_var.set(f"{len(hits)} 个结果  |  {info}")
         self.detail_var.set("点击结果缩略图查看详情（局部命中缩略图带红框）")

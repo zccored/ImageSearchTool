@@ -40,6 +40,7 @@ from .config import Config
 from .fine import ResNetExtractor
 from .io_utils import LOGGER, collect_images, human_bytes
 from .store import IndexFiles, meta_of
+from . import whiten
 
 
 def _wrap_frame(frame_sink, phase: str):
@@ -128,6 +129,8 @@ class HybridEngine:
         # 精排索引（懒加载 mmap）
         self._fine_feats = None          # (N,D) ndarray / memmap（L2 归一化）
         self._fine_npz = None
+        # 精排白化（可选）：(mu, W, meta)；None=未启用/侧车缺失
+        self._whiten = None
         # 精排特征提取器（懒加载）
         self._extractor: Optional[ResNetExtractor] = None
 
@@ -153,6 +156,9 @@ class HybridEngine:
             raise FileExistsError(
                 f"索引 {prefix}.* 已存在；请加 --force 重建，或用 add 增量入库")
         start = time.time()
+        # 帧交错追踪：默认关闭（None）。开启时每张仅多几次 perf_counter，不改流水线。
+        self._trace = [] if os.environ.get("HERMES_TRACE") == "1" else None
+        self._trace_last_end = 0.0
 
         if paths is None:
             if not img_dir:
@@ -200,6 +206,7 @@ class HybridEngine:
         self._log_prep_cache()
         LOGGER.info("索引构建完成：%d 张，耗时 %.1f s，输出前缀 %s.*",
                     self.coarse.size, time.time() - start, prefix)
+        self._dump_trace(prefix)
         return self.coarse.size
 
     def add(self, prefix: str, img_dir: Optional[str] = None,
@@ -241,8 +248,20 @@ class HybridEngine:
             LOGGER.info("特征提取完成：新增 %d 张", added)
             _phase(progress, added, added, "save")
             if old_has_fine:
-                new_feats = np.concatenate(
-                    [np.asarray(self._fine_feats), new_feats], axis=0)
+                base = np.asarray(self._fine_feats)
+                if getattr(self, "_whiten", None) is not None:
+                    # 增量必须基于磁盘上的原始特征；否则会把白化旧行与原始新行
+                    # 拼成混合空间。侧车随之作废，完成后再 whiten 重建。
+                    from . import whiten as _W
+                    _raw = IndexFiles(prefix).load_fine(
+                        mmap=False, sidecar=self._storage == "sidecar")
+                    base = np.array(_raw["features"], dtype=np.float32, copy=True)
+                    self.release_fine()      # 先释放白化 mmap，Windows 才能删侧车
+                    _W.remove(prefix)
+                    self._whiten = None
+                    LOGGER.warning("增量入库前已删除白化侧车（新旧行会混空间）；"
+                                   "完成后再运行 whiten 重新生成")
+                new_feats = np.concatenate([base, new_feats], axis=0)
             self.release_fine()            # 解除旧 mmap（Windows 无法替换被映射文件）
             self._keep_fine(new_feats)
             IndexFiles(prefix).save_fine(self.coarse.paths, new_feats,
@@ -279,6 +298,10 @@ class HybridEngine:
         from .fine import _PRE_DOWNSCALE_SIDE, set_prep_cache
         from .prep_cache import PrepCache, default_cache_dir
         root = default_cache_dir(prefix)
+        if getattr(self.cfg, "prep", "cpu") != "cpu":
+            # 换实现后旧缓存张量不可复用：直接禁用，避免按路径命中旧 PIL 结果
+            set_prep_cache(None)
+            return None
         cache = getattr(self, "_prep_cache", None)
         if cache is None or cache.root != root or not cache.enabled:
             cache = PrepCache(root, model=self.cfg.model,
@@ -286,6 +309,26 @@ class HybridEngine:
                               norm_on_gpu=getattr(self.cfg, "norm_on_gpu", True))
         set_prep_cache(cache)               # 让 build-fine / 查询路径也能命中
         return cache
+
+    def _dump_trace(self, prefix: str) -> None:
+        """把帧交错追踪落盘；未开启时零成本返回。"""
+        tr = getattr(self, "_trace", None)
+        if not tr:
+            self._trace = None
+            return
+        try:
+            import json as _json
+            out_dir = "perf_reports"
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, "trace_%s_%d.json"
+                                % (os.path.basename(prefix), int(time.time())))
+            with open(path, "w", encoding="utf-8") as fh:
+                _json.dump({"prefix": prefix, "n": len(tr), "events": tr}, fh)
+            LOGGER.info("帧交错追踪已写出：%s（%d 条）", path, len(tr))
+        except Exception:                                  # noqa: BLE001
+            LOGGER.warning("帧交错追踪落盘失败", exc_info=True)
+        finally:
+            self._trace = None
 
     def _log_prep_cache(self) -> None:
         cache = getattr(self, "_prep_cache", None)
@@ -324,6 +367,9 @@ class HybridEngine:
                                      seen_lock=_seen_lock)
 
         def on_batch(ok_paths, tensors, payloads):
+            tr = getattr(self, "_trace", None)
+            t_f0 = time.perf_counter() if tr is not None else 0.0
+            wait = (t_f0 - getattr(self, "_trace_last_end", t_f0)) if tr is not None else 0.0
             with self.coarse.append_transaction():
                 # 去重后仅对新增图前向；任何失败均撤回本批粗筛追加。
                 accepted = self.coarse.add_results(ok_paths, payloads)
@@ -332,13 +378,22 @@ class HybridEngine:
                     return [], None
                 sub_ok = [ok_paths[i] for i in keep]
                 sub_ts = [tensors[i] for i in keep]
-                feats = ex._forward(sub_ts)         # noqa: SLF001 同模块协作
+                if sub_ts and isinstance(sub_ts[0], np.ndarray):
+                    feats = ex.forward_rgb(sub_ts)  # 批量 GPU 预处理 + 一次前向
+                    if tr is not None:
+                        lt = getattr(ex, "last_times", (0.0, 0.0, 0.0))
+                        tr.append(("batch", t_f0, lt[0], lt[-1], len(sub_ts)))
+                else:
+                    feats = ex._forward(sub_ts)     # noqa: SLF001 同模块协作
                 if feats is None or feats.ndim != 2 or len(feats) != len(keep):
                     raise RuntimeError("融合精排返回空结果或特征行数不匹配")
                 rows = feats.astype(np.float32)
                 norms = np.linalg.norm(rows, axis=1, keepdims=True)
                 norms[norms < 1e-8] = 1.0
                 rows /= norms
+                if tr is not None:
+                    tr.append(("fwd", t_f0, time.perf_counter() - t_f0, wait,
+                               len(sub_ok)))
                 return sub_ok, rows
 
         return ex.stream_decode(paths, prep=prep, progress=progress,
@@ -367,6 +422,8 @@ class HybridEngine:
         cache = getattr(self, "_prep_cache", None)
 
         def prep(path):
+            tr = getattr(self, "_trace", None)
+            t_start = time.perf_counter() if tr is not None else 0.0
             if cache is not None:
                 hit = cache.get(path)
                 if hit is not None:
@@ -383,6 +440,7 @@ class HybridEngine:
                         if md5 in seen:
                             return None, None
                 rgb = decode_rgb(data)
+                t_dec = time.perf_counter() if tr is not None else 0.0
                 if rgb is None:
                     return None, None
                 # A2：先统一降采样到 ≤2048 边长（重型图）再做后续所有处理，
@@ -397,21 +455,32 @@ class HybridEngine:
                         interpolation=cv2.INTER_AREA)
                 gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
                 binary, hu, fp = extract_binary_features(gray, cfg)
+                t_crs = time.perf_counter() if tr is not None else 0.0
                 if frame_sink is not None:
                     try:
                         frame_sink(path, binary, "coarse")
                     except Exception:  # noqa: BLE001 —— 可视化失败不影响任务
                         pass
                 try:
-                    if frame_sink is not None:
-                        quad = _center_quad_sample(rgb)
-                        try:
-                            frame_sink(path, quad, "fine")
-                        except Exception:  # noqa: BLE001
-                            pass
-                    tensor = ex.transform(Image.fromarray(rgb))
+                    batch_prep = (getattr(cfg, "prep", "cpu") == "torch"
+                                  and int(getattr(cfg, "prep_batch", 0)) > 0)
+                    if batch_prep:
+                        tensor = rgb          # 交给 on_batch 在 GPU 上批量预处理
+                    else:
+                        if frame_sink is not None:
+                            quad = _center_quad_sample(rgb)
+                            try:
+                                frame_sink(path, quad, "fine")
+                            except Exception:  # noqa: BLE001
+                                pass
+                        tensor = ex.prep(rgb)
                 except Exception:  # noqa: BLE001 —— 前向预处理失败仅丢该图
                     tensor = None
+                t_end = time.perf_counter() if tr is not None else 0.0
+                if tr is not None:
+                    tr.append((threading.get_ident(), t_start,
+                               t_dec - t_start, t_crs - t_dec, t_end - t_crs))
+                    self._trace_last_end = t_end
                 if tensor is None:
                     return None, None
                 rec = CoarseRecord(path=path, md5=md5, hu=hu, fp=fp)
@@ -556,8 +625,46 @@ class HybridEngine:
             if fine_paths and feats.shape[0] == 0:
                 raise RuntimeError("精排索引为空文件，请执行 build-fine 重建")
             self._fine_feats = feats
-        LOGGER.info("索引已加载：%d 张 <- %s.*（存储 %s）",
-                    self.coarse.size, prefix, self._storage)
+        if self._fine_feats is not None and bool(getattr(self.cfg, "fine_whiten", False)):
+            self._enable_whiten(prefix, self._fine_feats)
+        LOGGER.info("索引已加载：%d 张 <- %s.*（存储 %s%s）",
+                    self.coarse.size, prefix, self._storage,
+                    "，精排白化已启用" if self._whiten is not None else "")
+
+    def _enable_whiten(self, prefix: str, raw_feats) -> None:
+        """按需加载白化侧车；缺失时保持原始特征（行为不变）。
+
+        侧车 = <prefix>.whiten.npz（mu + W）+ <prefix>.fine_white.npy（已白化特征）。
+        为避免"半套侧车"导致查询与库特征不在同一空间，两个文件必须同时存在、
+        且白化特征行数与原特征一致；否则整体回退。
+        """
+        self._whiten = None
+        if not whiten.exists(prefix):
+            LOGGER.warning(
+                "已请求精排白化（fine_whiten=True），但缺少侧车 %s / %s；"
+                "本次使用原始特征。生成命令：python main.py whiten --prefix %s",
+                whiten.transform_path(prefix), whiten.whitened_path(prefix), prefix)
+            return
+        loaded = whiten.load(prefix)
+        if loaded is None:
+            LOGGER.warning("白化侧车读取失败，回退原始特征：%s",
+                           whiten.transform_path(prefix))
+            return
+        try:
+            wfeats = np.load(whiten.whitened_path(prefix), mmap_mode="r")
+        except Exception as exc:                       # noqa: BLE001
+            LOGGER.warning("白化特征读取失败（%s），回退原始特征", exc)
+            return
+        if wfeats.shape[0] != raw_feats.shape[0]:
+            LOGGER.warning("白化特征行数(%d)与原精排索引(%d)不一致，回退原始特征",
+                           wfeats.shape[0], raw_feats.shape[0])
+            return
+        self._fine_feats = wfeats
+        self._whiten = (loaded["mu"], loaded["w"], loaded["meta"])
+        LOGGER.info("精排白化已启用：%s（%s）",
+                    loaded["meta"].get("mode", "?"),
+                    f"{loaded['meta'].get('dims_in', '?')}→"
+                    f"{loaded['meta'].get('dims_out', '?')} 维")
 
     def _check_cfg_compat(self, stored: dict) -> None:
         """
@@ -565,9 +672,14 @@ class HybridEngine:
         融合权重等只影响查询排序的可调项允许不同（仅提示）。
         """
         fatal_keys = ("coarse_size", "coarse_blur", "use_hu", "use_fp",
-                      "invert_binary", "png_decoder")
+                      "invert_binary", "binarize_norm", "png_decoder", "prep")
         soft_keys = ("hu_weight", "fp_weight")
         problems = []
+        # 旧索引（binarize_norm 引入前）没有该键：按 "none" 处理，避免"缺键即不校验"
+        # 导致用 eq 打开旧索引、静默得到错位的粗筛距离。
+        stored = dict(stored or {})
+        stored.setdefault("binarize_norm", "none")
+        stored.setdefault("prep", "cpu")
         for k in fatal_keys:
             if k in stored and getattr(self.cfg, k, None) != stored[k]:
                 problems.append(f"{k}: 索引={stored[k]} 当前={getattr(self.cfg, k, None)}")
@@ -634,6 +746,12 @@ class HybridEngine:
                 out.coarse_only = True
             else:
                 qn = q / max(float(np.linalg.norm(q)), 1e-8)
+                if self._whiten is not None:
+                    # 库侧特征已白化（侧车），只需归一化；查询侧需先白化再归一化
+                    mu, w, _meta = self._whiten
+                    qn = whiten.l2norm_rows(
+                        whiten.apply(qn[None, :], mu, w)[0])
+                    rows = whiten.l2norm_rows(rows)
                 scores = rows @ qn
                 order = np.argsort(scores, kind="stable")[::-1][:top_k]
                 for rank, pos in enumerate(order, 1):

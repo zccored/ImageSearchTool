@@ -538,11 +538,23 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
             raise RuntimeError("瓦片增量顺序不一致（粗筛与精排错位），请联系排查")
         # 落盘：coarse(含 boxes) + fine(旧特征追加或新建) + meta
         st = engine.coarse.export_state()
+        side = getattr(engine, "_storage", "npz") == "sidecar"
         old_feats = engine._fine_feats
+        if (old_feats is not None and len(old_feats)
+                and getattr(engine, "_whiten", None) is not None):
+            # 白化空间下 _fine_feats 是白化后的行；直接拼会把"白化旧行 + 原始新行"
+            # 写成混合空间。改为读磁盘原始特征，并作废旧侧车（需重新 whiten）。
+            from . import whiten as _W
+            _raw = IndexFiles(prefix).load_fine(mmap=False, sidecar=side)
+            old_feats = np.array(_raw["features"], dtype=np.float32, copy=True)
+            engine.release_fine()        # 释放白化 mmap 后再删侧车
+            _W.remove(prefix)
+            engine._whiten = None
+            LOGGER.warning("瓦片增量前已删除白化侧车（新旧行会混空间）；"
+                           "完成后再运行 whiten 重新生成")
         if old_feats is not None and len(old_feats):
             feats_all = np.concatenate(
                 [np.asarray(old_feats, dtype=np.float32), feats_all], axis=0)
-        side = getattr(engine, "_storage", "npz") == "sidecar"
         # 解除 fine 的 mmap（含 LSH 缓存引用）：Windows 下被映射的 .npy
         # 无法被替换，必须先释放；feats_all 已是拼接后的新数组
         LOGGER.info("瓦片特征提取完成：%d 块", added)
@@ -941,7 +953,8 @@ def search_tiles_tiled(engine, q_path: str, top_k: int = 10,
     if not queries:
         return single()
     t0 = time.time()
-    scores = _exact_tile_scores(feats, np.stack(queries), ex.device == "cuda")
+    qstack = _whiten_query(engine, np.stack(queries))
+    scores = _exact_tile_scores(feats, qstack, ex.device == "cuda")
     times["全库分块余弦"] = time.time() - t0
     return _tile_outcome(engine, q_path, scores, top_k, times, started)
 
@@ -967,13 +980,32 @@ def _lsh_for(engine, feats, n_bits: int, n_tables: int) -> LshTables:
     return lsh
 
 
+def _whiten_query(engine, q):
+    """把查询特征映射到与索引相同的白化空间；无白化时原样返回。
+
+    索引侧在 `engine.open()` 时已把 `_fine_feats` 换成 `.fine_white.npy`，
+    查询侧若不做同样变换，就是"白化库 × 原始查询"的跨空间比较。
+    """
+    w = getattr(engine, "_whiten", None)
+    if w is None:
+        return q
+    from . import whiten as _W
+    arr = np.asarray(q, dtype=np.float32)
+    single = arr.ndim == 1
+    if single:
+        arr = arr.reshape(1, -1)
+    arr = _W.l2norm_rows(_W.apply(arr, w[0], w[1]))
+    return arr[0] if single else arr
+
+
 def _query_fine_feat(engine, q_path: str, times: dict) -> Optional[np.ndarray]:
     t0 = time.time()
     f = engine._query_fine(q_path) if hasattr(engine, "_query_fine") else None
     times.setdefault("查询图ResNet", 0.0)
     if f is not None:
         times["查询图ResNet"] += time.time() - t0
-    return f
+        return _whiten_query(engine, f)
+    return None
 
 
 def default_tiles_prefix(root: str) -> str:
@@ -990,18 +1022,21 @@ def merge_hybrid(out_full: Outcome, out_tiles: Outcome, query: str,
                  top_k: int) -> Outcome:
     """混合检索合并：同一原图在两套索引里各可能命中，按原图路径去重，
     相似度取两路较高值重新统计，命中类型标注 full/tile/both。"""
+    started = time.perf_counter()
     best: dict = {}
     for h in list(out_full.hits) + list(out_tiles.hits):
         fs = h.fine_score
-        if fs != fs:                     # NaN
-            fs = -1.0
-        prev = best.get(h.path)
+        if not np.isfinite(fs):
+            fs = -float("inf")
+        key = os.path.normcase(os.path.abspath(h.path))
+        prev = best.get(key)
+        kinds = ({"full", "tile"} if h.match_kind == "both" else {h.match_kind})
+        if prev is not None:
+            kinds |= prev["kinds"]
+            prev["kinds"] = kinds
         if prev is None or fs > prev["fine"]:
-            best[h.path] = {"fine": fs, "coarse": h.coarse_score,
-                            "box": h.box,
-                            "kind": ("both" if (prev is not None and
-                                                prev["kind"] != h.match_kind)
-                                     else h.match_kind)}
+            best[key] = {"fine": fs, "coarse": h.coarse_score,
+                         "box": h.box, "path": h.path, "kinds": kinds}
     out = Outcome(query=query,
                   db_size=max(out_full.db_size, out_tiles.db_size),
                   times={**out_full.times,
@@ -1009,13 +1044,20 @@ def merge_hybrid(out_full: Outcome, out_tiles: Outcome, query: str,
                   method="hybrid")
     ranked = sorted(best.items(), key=lambda kv: kv[1]["fine"],
                     reverse=True)[:top_k]
-    for rank, (path, v) in enumerate(ranked, 1):
-        out.hits.append(Hit(rank=rank, path=path,
-                            fine_score=v["fine"] if v["fine"] > 0 else
+    for rank, (_key, v) in enumerate(ranked, 1):
+        kind = "both" if {"full", "tile"} <= v["kinds"] else next(iter(v["kinds"]))
+        out.hits.append(Hit(rank=rank, path=v["path"],
+                            fine_score=v["fine"] if np.isfinite(v["fine"]) else
                             float("nan"),
                             coarse_score=v["coarse"],
                             d_hu=float("nan"), d_fp=float("nan"),
-                            box=v["box"], match_kind=v["kind"]))
+                            box=v["box"], match_kind=kind))
     out.coarse_kept = out_full.coarse_kept + out_tiles.coarse_kept
     out.self_excluded = out_full.self_excluded or out_tiles.self_excluded
+    out.coarse_only = not any(np.isfinite(h.fine_score) for h in out.hits)
+    out.times["整图·total"] = out_full.times.get("total", 0.0)
+    out.times["合并"] = time.perf_counter() - started
+    # 当前 CLI/服务顺序执行两路；这是查询阶段合计，不含索引加载/界面渲染。
+    out.times["total"] = (out.times["整图·total"]
+                          + out_tiles.times.get("total", 0.0) + out.times["合并"])
     return out

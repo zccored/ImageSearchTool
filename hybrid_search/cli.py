@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import re
@@ -65,11 +66,20 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--fp-weight", type=float, default=0.65, help="指纹融合权重")
     sp.add_argument("--invert-binary", action="store_true",
                     help="白像素过半时取反二值图")
+    sp.add_argument("--binarize-norm", choices=["none", "eq", "quantile"],
+                    default=None,
+                    help="二值化前的亮度/对比度归一化（不指定用 Config 默认，现为 none）；"
+                         "eq=直方图均衡（实测把调色/裁切漏筛降到 0%%）；"
+                         "改动会改变指纹，必须重建索引")
     sp.add_argument("--model", default="resnet18",
                     help="ResNet 型号：resnet18/34/50/101/152")
     sp.add_argument("--device", default="auto", help="auto / cuda / cpu")
     sp.add_argument("--no-fp16", action="store_true", help="GPU 上禁用 FP16")
     sp.add_argument("--batch", type=int, default=0, help="精排批大小（0=自动）")
+    sp.add_argument("--prep", choices=["cpu", "torch"], default=None,
+                    help="预处理实现：cpu=PIL；torch=同源 torch 算子（GPU/CPU 同一套数学）")
+    sp.add_argument("--prep-batch", type=int, default=None,
+                    help="GPU 批量预处理张数（0=逐张；建议 8~64，配合 --batch）")
     sp.add_argument("--no-store-fine", action="store_true",
                     help="不预构建 ResNet 全库索引（查询时对候选实时抽特征）")
     sp.add_argument("--no-dedup", action="store_true", help="不做 MD5 内容去重")
@@ -86,7 +96,7 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
     # ⚠️ 默认 None = **不覆盖** Config（见 _apply_feature_args）：
     # 各子命令的 argparse 默认值必须与 config.py 对齐，否则会出现
     # “build 写进 meta 的参数 ≠ stats/compact 读到的一致性基准” → 索引被拒绝打开。
-    sp.add_argument("--png-decoder", choices=["cv2", "imagecodecs", "pillow", "libdeflate"],
+    sp.add_argument("--png-decoder", choices=["cv2", "imagecodecs", "pillow", "libdeflate", "libdeflate_compat"],
                     default=None,
                     help="PNG 解码器（不指定时用 Config 默认值，现为 libdeflate）；"
                          "cv2=OpenCV/libpng；imagecodecs="
@@ -117,6 +127,9 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
                     help="额外支持的图片扩展名（可多次，如 .gif）")
     sp.add_argument("--coarse-k", type=int, default=300,
                     help="粗筛保留候选数")
+    sp.add_argument("--fine-whiten", action="store_true",
+                    help="检索时使用精排白化侧车（需先运行 whiten 生成；"
+                         "各向异性下可把 0.85 阈值带拉回可用区间）")
     sp.add_argument("--no-exclude-self", action="store_true",
                     help="不剔除“查询图自身”这个结果")
     sp.add_argument("--no-progress", action="store_true",
@@ -132,12 +145,20 @@ def _apply_feature_args(cfg: Config, a: argparse.Namespace) -> None:
     cfg.hu_weight = float(_val(a, "hu_weight", cfg.hu_weight))
     cfg.fp_weight = float(_val(a, "fp_weight", cfg.fp_weight))
     cfg.invert_binary = _flag(a, "invert_binary")
+    if _val(a, "binarize_norm", None):
+        cfg.binarize_norm = str(a.binarize_norm)
     cfg.model = _val(a, "model", cfg.model)
     cfg.device = _val(a, "device", cfg.device)
     cfg.fp16 = not _flag(a, "no_fp16")
     cfg.batch = int(_val(a, "batch", cfg.batch))
+    if _val(a, "prep", None) is not None:
+        cfg.prep = str(a.prep)
+    if _val(a, "prep_batch", None) is not None:
+        cfg.prep_batch = int(a.prep_batch)
     cfg.store_fine = not _flag(a, "no_store_fine")
     cfg.dedup = not _flag(a, "no_dedup")
+    if _flag(a, "fine_whiten", False):
+        cfg.fine_whiten = True
     cfg.workers = int(_val(a, "workers", cfg.workers))
     cfg.decode_workers = int(_val(a, "decode_workers", cfg.decode_workers))
     cfg.torch_threads = int(_val(a, "torch_threads", cfg.torch_threads))
@@ -221,6 +242,49 @@ def cmd_build_fine(cfg: Config, a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_whiten(cfg: Config, a: argparse.Namespace) -> int:
+    """为已有精排索引生成白化侧车（不重建索引、不改粗筛）。
+
+    产物：<prefix>.whiten.npz（mu + W）与 <prefix>.fine_white.npy（白化后特征）。
+    检索端加 --fine-whiten 即启用；删除侧车即回退。
+    """
+    import numpy as np
+
+    from . import whiten
+    from .store import IndexFiles
+
+    prefix = os.path.abspath(a.prefix)
+    files = IndexFiles(prefix)
+    if not files.meta_exists():
+        LOGGER.error("索引不存在：%s.*（先 build / build-fine）", prefix)
+        return 2
+    if whiten.exists(prefix) and not bool(_flag(a, "force", False)):
+        LOGGER.error("白化侧车已存在：%s（加 --force 覆盖）",
+                     whiten.transform_path(prefix))
+        return 3
+    storage = files.storage_of()
+    if not files.fine_exists(sidecar=storage == "sidecar"):
+        LOGGER.error("该索引没有精排特征（fine），无法白化；先 build-fine")
+        return 4
+
+    t0 = time.time()
+    fine = files.load_fine(mmap=True, sidecar=storage == "sidecar")
+    feats = np.asarray(fine["features"], dtype=np.float32)
+    n, d = feats.shape
+    mode = str(_val(a, "mode", "zca"))
+    dims = int(_val(a, "dims", 0) or 0)
+    LOGGER.info("拟合白化：%d × %d（mode=%s, dims=%s）", n, d, mode, dims or "全部")
+    fitted = whiten.fit_and_write(prefix, feats, mode=mode, dims=dims,
+                                  eps=float(_val(a, "eps", 1e-6)))
+    meta = fitted["meta"]
+    LOGGER.info("完成：%d → %d 维，用时 %.1f s；侧车 %s / %s",
+                meta["dims_in"], meta["dims_out"], time.time() - t0,
+                os.path.basename(whiten.transform_path(prefix)),
+                os.path.basename(whiten.whitened_path(prefix)))
+    LOGGER.info("启用：search --fine-whiten（或 Config.fine_whiten=True）")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # build-tiles / add-tiles：瓦片（局部）索引
 # ---------------------------------------------------------------------------
@@ -299,8 +363,21 @@ def cmd_search(cfg: Config, a: argparse.Namespace) -> int:
         eng_full.open(a.prefix)
         eng_t = HybridEngine(cfg)
         eng_t.open(tiles_prefix)
+        # 与 service 同一条守卫：两侧都真带白化才允许混合比较
+        if getattr(cfg, "fine_whiten", False) and (
+                getattr(eng_full, "_whiten", None) is None
+                or getattr(eng_t, "_whiten", None) is None):
+            LOGGER.warning("混合检索：白化侧车不完整（stale 或行数不符），两路统一回退原空间")
+            cfg = dataclasses.replace(cfg, fine_whiten=False)
+            eng_full = HybridEngine(cfg)
+            eng_full.open(a.prefix)
+            eng_t = HybridEngine(cfg)
+            eng_t.open(tiles_prefix)
         out_full = eng_full.search(a.query, coarse_k=a.coarse_k,
                                    top_k=a.top_k)
+        ex = getattr(eng_full, "_extractor", None)
+        if ex is not None:
+            eng_t._extractor = ex
         out_t = _search_tiles_mode(eng_t, a, tiles_prefix)
         out = merge_hybrid(out_full, out_t, a.query, top_k=a.top_k)
         _print_outcome(out)
@@ -665,6 +742,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_prefix(sp)
     _add_feature_args(sp)
     sp.set_defaults(func=cmd_build_fine)
+
+    # ---- whiten（精排白化侧车）
+    sp = sub.add_parser("whiten",
+                        help="为已有精排索引生成白化侧车（ZCA/PCA，免重建、可回退）")
+    _add_prefix(sp)
+    sp.add_argument("--mode", choices=["zca", "pca"], default="zca",
+                    help="zca=完整白化（维度不变）；pca=白化+降维")
+    sp.add_argument("--dims", type=int, default=0,
+                    help="pca 模式的目标维度（0=全部）")
+    sp.add_argument("--eps", type=float, default=1e-6,
+                    help="协方差特征值下限（防止除零）")
+    sp.add_argument("--force", action="store_true",
+                    help="覆盖已存在的白化侧车")
+    sp.set_defaults(func=cmd_whiten)
 
     # ---- build-tiles（瓦片局部索引）
     sp = sub.add_parser("build-tiles",

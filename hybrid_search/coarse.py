@@ -126,6 +126,19 @@ def _to_binary(gray: np.ndarray, cfg: Config) -> np.ndarray:
     blurred = cv2.GaussianBlur(gray, (k, k), 0) if k > 1 else gray
     size = cfg.coarse_size
     resized = cv2.resize(blurred, (size, size), interpolation=cv2.INTER_AREA)
+    # 二值化前的亮度/对比度归一化（opt-in）：
+    # 逐图 OTSU 的阈值随整体亮度漂移，同一构图在“调色/曝光”后二值模式会错位。
+    # 在 64×64 灰度上做一次线性归一，成本可忽略，且不改变方差化流程的其余部分。
+    norm = str(getattr(cfg, "binarize_norm", "none") or "none").lower()
+    if norm == "eq":
+        resized = cv2.equalizeHist(resized)
+    elif norm == "quantile":
+        lo, hi = np.percentile(resized, (2.0, 98.0))
+        if hi > lo + 1e-6:
+            resized = np.clip((resized.astype(np.float32) - lo) * (255.0 / (hi - lo)),
+                              0, 255).astype(np.uint8)
+    elif norm not in ("none", "", "off"):
+        raise ValueError(f"未知 binarize_norm: {norm}")
     _, binary = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if cfg.invert_binary and np.count_nonzero(binary > 127) > binary.size // 2:
         binary = 255 - binary  # 白多则取反，弱化前景/背景极性差异

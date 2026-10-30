@@ -33,6 +33,18 @@ class Config:
     coarse_size: int = 64
     # 高斯模糊核大小（奇数），用于降噪
     coarse_blur: int = 5
+    # 二值化前的亮度/对比度归一化（opt-in，默认关闭）：
+    #   "none"     保持原行为（逐图直接 OTSU）
+    #   "eq"       直方图均衡（全局对比度归一）
+    #   "quantile" 2%/98% 分位拉伸（对整体亮度/曝光偏移最鲁棒，推荐）
+    # 目的：让同一构图在“调色/曝光”后得到相近的二值模式，降低调色类漏筛。
+    binarize_norm: str = "none"
+    # 预处理实现：cpu=torch CPU 插值，gpu=GPU 插值；两者特征必须同源，故写入 meta 并以 fatal 校验
+    prep: str = "cpu"
+    prep_lane: str = "cpu"
+    # >0 时解码线程只交原始 RGB，由 GPU 侧单线程批量做 resize/crop（消除线程争抢）
+    prep_batch: int = 8
+    prep_px_budget_mp: float = 40.0
     # 是否启用轮廓 Hu 矩（7 维，旋转/缩放不变形状特征）
     use_hu: bool = True
     # 是否启用二值图像指纹（展平位图，汉明距离）
@@ -77,6 +89,14 @@ class Config:
     # 是否预构建全库 ResNet 特征索引（True：检索最快；
     # False：每次查询只对粗筛候选实时抽特征，省内存但每查必算）
     store_fine: bool = True
+    # 精排白化（ZCA / PCA）：针对 ImageNet 预训练特征的各向异性，
+    # 把“无关图天然 0.70”的分数基线拉回 0、收窄阈值噪声带。
+    # 需先运行 `python main.py whiten --prefix <prefix>` 生成侧车；
+    # 侧车缺失时自动回退原始特征（行为与未启用完全一致）。
+    fine_whiten: bool = False
+    fine_whiten_mode: str = "zca"      # zca | pca
+    fine_whiten_dims: int = 0          # pca 模式目标维度（0=全部）
+    fine_whiten_eps: float = 1e-6
     # 按文件 MD5 去重（同一张图重复出现只索引一次）
     dedup: bool = True
     # 解码前按内容 md5 预过滤重复副本（True=推荐）：同内容文件只处理第一张，

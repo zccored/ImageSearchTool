@@ -49,12 +49,14 @@ tkinter 界面（`gui.py`）、Web 界面（`gui_web.py` + `frontend/`）与无 
 from __future__ import annotations
 
 import logging
+import json
 import os
 import subprocess
 import sys
 import threading
 import time
 import traceback
+import dataclasses
 from collections import Counter
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -72,7 +74,7 @@ __all__ = [
     "EVENT_PERF_REPORT", "EVENT_TASK_DONE", "EVENT_TASK_ERROR",
     "PHASE_LABELS", "PHASE_SAVE", "PHASE_DONE", "SEARCH_MODES",
     "OP_SCAN", "OP_BUILD", "OP_ADD", "OP_TILES", "OP_COMPACT", "OP_SEARCH",
-    "OP_DEDUP_SCAN", "OP_DEDUP_APPLY", "OP_HANDOFF", "OP_STATS",
+    "OP_WHITEN", "OP_DEDUP_SCAN", "OP_DEDUP_APPLY", "OP_HANDOFF", "OP_STATS",
     "HIT_FIELDS", "config_schema", "cli_hint", "cli_command",
 ]
 
@@ -113,7 +115,6 @@ PHASE_LABELS = {
 
 # 检索模式（与 `cli.py --mode`、界面单选框一致）
 SEARCH_MODES = ("full", "tiles", "hybrid")
-HYBRID_TOP_K = 20            # 混合检索固定返回条数（界面/CLI 同口径）
 
 # 任务 op（task_done / task_error 里回传，界面据此分发）
 OP_SCAN = "scan"
@@ -122,6 +123,7 @@ OP_ADD = "add"
 OP_TILES = "tiles"
 OP_COMPACT = "compact"
 OP_SEARCH = "search"
+OP_WHITEN = "whiten"
 OP_DEDUP_SCAN = "dedup_scan"
 OP_DEDUP_APPLY = "dedup_apply"
 OP_HANDOFF = "handoff"
@@ -132,7 +134,7 @@ HIT_FIELDS = ("rank", "path", "fine_score", "coarse_score", "d_fp",
               "box", "match_kind")
 
 # 任务出错时的弹窗标题（其余任务由界面用“操作失败”）
-TASK_TITLES = {OP_HANDOFF: "自动交接"}
+TASK_TITLES = {OP_HANDOFF: "自动交接", OP_WHITEN: "生成白化侧车"}
 
 # ---------------------------------------------------------------------------
 # 参数 schema（参数页 / 等价 CLI 提示的唯一来源）
@@ -165,6 +167,10 @@ PARAM_FIELDS: Tuple[Dict, ...] = (
      "page": "build", "group": "二值粗筛", "cli": "--no-fp"},
     {"key": "invert_binary", "label": "白像素过半时取反(白底图库)", "kind": "bool",
      "page": "build", "group": "二值粗筛", "cli": "--invert-binary"},
+    {"key": "binarize_norm", "label": "二值化前归一化", "kind": "choice",
+     "page": "build", "group": "二值粗筛",
+     "choices": ["none", "eq", "quantile"], "cli": "--binarize-norm",
+     "tip": "改动会改变指纹，必须重建索引；与建库不一致会被拒绝打开（界面会自动同步 meta）"},
     # ---- 建库：ResNet 精排 --------------------------------------------------
     {"key": "model", "label": "模型", "kind": "choice",
      "page": "build", "group": "ResNet 精排",
@@ -176,13 +182,21 @@ PARAM_FIELDS: Tuple[Dict, ...] = (
     {"key": "batch", "label": "批大小(0=自动)", "kind": "int",
      "page": "build", "group": "ResNet 精排", "min": 0, "max": 512,
      "cli": "--batch", "tip": "实测 CUDA 自动值 256 最优；瓦片不跟随本项"},
+    {"key": "prep", "label": "预处理实现(cpu=PIL/torch=同源)", "kind": "choice",
+     "page": "build", "group": "ResNet 精排", "choices": ["cpu", "torch"],
+     "cli": "--prep",
+     "tip": "torch=CPU/GPU 共用同一套 resize/crop（同源，GPU 更快）；\n"
+            "与建库不一致会被拒绝打开（界面会自动同步 meta）"},
+    {"key": "prep_batch", "label": "GPU 批量预处理张数(0=逐张)", "kind": "int",
+     "page": "build", "group": "ResNet 精排", "min": 0, "max": 128,
+     "cli": "--prep-batch", "tip": ">0 时解码线程只交 RGB，由单线程在 GPU 上批量预处理"},
     {"key": "fp16", "label": "GPU 半精度 FP16", "kind": "bool",
      "page": "build", "group": "ResNet 精排", "cli": "--no-fp16"},
     {"key": "store_fine", "label": "预构建 ResNet 全库索引(快/占内存)", "kind": "bool",
      "page": "build", "group": "ResNet 精排", "cli": "--no-store-fine"},
     {"key": "png_decoder", "label": "PNG 解码器(旁路)", "kind": "choice",
      "page": "build", "group": "ResNet 精排",
-     "choices": ["libdeflate", "cv2", "imagecodecs", "pillow"],
+     "choices": ["libdeflate", "libdeflate_compat", "cv2", "imagecodecs", "pillow"],
      "cli": "--png-decoder",
      "tip": "在硬校验名单里：与建库时不一致会拒绝打开索引"},
     {"key": "prep_cache", "label": "启用预处理缓存(重复建库更快/占磁盘)", "kind": "bool",
@@ -264,6 +278,9 @@ PARAM_FIELDS: Tuple[Dict, ...] = (
      "cli": "--top-k"},
     {"key": "exclude_self", "label": "剔除查询图自身", "kind": "bool",
      "page": "search", "group": "检索流程", "cli": "--no-exclude-self"},
+    {"key": "fine_whiten", "label": "检索时使用精排白化", "kind": "bool",
+     "page": "search", "group": "检索流程", "cli": "--fine-whiten",
+     "tip": "需先生成白化侧车（工具→生成白化侧车）；缺失时自动回退原空间"},
     # ---- 界面/命令参数（不是 Config 字段）-----------------------------------
     {"key": "prefix", "label": "索引前缀(留空=自动放图库内)", "kind": "text",
      "page": "search", "group": "索引位置", "cli": "--prefix", "ui": True,
@@ -386,6 +403,7 @@ CLI_TEMPLATES = {
     "eval": "python main.py eval <查询目录>",
     "stats": "python main.py stats",
     "compact": "python main.py compact",
+    "whiten": "python main.py whiten --prefix <索引前缀>",
     "ingest": "python main.py ingest <交接文件>",
 }
 
@@ -820,13 +838,72 @@ class SearchService:
         return (prefix, cfg.model, cfg.device, bool(cfg.fp16), cfg.coarse_size,
                 cfg.coarse_blur, bool(cfg.use_hu), bool(cfg.use_fp),
                 bool(cfg.invert_binary), getattr(cfg, "png_decoder", "cv2"),
-                float(cfg.hu_weight), float(cfg.fp_weight))
+                float(cfg.hu_weight), float(cfg.fp_weight),
+                bool(getattr(cfg, "fine_whiten", False)),
+                getattr(cfg, "prep", "cpu"))
+
+    # 与 engine._check_cfg_compat 的 fatal_keys 保持一致
+    _FATAL_KEYS = ("coarse_size", "coarse_blur", "use_hu", "use_fp",
+                   "invert_binary", "binarize_norm", "png_decoder", "prep")
+
+    @classmethod
+    def _sync_fatal(cls, cfg: Config, prefix: str) -> Config:
+        """按索引 meta 对齐**全部**硬校验参数。
+
+        只用于“打开/追加已有索引”的路径；`build` 全量重建时以界面选择为准，
+        不能反过来被旧 meta 覆盖（否则改 binarize_norm 后重建永远改不动）。
+        """
+        try:
+            with open(prefix + ".meta.json", "r", encoding="utf-8") as fh:
+                stored = dict(json.load(fh).get("cfg") or {})
+        except Exception:                                     # noqa: BLE001
+            return cfg
+        # 与 engine 同口径：旧索引缺 binarize_norm 视为 "none"
+        stored.setdefault("binarize_norm", "none")
+        stored.setdefault("prep", "cpu")
+        diff = {k: stored[k] for k in cls._FATAL_KEYS
+                if k in stored and getattr(cfg, k, None) != stored[k]}
+        if diff:
+            LOGGER.warning("索引参数与界面不一致，已自动对齐：%s", diff)
+            return dataclasses.replace(cfg, **diff)
+        return cfg
+
+    @staticmethod
+    def _sync_binarize_norm(cfg: Config, prefix: str) -> Config:
+        """兼容旧名：等价于 `_sync_fatal`（含 binarize_norm）。"""
+        return SearchService._sync_fatal(cfg, prefix)
+
+    @staticmethod
+    def _has_whiten(prefix: str) -> bool:
+        try:
+            from . import whiten as W
+            return bool(W.exists(prefix))
+        except Exception:                                     # noqa: BLE001
+            return False
+
+    def _hybrid_whiten_guard(self, cfg: Config, prefix: str,
+                             tiles_prefix: str) -> Config:
+        """混合检索的白化空间守卫：两侧都有侧车才开白化，否则统一回退原空间。
+
+        整图已白化、瓦片未白化时，两路 fine_score 不在同一空间，直接比较会系统性
+        偏向某一侧；这里宁可两路都退回原空间，也不做跨空间比较。
+        """
+        if not getattr(cfg, "fine_whiten", False):
+            return cfg
+        a = self._has_whiten(prefix)
+        b = self._has_whiten(tiles_prefix)
+        if a and b:
+            return cfg
+        LOGGER.warning("混合检索：白化侧车不完整（整图=%s 瓦片=%s），"
+                       "本次两路统一回退原空间", a, b)
+        return dataclasses.replace(cfg, fine_whiten=False)
 
     def engine_for(self, cfg: Optional[Config] = None,
                    prefix: Optional[str] = None):
         """返回 (引擎, 是否命中缓存)；未命中时加载索引（慢，见 open()）。"""
         cfg = cfg or self.cfg
         prefix = prefix or self.current_prefix()
+        cfg = self._sync_binarize_norm(cfg, prefix)
         sig = self.engine_signature(cfg, prefix)
         with self._eng_lock:
             hit = self._eng_cache.get(prefix)
@@ -984,6 +1061,9 @@ class SearchService:
                    cfg, perf, title, perf_meta) -> Optional[Dict]:
         cfg = cfg or self.cfg
         prefix = prefix or self.current_prefix()
+        if action == "add":
+            # 增量入库必须贴合已有索引；build 全量重建以界面选择为准
+            cfg = self._sync_fatal(cfg, prefix)
         title = title or ("新建索引" if action == "build" else "增量入库")
 
         def job() -> Dict:
@@ -1038,6 +1118,7 @@ class SearchService:
         """
         cfg = cfg or self.cfg
         tp = tiles_prefix or self.tiles_prefix(self.current_prefix())
+        cfg = self._sync_fatal(cfg, tp)
         exists = self.meta_exists(tp) if exists is None else bool(exists)
         title = title or ("子图索引增量" if exists else "子图索引构建")
 
@@ -1141,11 +1222,42 @@ class SearchService:
     # ==================================================================
     # 检索（三种模式 + 混合合并）
     # ==================================================================
+    def whiten(self, task_id: str, prefix: Optional[str] = None, *,
+               mode: str = "zca", dims: int = 0, force: bool = False,
+               cfg: Optional[Config] = None):
+        """为已有精排索引生成白化侧车（不重建索引、不改粗筛）。
+
+        产物：`<prefix>.whiten.npz`（mu+W）与 `<prefix>.fine_white.npy`；
+        检索端把 `fine_whiten=True` 打开即启用，删除侧车即回退。
+        """
+        prefix = os.path.abspath(prefix or self.current_prefix())
+
+        def job():
+            import numpy as np
+
+            from . import whiten as W
+            files = IndexFiles(prefix)
+            if not files.meta_exists():
+                raise RuntimeError(f"索引不存在：{prefix}.*（先 build）")
+            if W.exists(prefix) and not force:
+                raise RuntimeError("白化侧车已存在（force=True 覆盖）")
+            storage = files.storage_of()
+            if not files.fine_exists(sidecar=storage == "sidecar"):
+                raise RuntimeError("该索引没有精排特征（fine），先 build-fine")
+            fine = files.load_fine(mmap=True, sidecar=storage == "sidecar")
+            feats = np.asarray(fine["features"], dtype=np.float32)
+            fitted = W.fit_and_write(prefix, feats, mode=mode, dims=dims, eps=1e-6)
+            # 侧车已变化：丢弃缓存的引擎，下一次检索才会重新加载白化
+            self.release_engines("白化侧车已生成", silent=True)
+            return fitted.get("meta") if isinstance(fitted, dict) else fitted
+
+        return self._run(task_id, OP_WHITEN, job, "白化侧车生成失败：")
+
     def search(self, task_id: str, query: str, mode: str = "full", *,
                prefix: Optional[str] = None, cfg: Optional[Config] = None,
                coarse_k: Optional[int] = None, top_k: Optional[int] = None,
                perf: bool = False, title: str = "") -> Optional[Dict]:
-        """以图搜图：full（整图）/ tiles（瓦片）/ hybrid（两路合并，固定 Top-20）。
+        """以图搜图：full / tiles / hybrid 均遵循 top_k，未指定时用 Config。
 
         返回 {hits, db, kept, coarse_only, self_excluded, times, method, perf}；
         `hits` 是元组列表，字段顺序见 `HIT_FIELDS`（界面网格按同一下标渲染）。
@@ -1184,11 +1296,22 @@ class SearchService:
                     out = TI.search_tiles_tiled(eng, query, top_k=top_k,
                                                 coarse_k=coarse_k)
                 elif mode == "hybrid":
-                    # 两路各取 HYBRID_TOP_K 再合并（同一原图去重取高分）
+                    # 两路各取 top_k 再合并（同一原图去重取高分）
                     tp = TI.tiles_prefix_of(prefix)
+                    cfg = self._hybrid_whiten_guard(cfg, prefix, tp)
                     t0 = time.time()
                     eng_full, c1 = self.engine_for(cfg, prefix)
                     eng_t, c2 = self.engine_for(cfg, tp)
+                    # 守卫的第二道：文件存在≠能生效（行数不符/stale 时 engine 会静默回退），
+                    # 必须按实际打开的引擎是否真的带白化来判定，避免跨空间比较。
+                    if getattr(cfg, "fine_whiten", False) and (
+                            getattr(eng_full, "_whiten", None) is None
+                            or getattr(eng_t, "_whiten", None) is None):
+                        LOGGER.warning("混合检索：白化侧车未能生效（stale 或行数不符），"
+                                       "两路统一回退原空间")
+                        cfg = dataclasses.replace(cfg, fine_whiten=False)
+                        eng_full, c1 = self.engine_for(cfg, prefix)
+                        eng_t, c2 = self.engine_for(cfg, tp)
                     # 共享特征提取器（同 cfg 模型），避免重复加载模型
                     ex = getattr(eng_full, "_extractor", None)
                     if ex is not None:
@@ -1198,12 +1321,16 @@ class SearchService:
                                   耗时=round(time.time() - t0, 3))
                         prof.mark("整图检索")
                     o_full = eng_full.search(query, coarse_k=coarse_k,
-                                             top_k=HYBRID_TOP_K)
+                                             top_k=top_k)
+                    # 冷查询直到上一步才初始化模型；在此复用，避免瓦片路再加载一份。
+                    ex = getattr(eng_full, "_extractor", None)
+                    if ex is not None:
+                        eng_t._extractor = ex
                     if prof:
                         prof.mark("瓦片检索")
-                    o_t = TI.search_tiles_tiled(eng_t, query, top_k=HYBRID_TOP_K,
+                    o_t = TI.search_tiles_tiled(eng_t, query, top_k=top_k,
                                                 coarse_k=coarse_k)
-                    out = TI.merge_hybrid(o_full, o_t, query, top_k=HYBRID_TOP_K)
+                    out = TI.merge_hybrid(o_full, o_t, query, top_k=top_k)
                 else:
                     raise ValueError(f"未知检索模式：{mode}"
                                      f"（可选 {'/'.join(SEARCH_MODES)}）")

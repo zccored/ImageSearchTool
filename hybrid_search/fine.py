@@ -175,7 +175,7 @@ def set_prep_cache(cache) -> None:
     _PREP_CACHE = cache
 
 
-def _prepare_one(path: str, transform, frame_sink=None) -> Optional:
+def _prepare_one(path: str, transform, frame_sink=None, prep_fn=None) -> Optional:
     """
     单个工作项：单次读盘 -> 快速解码 RGB -> torchvision 预处理 -> CPU 张量。
     frame_sink(path, quad16x16x3)：可选可视化回调（解码 worker 线程内调用，
@@ -206,6 +206,8 @@ def _prepare_one(path: str, transform, frame_sink=None) -> Optional:
                           max(1, int(rgb.shape[0] * scale))),
                          interpolation=cv2.INTER_AREA)
     try:
+        if prep_fn is not None:
+            return prep_fn(rgb)
         return transform(Image.fromarray(rgb))
     except Exception:  # noqa: BLE001 —— 个别格式怪异，交给调用方跳过
         return None
@@ -304,6 +306,37 @@ class ResNetExtractor:
         return prep_cv2(rgb, self._mean, self._std)
 
     # ------------------------------------------------------------------
+    def prep(self, rgb):
+        """按 cfg.prep 选择预处理实现：cpu=PIL（旧路径），torch=同源算子。"""
+        mode = getattr(self.cfg, "prep", "cpu")
+        if mode == "torch":
+            from .prep_torch import transform_torch
+            return transform_torch(rgb, getattr(self.cfg, "prep_lane", "cpu"))
+        return self.transform(Image.fromarray(rgb))
+
+    def forward_rgb(self, rgbs):
+        """单线程批量预处理：uint8 HWC 列表 → GPU resize/crop → 一次前向。
+
+        与 `_prepare_one` 不同，这里的 resize/crop 只在 GPU 上由一个线程发起，
+        避免 20 个解码线程各自 H2D/插值造成的串行化与往返开销。
+        """
+        from .prep_torch import transform_to_device
+        import torch
+        import time as _t
+        t0 = _t.perf_counter()
+        tensors = [transform_to_device(rgb, self.device) for rgb in rgbs]
+        t1 = _t.perf_counter()
+        # 预分配一个批次缓冲，逐张 copy_（stack 256 个 GPU 张量约 52ms，拷贝约 6ms）
+        dev = tensors[0].device if tensors else self.device
+        batched = torch.empty((len(tensors), 3, 224, 224), device=dev,
+                              dtype=torch.float32)
+        for i, t in enumerate(tensors):
+            batched[i].copy_(t)
+        t2 = _t.perf_counter()
+        out = self._forward([batched])
+        self.last_times = (t1 - t0, t2 - t1, _t.perf_counter() - t2)
+        return out
+
     def _forward(self, tensors) -> Optional[np.ndarray]:
         """一组 CPU 张量 -> 归一化前特征矩阵（单次前向，autocast 可选）。
 
@@ -314,7 +347,11 @@ class ResNetExtractor:
         import torch
         try:
             with torch.no_grad():
-                batch_t = torch.stack(tensors, dim=0).to(self.device)
+                if (len(tensors) == 1 and torch.is_tensor(tensors[0])
+                        and tensors[0].dim() == 4):
+                    batch_t = tensors[0].to(self.device)
+                else:
+                    batch_t = torch.stack(tensors, dim=0).to(self.device)
                 if batch_t.dtype == torch.uint8:
                     if self._tile_scale_lut is None:
                         raise ValueError("uint8 瓦片输入需要 CUDA 归一化路径")
@@ -334,7 +371,7 @@ class ResNetExtractor:
 
     def extract_one(self, path: str) -> Optional[np.ndarray]:
         """单张同步抽取（查询图常用）：不经流水线，延迟最低。"""
-        t = _prepare_one(path, self.transform)
+        t = _prepare_one(path, self.transform, prep_fn=self.prep)
         if t is None:
             return None
         feats = self._forward([t])
@@ -362,7 +399,7 @@ class ResNetExtractor:
 
         if prep is None:
             def prep(p):
-                t = _prepare_one(p, self.transform)
+                t = _prepare_one(p, self.transform, prep_fn=self.prep)
                 return t, None
         if on_batch is None:
             def on_batch(ok, tensors, _payloads):
@@ -386,6 +423,7 @@ class ResNetExtractor:
             task_q: "queue.Queue" = queue.Queue()
             results: List = [None] * n
             stop = threading.Event()
+            cond = threading.Condition()
 
             def worker():
                 while not stop.is_set():
@@ -401,6 +439,8 @@ class ResNetExtractor:
                         LOGGER.debug("解码失败 %s: %r", path, e)
                         r = (None, None)
                     results[idx] = r
+                    with cond:
+                        cond.notify_all()
                     task_q.task_done()
 
             threads = [threading.Thread(target=worker, daemon=True)
@@ -408,20 +448,36 @@ class ResNetExtractor:
             for t in threads:
                 t.start()
             try:
-                for start in range(0, n, self.batch):
-                    chunk = paths[start:start + self.batch]
-                    for i, p in enumerate(chunk):
-                        task_q.put((start + i, p))
-                    task_q.join()
+                # 滑动窗口：始终提前投递 batch + 2×workers 个任务；
+                # 批内最后一张完成即可发批，此时其余解码线程已在处理下一批，
+                # 从而消除旧实现 task_q.join() 的“批尾等最长一张”气泡。
+                batch = max(1, int(self.batch))
+                inflight = batch + max(1, int(self.decode_workers)) * 2
+                nxt = 0
+                start = 0
+                while start < n:
+                    end = min(n, start + batch)
+                    with cond:
+                        while nxt < n and (nxt - start) < inflight:
+                            task_q.put((nxt, paths[nxt]))
+                            nxt += 1
+                        while any(results[i] is None for i in range(start, end)):
+                            cond.wait(0.5)
+                            if not any(t.is_alive() for t in threads):
+                                break
                     ok, tensors, payloads = [], [], []
-                    for i, p in enumerate(chunk):
-                        t, pl = results[start + i]
-                        results[start + i] = None
+                    for i in range(start, end):
+                        r = results[i]
+                        results[i] = None
+                        if r is None:
+                            continue
+                        t, pl = r
                         if t is not None:
-                            ok.append(p)
+                            ok.append(paths[i])
                             tensors.append(t)
                             payloads.append(pl)
-                    prep_q.put((start, len(chunk), ok, tensors, payloads))
+                    prep_q.put((start, end - start, ok, tensors, payloads))
+                    start = end
                 prep_q.put(None)
             except Exception as e:  # noqa: BLE001
                 prep_q.put(("ERR", e))
@@ -511,7 +567,7 @@ class ResNetExtractor:
                         continue
                     try:
                         results[idx] = _prepare_one(path, self.transform,
-                                                    frame_sink)
+                                                    frame_sink, prep_fn=self.prep)
                     except Exception as e:  # noqa: BLE001
                         LOGGER.debug("解码失败 %s: %r", path, e)
                         results[idx] = None

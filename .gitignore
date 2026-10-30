@@ -240,3 +240,10 @@ frontend/dist/
 # 本地会话边界文件与旧分支快照（含本机路径 / 非源码），不入库
 AGENTS.md
 branch/
+
+# ---- local-only artifacts (added 2026-10-31) ----
+backups/
+docs/paper/results/
+docs/paper/*.py
+docs/_qbot_query*.txt
+docs/QBOT_*.md

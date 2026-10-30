@@ -373,7 +373,7 @@ python gui.py   :: bash启动
 python main.py build-tiles "<图库根目录>" --prefix "<图库根目录>\.gallery_index\gallery_tiles"
 python main.py add-tiles   "<图库根目录>" --prefix "<图库根目录>\.gallery_index\gallery_tiles"
 
-:: 检索：tiles=只搜瓦片；hybrid=整图+瓦片并搜（按原图去重、取两路较高分，返回 ≤20 条）
+:: 检索：tiles=只搜瓦片；hybrid=整图+瓦片合并（按原图去重、取两路较高分，返回条数遵循 top_k）
 python main.py search "局部截图.png" --mode tiles  --tiles-prefix "<图库根目录>\.gallery_index\gallery_tiles"
 python main.py search "局部截图.png" --mode hybrid --prefix "<图库根目录>\.gallery_index\gallery"
 ```

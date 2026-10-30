@@ -43,8 +43,8 @@ async function doSearch() {
   if (!state.query) return;
   if (state.mode === 'hybrid' && !hybridWarned.value) {
     hybridWarned.value = true;
-    // 混合模式：两套索引并行打分，耗时约为单套 2 倍（与 tkinter 版同一提示口径）
-    console.info('混合检索将同时载入整图与瓦片两套索引，耗时约为单套的 2 倍');
+    // 两路顺序检索，共享模型；耗时取决于各自索引规模。
+    console.info('混合检索载入两套索引并共享模型，返回条数遵循当前设置');
   }
   await cmd.search(state.query, state.mode, coarseK.value, topK.value, props.perfSearch);
 }
@@ -101,9 +101,9 @@ async function exportSheet() {
     </div>
     <div class="row">
       <label class="lab">{{ t('search.mode', '检索模式') }}</label>
-      <label class="chk"><input type="radio" value="full" v-model="state.mode" />整图索引 (Top≤10)</label>
+      <label class="chk"><input type="radio" value="full" v-model="state.mode" />整图索引</label>
       <label class="chk"><input type="radio" value="tiles" v-model="state.mode" />局部索引·瓦片</label>
-      <label class="chk"><input type="radio" value="hybrid" v-model="state.mode" />混合·两者都搜 (Top≤20)</label>
+      <label class="chk"><input type="radio" value="hybrid" v-model="state.mode" />混合·两者都搜</label>
       <label class="lab">{{ t('search.coarse_k', '粗筛候选') }}</label>
       <input class="num" type="number" min="10" v-model.number="coarseK" placeholder="默认" />
       <label class="lab">{{ t('search.top_k', '返回条数') }}</label>

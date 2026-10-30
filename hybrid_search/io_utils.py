@@ -533,11 +533,17 @@ def set_png_decoder(mode: str, silence_noise: Optional[bool] = None) -> None:
                     实测 inflate 1526 MB/s vs cv2 全解码 365 MB/s（docs/perf-plan.md 第五节）；
                     只覆盖 8bit 非交错 RGB/RGBA，其余自动回退 cv2；缺少原生模块或
                     libdeflate.dll 时也回退（见 hybrid_search/png_fast.py）
+      "libdeflate_compat"
+                    半旁路：libdeflate 只解 inflate，再把扫描线以 stored-deflate
+                    重封装交还 cv2（libpng 做反滤波/色彩）。覆盖**全部 PNG 格式**，
+                    输出与 cv2 逐位一致；覆盖率实测 99.4%（vs 全旁路 87.3%），
+                    但只省 inflate，收益小于全旁路。
 
     silence_noise：是否同时屏蔽 libpng 的 iCCP/cHRM stderr 噪音（不影响解码结果）。
     """
     global _PNG_DECODER
-    if mode in ("cv2", "pillow", "imagecodecs", "libdeflate"):
+    if mode in ("cv2", "pillow", "imagecodecs", "libdeflate",
+                "libdeflate_compat"):
         _PNG_DECODER = mode
     if silence_noise is None:
         silence_noise = _PNG_DECODER == "cv2"    # cv2/libpng 才有噪音
@@ -674,6 +680,54 @@ def _decode_png_libdeflate(data: bytes, gray: bool,
     return png_fast.decode_rgb(data)
 
 
+def _decode_png_libdeflate_compat(data: bytes, gray: bool,
+                                  probe: Tuple[str, Tuple[int, int], int]
+                                  ) -> Optional[np.ndarray]:
+    """PNG -> libdeflate 只解 inflate，再用 stored-deflate 重封装交回 cv2（半旁路）。
+
+    与全旁路的区别：反滤波与色彩转换仍由 libpng 完成，因此**覆盖全部 PNG 格式**
+    （调色板/16bit/灰度/隔行），且输出与 cv2 天然逐位一致（扫描线字节未变）。
+    代价是多一次"解出字节 → stored 重压"的拷贝与 CRC。
+
+    灰度路径同样交给 cv2（理由见 `_decode_png_libdeflate`）。
+    """
+    if gray:
+        return None
+    w, h, orient = probe[1][0], probe[1][1], probe[2]
+    if orient != 1:
+        return None
+    try:
+        from . import png_fast
+    except Exception as e:                          # noqa: BLE001
+        LOGGER.debug("png_fast 不可用（回退 cv2）: %r", e)
+        return None
+    if not png_fast.has_libdeflate():
+        return None
+    try:
+        if w * h > _BIG_IMAGE_PX:
+            _big_decode_enter()
+            try:
+                packed = png_fast.compat_rgb(data)
+            finally:
+                _big_decode_exit()
+        else:
+            packed = png_fast.compat_rgb(data)
+    except Exception as e:                          # noqa: BLE001
+        LOGGER.debug("兼容旁路异常（回退 cv2）: %r", e)
+        return None
+    if packed is None:
+        return None
+    try:
+        flag, swap = _flag_maybe_rgb(cv2.IMREAD_COLOR, gray)
+        img = cv2.imdecode(np.frombuffer(packed, np.uint8), flag)
+        if img is None:
+            return None
+        return img[..., ::-1].copy() if swap else img
+    except Exception as e:                          # noqa: BLE001
+        LOGGER.debug("兼容旁路 cv2 解码失败（回退）: %r", e)
+        return None
+
+
 def decode_gray(data: bytes) -> Optional[np.ndarray]:
     """字节 -> 灰度 uint8 数组。
     PNG：默认 OpenCV/libpng 全尺寸（快 ~1.3x；坏 iCCP 文件会有零星 stderr 警告），
@@ -687,7 +741,7 @@ def decode_gray(data: bytes) -> Optional[np.ndarray]:
         LOGGER.debug("超大图跳过: %dx%d 像素超过上限", w, h)
         return None
     if fmt == "PNG":
-        if _PNG_DECODER in ("imagecodecs", "libdeflate", "cv2"):
+        if _PNG_DECODER in ("imagecodecs", "libdeflate", "libdeflate_compat", "cv2"):
             # imagecodecs/libdeflate 模式也走 cv2 解灰度：与 cvtColor 的舍入可能差 ±1 级，
             # 而灰度路径只服务非融合的老路径，不值得为它冒索引漂移的风险
             arr = _decode_png_cv2(data, gray=True, probe=probe)
@@ -715,6 +769,13 @@ def decode_rgb(data: bytes) -> Optional[np.ndarray]:
     if fmt == "PNG":
         if _PNG_DECODER == "libdeflate":
             arr = _decode_png_libdeflate(data, gray=False, probe=probe)
+            if arr is not None:
+                return arr
+            arr = _decode_png_cv2(data, gray=False, probe=probe)   # 回退
+            if arr is not None:
+                return arr
+        elif _PNG_DECODER == "libdeflate_compat":
+            arr = _decode_png_libdeflate_compat(data, gray=False, probe=probe)
             if arr is not None:
                 return arr
             arr = _decode_png_cv2(data, gray=False, probe=probe)   # 回退
