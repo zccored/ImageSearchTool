@@ -247,3 +247,7 @@ docs/paper/results/
 docs/paper/*.py
 docs/_qbot_query*.txt
 docs/QBOT_*.md
+
+# release artifacts (built by git archive)
+release/
+

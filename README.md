@@ -13,6 +13,48 @@
 > 仓库内全部源文件头均带版权与许可声明（英文 + 中文双语，**不使用**
 > `SPDX-License-Identifier:` 行），详见文末「开源协议」（2026-09-12 由 MIT 变更）。
 
+## v3.5.0-beta 更新摘要（2026-10-31）
+
+> 分支：`perf/v3.5.0-beta-zccored-2026.10.31` · 完整数据见 [`docs/paper/dual_path_10k.md`](docs/paper/dual_path_10k.md)
+
+- **CPU/GPU 双路同源**：新增 `hybrid_search/prep_torch.py`，CPU 与 GPU 共用同一套
+  `Resize(256, bilinear, antialias) + CenterCrop(224)` torch 算子；两路特征余弦 **0.9999997**。
+- **批量 GPU 预处理**：解码线程只交原始 RGB，由单线程在 GPU 上批量 resize/crop，
+  单图预处理尾段 **17.9 ms → 3.69 ms**；`forward_rgb` 预分配 `[n,3,224,224]` 并逐张 `copy_`，
+  替代 `torch.stack` 256 个 GPU 张量（52 ms → 6.4 ms）。
+- **实测**：10k 张 **−14.3%** 墙钟；全量 37,682 张 **408.96 s → 334.13 s（−18.3%）**，
+  吞吐 92.1 → 112.8 img/s，GPU 利用率 10.3% → 26.3%。
+- **索引语义**：`prep` 写入 meta 并纳入 fatal 校验（旧索引缺键按 `cpu` 处理）；
+  `add/add_tiles` 自动对齐，避免新旧行混空间；白化侧车与瓦片查询侧同步修正。
+- **界面/CLI**：新增「预处理实现(cpu/torch)」「GPU 批量预处理张数」；`--prep` / `--prep-batch`。
+
+## 目录结构
+
+```text
+image-search/
+├─ main.py                  CLI 入口（build/add/search/whiten/tiles/stats…）
+├─ gui.py                   tkinter 界面（零额外 GUI 依赖）
+├─ gui_web.py               Web 界面入口
+├─ perfscope.py / perfwatch.py   只读图库观测仪 / 性能报告
+├─ hybrid_search/           核心包
+│  ├─ service.py            前端无关的唯一编排层（任务/参数/schema/事件）
+│  ├─ engine.py             建库、增量、检索、融合流水线、帧追踪
+│  ├─ fine.py               ResNet 抽取、并行解码、批量前向
+│  ├─ prep_torch.py         CPU/GPU 同源 resize/crop 算子
+│  ├─ coarse.py             二值指纹 + Hu 矩 + 融合
+│  ├─ tile_index.py         瓦片索引（切块/检索/混合合并）
+│  ├─ whiten.py             精排白化侧车（fit/apply/load/remove）
+│  ├─ store.py              索引文件与 meta 读写（npz / 侧车 .npy）
+│  ├─ config.py             全部可调参数
+│  ├─ cli.py                CLI 子命令
+│  └─ io_utils.py           读盘/解码/PNG 旁路/日志
+├─ frontend/                Web 前端（Vue）
+├─ docs/                    文档与论文（paper/ 含实验与成稿）
+├─ devtools/                验证脚本（hybrid merge / parameters）
+├─ branch/                  分支与交接文档
+└─ perf_reports/            性能图 JSON/HTML（本地产物，不入库）
+```
+
 ```
 查询图片
   │
@@ -49,6 +91,11 @@
 > 用哪个都不影响索引内容与检索结果。
 
 ### 一、用打包版（最省事，目标机不需要 Python）
+
+> 📦 **v3.5.0-beta 起提供源码归档**：`ImageSearchTool-v3.5.0-beta-src.zip` / `.tar.gz`
+> 由 `git archive` 从 `perf/v3.5.0-beta-zccored-2026.10.31` 生成（只含已跟踪文件，
+> 不含测试索引、`backups/`、`perf_reports/`），校验和见 Release 附件的 `SHA256SUMS.txt`。
+> 打包版 exe 说明仍可沿用下方 v3.3.1-beta 的步骤。
 
 **先下载**：到 [Releases](https://github.com/zccored/ImageSearchTool/releases) 页下最新的打包版
 （当前是 `ImageSearchTool-v3.3.1-beta-win64-cuda.zip.001` / `.002`）。GitHub 单个附件上限 2 GiB，
@@ -883,6 +930,18 @@ image-search/
 
 <details>
   <summary>更新日志</summary>
+
+### 2026-10-31（v3.5.0-beta：CPU/GPU 双路同源 + 批量 GPU 预处理）
+
+- **同源算子**（`prep_torch.py`）：CPU/GPU 共用 `Resize(256)+CenterCrop(224)` torch 数学；
+  与旧 PIL 路径特征余弦 0.9971（不同源），与 GPU 路径 0.9999997（同源）。
+- **批量 GPU 预处理**：`prep_batch>0` 时解码线程只交 RGB；`forward_rgb` 单线程批量 H2D +
+  resize/crop + 一次前向，预分配 `[n,3,224,224]` 替代 stack（52 ms → 6.4 ms）。
+  单图预处理尾段 17.9 → 3.69 ms；全量 37,682 张 408.96 → 334.13 s（**−18.3%**）。
+- **语义保护**：`prep` 进 meta / fatal 校验 / 旧索引默认 `cpu`；`add`、`add_tiles` 自动对齐；
+  瓦片查询侧白化、白化侧车缓存失效、混合检索白化守卫一并修复。
+- **界面/CLI**：新增 `prep`、`prep_batch` 两个参数；GUI 打开索引时回填。
+- **诊断**：`HERMES_TRACE=1` 输出轻量帧追踪（默认关，零开销）。
 
 ### 2026-10-10（打包全自动化：GitHub Actions 出包并发布）
 
