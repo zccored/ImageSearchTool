@@ -1271,6 +1271,9 @@ class SearchService:
 
         def job() -> Dict:
             from . import tile_index as TI
+            # 注意：job 内不能重新绑定 cfg（会变成局部变量，导致 _perf_start 处
+            # UnboundLocalError）；白化守卫改在 run_cfg 上生效。
+            run_cfg = cfg
             prof = self._perf_start("search", title, cfg, prefix,
                                     {"查询图": os.path.basename(query),
                                      "模式": mode}, enabled=perf)
@@ -1298,20 +1301,20 @@ class SearchService:
                 elif mode == "hybrid":
                     # 两路各取 top_k 再合并（同一原图去重取高分）
                     tp = TI.tiles_prefix_of(prefix)
-                    cfg = self._hybrid_whiten_guard(cfg, prefix, tp)
+                    run_cfg = self._hybrid_whiten_guard(cfg, prefix, tp)
                     t0 = time.time()
-                    eng_full, c1 = self.engine_for(cfg, prefix)
-                    eng_t, c2 = self.engine_for(cfg, tp)
+                    eng_full, c1 = self.engine_for(run_cfg, prefix)
+                    eng_t, c2 = self.engine_for(run_cfg, tp)
                     # 守卫的第二道：文件存在≠能生效（行数不符/stale 时 engine 会静默回退），
                     # 必须按实际打开的引擎是否真的带白化来判定，避免跨空间比较。
-                    if getattr(cfg, "fine_whiten", False) and (
+                    if getattr(run_cfg, "fine_whiten", False) and (
                             getattr(eng_full, "_whiten", None) is None
                             or getattr(eng_t, "_whiten", None) is None):
                         LOGGER.warning("混合检索：白化侧车未能生效（stale 或行数不符），"
                                        "两路统一回退原空间")
-                        cfg = dataclasses.replace(cfg, fine_whiten=False)
-                        eng_full, c1 = self.engine_for(cfg, prefix)
-                        eng_t, c2 = self.engine_for(cfg, tp)
+                        run_cfg = dataclasses.replace(run_cfg, fine_whiten=False)
+                        eng_full, c1 = self.engine_for(run_cfg, prefix)
+                        eng_t, c2 = self.engine_for(run_cfg, tp)
                     # 共享特征提取器（同 cfg 模型），避免重复加载模型
                     ex = getattr(eng_full, "_extractor", None)
                     if ex is not None:
