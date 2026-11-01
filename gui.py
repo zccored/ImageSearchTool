@@ -1502,9 +1502,10 @@ class App:
         self._add_combo(page_build, "模型", "model",
                         ["resnet18", "resnet34", "resnet50", "resnet101", "resnet152"])
         self._add_combo(page_build, "设备", "device", ["auto", "cuda", "cpu"])
-        self._add_int(page_build, "批大小(0=自动)", "batch", 0, 0, 512)
+        self._add_int(page_build, "批大小(0=自动)", "batch", 64, 0, 512,
+                      tooltip="GPU 预处理建议 64（>128 时 RGB 批次会堆积换页）；0=自动")
         self._add_combo(page_build, "预处理实现(cpu=PIL / torch=同源 GPU)", "prep",
-                        ["cpu", "torch"])
+                        ["torch", "cpu"])
         self._add_int(page_build, "GPU 批量预处理张数(0=逐张)", "prep_batch", 8, 0, 128,
                       tooltip=">0 时解码线程只交原始 RGB，由单线程在 GPU 上批量 resize/crop；\n"
                               "全量实测 batch=64 最稳（256 会因 RGB 堆积换页）")
@@ -1789,6 +1790,7 @@ class App:
                       self.svc.build_index, "build", self.prefix,
                       paths=list(self.all_images), force=True, cfg=cfg,
                       perf=self.perf_build_var.get(), title=title,
+                      viz=self._viz_visible(),
                       perf_meta={"图片数": len(self.all_images)})
 
     def _index_selected(self):
@@ -1806,11 +1808,12 @@ class App:
         if existing:
             self._run_cmd(busy, self.svc.add_index, "add", self.prefix,
                           paths=sel, cfg=cfg, perf=self.perf_build_var.get(),
-                          title=title)
+                          viz=self._viz_visible(), title=title)
         else:
             self._run_cmd(busy, self.svc.build_index, "build", self.prefix,
                           paths=sel, force=True, cfg=cfg,
-                          perf=self.perf_build_var.get(), title=title)
+                          perf=self.perf_build_var.get(),
+                          viz=self._viz_visible(), title=title)
 
     def _add_new(self):
         if not self._require_scan():
@@ -1826,7 +1829,8 @@ class App:
         self._run_cmd(f"{title} …（操作期间请勿重复点击）",
                       self.svc.add_index, "add", self.prefix,
                       paths=list(self.all_images), cfg=cfg,
-                      perf=self.perf_build_var.get(), title=title)
+                      perf=self.perf_build_var.get(),
+                      viz=self._viz_visible(), title=title)
 
     # ------------------------------------------------------------------
     # 索引引擎缓存 / 内存释放：全部在服务层（mmap 释放时机的唯一持有者）
@@ -1990,6 +1994,13 @@ class App:
                      f"可释放 {human_bytes(rep.wasted_bytes)}")
         DedupWindow(self, rep)
 
+    def _viz_visible(self) -> bool:
+        """可视化面板是否可见；不可见时建库不产生帧事件（省 ~1ms/张）。"""
+        try:
+            return bool(self.viz_canvas.winfo_ismapped())
+        except Exception:                                     # noqa: BLE001
+            return True
+
     def _reset_viz(self):
         """新一轮索引任务开始：清空帧队列、重置阶段与计数。"""
         self._viz_queue["coarse"].clear()
@@ -2061,7 +2072,7 @@ class App:
             else "子图索引构建（大图切 512px+25% 重叠瓦片）…",
             self.svc.tiles_index, "tiles", tp,
             paths=list(self.all_images), exists=exists, cfg=cfg,
-            perf=self.perf_build_var.get(),
+            perf=self.perf_build_var.get(), viz=self._viz_visible(),
             perf_meta={"图片数": len(self.all_images)})
 
     def _load_indexed_set(self):

@@ -1038,27 +1038,27 @@ class SearchService:
                     paths: Optional[List[str]] = None,
                     img_dir: Optional[str] = None, force: bool = True,
                     cfg: Optional[Config] = None, perf: bool = False,
-                    title: str = "",
+                    viz: bool = True, title: str = "",
                     perf_meta: Optional[Dict] = None) -> Optional[Dict]:
         """整图索引全量构建。返回 {n, prefix, title, perf}。"""
         return self._index_run(task_id, OP_BUILD, "build", prefix, paths=paths,
                                img_dir=img_dir, force=force, cfg=cfg, perf=perf,
-                               title=title, perf_meta=perf_meta)
+                               viz=viz, title=title, perf_meta=perf_meta)
 
     def add_index(self, task_id: str, prefix: Optional[str] = None, *,
                   paths: Optional[List[str]] = None,
                   img_dir: Optional[str] = None,
                   cfg: Optional[Config] = None, perf: bool = False,
-                  title: str = "",
+                  viz: bool = True, title: str = "",
                   perf_meta: Optional[Dict] = None) -> Optional[Dict]:
         """整图索引增量（路径 + MD5 去重）。返回 {n, prefix, title, perf}。"""
         return self._index_run(task_id, OP_ADD, "add", prefix, paths=paths,
                                img_dir=img_dir, force=False, cfg=cfg, perf=perf,
-                               title=title, perf_meta=perf_meta)
+                               viz=viz, title=title, perf_meta=perf_meta)
 
     def _index_run(self, task_id: str, op: str, action: str,
                    prefix: Optional[str], *, paths, img_dir, force,
-                   cfg, perf, title, perf_meta) -> Optional[Dict]:
+                   cfg, perf, title, perf_meta, viz: bool = True) -> Optional[Dict]:
         cfg = cfg or self.cfg
         prefix = prefix or self.current_prefix()
         if action == "add":
@@ -1083,7 +1083,7 @@ class SearchService:
                     prof.mark("解码+特征提取(粗筛与ResNet同一条流水线)")
                 kw = {"img_dir": img_dir, "paths": paths,
                       "progress": self._progress_cb(task_id, prof),
-                      "frame_sink": self._frame_cb(task_id)}
+                      "frame_sink": self._frame_cb(task_id) if viz else None}
                 if action == "build":
                     kw["force"] = force
                 n = (eng.build if action == "build" else eng.add)(prefix, **kw)
@@ -1110,7 +1110,7 @@ class SearchService:
                     img_dir: Optional[str] = None,
                     exists: Optional[bool] = None,
                     cfg: Optional[Config] = None, perf: bool = False,
-                    title: str = "",
+                    viz: bool = True, title: str = "",
                     perf_meta: Optional[Dict] = None) -> Optional[Dict]:
         """子图(瓦片)索引：无索引 → 全量构建；已有 → 增量（切块参数从 meta 恢复）。
 
@@ -1136,7 +1136,7 @@ class SearchService:
                 # 瓦片进度回调是 (done,total) 两参；带第三参时是阶段边界
                 # （save/done），必须原样透传，否则性能图看不到“结束状态”
                 cb = self._progress_cb(task_id, prof, default_phase=PHASE_TILES)
-                viz = self._frame_cb(task_id)
+                viz = self._frame_cb(task_id) if viz else None
                 if exists:
                     t0 = time.time()
                     eng.open(tp)
