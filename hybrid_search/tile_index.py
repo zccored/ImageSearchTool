@@ -277,7 +277,7 @@ def _decode_to_crops(path: str, cfg, tile: int, overlap: float,
 
 def _feature_one_tile(path: str, rgb_crop: np.ndarray, box: tuple,
                       base, first: bool, cfg, transform,
-                      frame_sink=None
+                      frame_sink=None, batch_prep: bool = False
                       ) -> Optional[Tuple[np.ndarray, CoarseRecord]]:
     """二级：单瓦片特征（粗筛指纹+Hu + ResNet 预处理张量）。失败返回 None。
 
@@ -291,10 +291,15 @@ def _feature_one_tile(path: str, rgb_crop: np.ndarray, box: tuple,
         md5 = (_tile_md5(base, box) if isinstance(base, (bytes, bytearray))
                else _tile_md5_of(base, box))
         rec = CoarseRecord(path=path, md5=md5, hu=hu, fp=fp, box=box)
-        try:
-            tensor = transform(Image.fromarray(rgb_crop))
-        except Exception:                # noqa: BLE001
-            return None
+        if batch_prep:
+            # 只交原始 RGB：由 flush 里的单线程批量 GPU 预处理统一 resize/crop，
+            # 避免每块一次 PIL fromarray/transform（实测约 2.5~3 ms/块）。
+            tensor = rgb_crop
+        else:
+            try:
+                tensor = transform(Image.fromarray(rgb_crop))
+            except Exception:            # noqa: BLE001
+                return None
         if frame_sink is not None:
             try:
                 frame_sink(path, binary, "coarse")     # 免费副产物
@@ -331,12 +336,18 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
     old_n = engine.coarse.size
     ex = engine._get_extractor()
     tile_transform = getattr(ex, "tile_transform", ex.transform)
+    if str(getattr(engine.cfg, "prep", "cpu")) == "torch":
+        # 同源：即使 prep_batch=0（逐块），也必须用 torch 算子，不能回退 PIL，
+        # 否则瓦片特征与查询/整图索引跨空间。
+        tile_transform = ex.prep
     workers = max(1, ex.decode_workers)
     n = len(todo)
     if n == 0:
         return 0
     t0 = time.time()
     tile_fwd_batch = int(getattr(engine.cfg, "tile_fwd_batch", 64) or 64)
+    batch_prep = (str(getattr(engine.cfg, "prep", "cpu")) == "torch"
+                  and int(getattr(engine.cfg, "prep_batch", 0) or 0) > 0)
     TILE_FWD_BATCH = max(64, tile_fwd_batch)
     _cfg = engine.cfg
     TICK = max(2.0, float(getattr(_cfg, "tile_flush_ms", 20) or 20)) / 1000.0
@@ -413,7 +424,7 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
                                                         item[5])
                     out = _feature_one_tile(path, rgb_crop, box, base, first,
                                             engine.cfg, tile_transform,
-                                            frame_sink)
+                                            frame_sink, batch_prep=batch_prep)
                     if out is not None:
                         ready_q.put((path, [out]))
             except Exception as e:                  # noqa: BLE001 —— 单项失败不中断
@@ -470,7 +481,10 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
                     sub_paths = [paths[i] for i in keep]
                     sub_ts = [tensors[i] for i in keep]
                     tb0 = time.monotonic()
-                    feats = ex._forward(sub_ts)     # noqa: SLF001 同项目协作
+                    if isinstance(sub_ts[0], np.ndarray):
+                        feats = ex.forward_rgb(sub_ts)   # 批量 GPU 预处理
+                    else:
+                        feats = ex._forward(sub_ts)      # noqa: SLF001
                     tb1 = time.monotonic()
                     if trace is not None:
                         trace.on_batch(tb0, tb1, len(sub_ts))
@@ -945,7 +959,7 @@ def search_tiles_tiled(engine, q_path: str, top_k: int = 10,
         crop = work[y0:y1, x0:x1]
         if crop.shape[0] < 4 or crop.shape[1] < 4:
             continue
-        feat = ex._forward([ex.transform(Image.fromarray(crop))])
+        feat = ex._forward([ex.prep(crop)])
         if feat is None or len(feat) != 1:
             raise RuntimeError("查询瓦片特征提取失败，未返回不完整的检索结果")
         queries.append(np.asarray(feat[0], dtype=np.float32))
