@@ -310,7 +310,10 @@ class CoarseIndex:
                 known_md5s.add(rec.md5)
                 self.paths.append(p)
                 self.md5s.append(rec.md5)
-                self._path_set.add(os.path.normcase(os.path.abspath(p)))
+                if rec.box is None:
+                    # 整图条目才需要路径集合；瓦片条目一图多块，去重按 md5(含框)，
+                    # 逐块 abspath+normcase 在 Windows 上约 0.2~0.4 ms/块。
+                    self._path_set.add(os.path.normcase(os.path.abspath(p)))
                 self.boxes.append(rec.box)
                 if rec.hu is not None:
                     self._hu_parts.append(rec.hu.reshape(1, 7))
