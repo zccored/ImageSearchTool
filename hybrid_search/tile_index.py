@@ -340,7 +340,8 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
         # 同源：即使 prep_batch=0（逐块），也必须用 torch 算子，不能回退 PIL，
         # 否则瓦片特征与查询/整图索引跨空间。
         tile_transform = ex.prep
-    workers = max(1, ex.decode_workers)
+    workers = max(1, int(getattr(engine.cfg, "tile_workers", 0)
+                        or ex.decode_workers))
     n = len(todo)
     if n == 0:
         return 0
@@ -466,6 +467,41 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
     acc_t0 = time.monotonic()
     ended = False
 
+    # 双缓冲：主线程只做 add_results + 投递，GPU 线程连续算；队列深度 2
+    # 让“攒批”和“前向”重叠，避免 flush 同步等待造成 GPU 空档。
+    batch_q: "queue.Queue" = queue.Queue(maxsize=2)
+    res_q: "queue.Queue" = queue.Queue()
+    seq_box = [0]
+
+    def gpu_worker():
+        while True:
+            item = batch_q.get()
+            if item is None:
+                res_q.put(None)
+                return
+            seq, sub_paths, sub_ts = item
+            tb0 = time.monotonic()
+            try:
+                if isinstance(sub_ts[0], np.ndarray):
+                    feats = ex.forward_rgb(sub_ts)       # 批量 GPU 预处理
+                else:
+                    feats = ex._forward(sub_ts)          # noqa: SLF001
+                tb1 = time.monotonic()
+                if trace is not None:
+                    trace.on_batch(tb0, tb1, len(sub_ts))
+                if feats is None or feats.ndim != 2 or len(feats) != len(sub_ts):
+                    raise RuntimeError("瓦片精排返回空结果或特征行数不匹配")
+                rows = feats.astype(np.float32)
+                norms = np.linalg.norm(rows, axis=1, keepdims=True)
+                norms[norms < 1e-8] = 1.0
+                rows /= norms
+                res_q.put((seq, sub_paths, rows))
+            except Exception as e:                       # noqa: BLE001
+                res_q.put(("ERR", seq, e))
+
+    gpu_thread = threading.Thread(target=gpu_worker, daemon=True)
+    gpu_thread.start()
+
     def flush():
         nonlocal acc_paths, acc_ts, acc_recs, acc_t0
         if not acc_ts:
@@ -476,31 +512,15 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
         try:
             with engine.coarse.append_transaction():
                 accepted = engine.coarse.add_results(paths, recs)
-                keep = [i for i, a in enumerate(accepted) if a]
-                if keep:
-                    sub_paths = [paths[i] for i in keep]
-                    sub_ts = [tensors[i] for i in keep]
-                    tb0 = time.monotonic()
-                    if isinstance(sub_ts[0], np.ndarray):
-                        feats = ex.forward_rgb(sub_ts)   # 批量 GPU 预处理
-                    else:
-                        feats = ex._forward(sub_ts)      # noqa: SLF001
-                    tb1 = time.monotonic()
-                    if trace is not None:
-                        trace.on_batch(tb0, tb1, len(sub_ts))
-                    if feats is None or feats.ndim != 2 or len(feats) != len(keep):
-                        raise RuntimeError("瓦片精排返回空结果或特征行数不匹配")
-                    rows = feats.astype(np.float32)
-                    norms = np.linalg.norm(rows, axis=1, keepdims=True)
-                    norms[norms < 1e-8] = 1.0
-                    rows /= norms
-                    all_feats.append(rows)
-                    all_ok.extend(sub_paths)
+            keep = [i for i, a in enumerate(accepted) if a]
+            if keep:
+                sub_paths = [paths[i] for i in keep]
+                sub_ts = [tensors[i] for i in keep]
+                batch_q.put((seq_box[0], sub_paths, sub_ts))
+                seq_box[0] += 1
         except Exception as e:                   # noqa: BLE001 —— 单批失败跳过
             LOGGER.warning("瓦片批次处理失败（%d 块）已跳过: %r", len(paths), e)
         finally:
-            # 下一批的收集计时从本批处理结束开始，不能把 GPU 耗时计入等待。
-            # 否则前向超过 TICK 后，下一个结果会立刻被发送为单行小批。
             acc_t0 = time.monotonic()
 
     while not ended:
@@ -544,6 +564,22 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
     stop.set()
     for t in threads:
         t.join(timeout=3)
+
+    # 收尾：等 GPU 线程把已投递的批算完，按提交顺序还原
+    batch_q.put(None)
+    results = []
+    while True:
+        item = res_q.get()
+        if item is None:
+            break
+        if isinstance(item, tuple) and item and item[0] == "ERR":
+            raise RuntimeError(f"瓦片前向失败: {item[2]!r}")
+        results.append(item)
+    results.sort(key=lambda x: x[0])
+    for _seq, sub_paths, rows in results:
+        all_feats.append(rows)
+        all_ok.extend(sub_paths)
+    gpu_thread.join(timeout=5)
 
     added = len(all_ok)
     if all_feats:
