@@ -581,6 +581,20 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
         all_ok.extend(sub_paths)
     gpu_thread.join(timeout=5)
 
+    added = _save_tiles(engine, prefix, old_n, all_ok, all_feats,
+                        tile, overlap, min_side, pre_max, progress)
+    rate = added / max(time.time() - t0, 1e-6)
+    _phase(progress, added, "done")
+    LOGGER.info("瓦片索引：+%d 块（原图 %d 张），库内共 %d 块，吞吐 %.1f 块/秒",
+                added, n, engine.coarse.size, rate)
+    return added
+
+
+def _save_tiles(engine, prefix: str, old_n: int, all_ok: List[str],
+                all_feats: List[np.ndarray], tile: int, overlap: float,
+                min_side: int, pre_max: int, progress=None) -> int:
+    """把已收集的 coarse/fine 行落盘（build/add 共用；进程/线程后端共用）。"""
+    files = IndexFiles(prefix)
     added = len(all_ok)
     if all_feats:
         feats_all = np.concatenate(all_feats, axis=0).astype(np.float32)
@@ -638,10 +652,6 @@ def _ingest_tiles(engine, prefix: str, todo: List[str], progress=None,
                                 "overlap": overlap, "min_side": min_side,
                                 "pre_max": pre_max}
         files.save_meta(meta)
-    rate = added / max(time.time() - t0, 1e-6)
-    _phase(progress, added, "done")
-    LOGGER.info("瓦片索引：+%d 块（原图 %d 张），库内共 %d 块，吞吐 %.1f 块/秒",
-                added, n, engine.coarse.size, rate)
     return added
 
 
@@ -677,6 +687,14 @@ def build_tiles(engine, prefix: str, img_dir: Optional[str] = None,
     # 全新引擎实例（避免与其它已打开前缀混用）
     from .engine import HybridEngine
     eng = HybridEngine(engine.cfg) if engine.coarse.size else engine
+    from .tile_mp import build_tiles_mp, resolve_tile_backend  # noqa: PLC0415
+    if resolve_tile_backend(eng.cfg, frame_sink) == "processes":
+        try:
+            return build_tiles_mp(eng, prefix, paths, progress=progress,
+                                  tile=tile, overlap=overlap,
+                                  min_side=min_side, pre_max=pre_max)
+        except Exception as e:                   # noqa: BLE001 —— 自动回退
+            LOGGER.warning("瓦片多进程后端失败，回退线程：%r", e)
     return _ingest_tiles(eng, prefix, paths, progress=progress,
                          frame_sink=frame_sink, tile=tile, overlap=overlap,
                          min_side=min_side, pre_max=pre_max, trace=trace)
@@ -707,6 +725,14 @@ def add_tiles(engine, prefix: str, img_dir: Optional[str] = None,
     todo = [p for p in paths
             if os.path.normcase(os.path.abspath(p)) not in known]
     LOGGER.info("瓦片增量：扫描到 %d 张，待处理 %d 张", len(paths), len(todo))
+    from .tile_mp import build_tiles_mp, resolve_tile_backend  # noqa: PLC0415
+    if resolve_tile_backend(engine.cfg, frame_sink) == "processes":
+        try:
+            return build_tiles_mp(engine, prefix, todo, progress=progress,
+                                  tile=tile, overlap=overlap,
+                                  min_side=min_side, pre_max=pre_max)
+        except Exception as e:                   # noqa: BLE001
+            LOGGER.warning("瓦片多进程增量失败，回退线程：%r", e)
     return _ingest_tiles(engine, prefix, todo, progress=progress,
                          frame_sink=frame_sink, tile=tile, overlap=overlap,
                          min_side=min_side, pre_max=pre_max, trace=trace)

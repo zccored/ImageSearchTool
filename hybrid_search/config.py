@@ -145,6 +145,10 @@ class Config:
     # 瓦片(局部)建库：第一级“同时解码的原图数”上限(大图还受上面并发门约束)
     # 瓦片专用：解码/切块 worker 数。20 核机器上 24 实测最优
     # （220 张：16→726、20→761、24→826、28→751 块/s）。
+    # 瓦片后端：auto/threads/processes。auto 在 CUDA+CPU>=8 且非打包版时用多进程；
+    # 打包版/可视化/非 torch 预处理自动回退线程。
+    tile_backend: str = "auto"
+    tile_mp_workers: int = 0          # 0=自动（cpu//2，夹在 4..12）
     tile_workers: int = 24
     tile_decode_slots: int = 24
     # 瓦片(局部)建库：瓦片不足一批时的最长等待毫秒(批发送间隔)。
