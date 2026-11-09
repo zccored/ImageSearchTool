@@ -95,6 +95,7 @@ def build_tiles_mp(engine, prefix: str, paths, *, progress=None,
         done_imgs = 0
         tiles = 0
         errors = 0
+        retries = {}
 
         def flush():
             if not pending:
@@ -102,7 +103,11 @@ def build_tiles_mp(engine, prefix: str, paths, *, progress=None,
             ts = [p[3] for p in pending]
             feats = ex.forward_rgb(ts)
             for (img, ti, _rec, _arr, _slot), row in zip(pending, feats):
-                rows.append((img, ti, row.astype(np.float32)))
+                vec = row.astype(np.float32)
+                nn = float(np.linalg.norm(vec))
+                if nn > 1e-8:
+                    vec /= nn
+                rows.append((img, ti, vec))
             for _img, _ti, _rec, _arr, slot in pending:
                 slot_q.put(slot)
             pending.clear()
@@ -122,8 +127,15 @@ def build_tiles_mp(engine, prefix: str, paths, *, progress=None,
                         pass
                 continue
             if msg[0] == "err":
-                errors += 1
-                LOGGER.warning("瓦片多进程解码失败 %s: %s", msg[1], msg[2])
+                _kind, bad_idx, bad_path, err = msg
+                if retries.get(bad_idx, 0) < 1:
+                    retries[bad_idx] = 1
+                    job_q.put((bad_idx, bad_path))
+                    LOGGER.debug("瓦片多进程重试 %s: %s", bad_path, err)
+                else:
+                    errors += 1
+                    done_imgs += 1                 # 放弃该图，避免永久等待
+                    LOGGER.warning("瓦片多进程解码失败（已重试）%s: %s", bad_path, err)
                 continue
             img_idx, ti, path, box, md5, hu, fp, slot, shape, nbytes = msg
             arr = np.frombuffer(shm_view, dtype=np.uint8, count=nbytes,

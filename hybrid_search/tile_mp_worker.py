@@ -101,9 +101,10 @@ def run(job_q, msg_q, slot_q, shm_name, slot_bytes, cfg,
                 msg_q.put((img_idx, ti, path, box, md5, hu, fp, slot,
                            crop.shape, crop.nbytes))
                 n_tiles += 1
+            msg_q.put(("img_done", img_idx, n_tiles))
         except Exception as e:                       # noqa: BLE001
-            msg_q.put(("err", img_idx, repr(e)))
-        msg_q.put(("img_done", img_idx, n_tiles))
+            # 不补 img_done：父进程会重试一次，最终失败才计完成
+            msg_q.put(("err", img_idx, path, repr(e)))
     try:
         shm_view.release()
         shm.close()
