@@ -66,6 +66,7 @@ def run(job_q, msg_q, slot_q, shm_name, slot_bytes, cfg,
         tile, overlap, min_side, pre_max):
     cv2.setNumThreads(1)
     shm = shared_memory.SharedMemory(name=shm_name)
+    shm_view = shm.buf
     while True:
         job = job_q.get()
         if job is None:
@@ -96,10 +97,15 @@ def run(job_q, msg_q, slot_q, shm_name, slot_bytes, cfg,
                 md5 = _md5_of(base, box)
                 slot = slot_q.get()
                 off = slot * slot_bytes
-                shm.buf[off:off + crop.nbytes] = crop.tobytes()
+                shm_view[off:off + crop.nbytes] = crop.tobytes()
                 msg_q.put((img_idx, ti, path, box, md5, hu, fp, slot,
                            crop.shape, crop.nbytes))
                 n_tiles += 1
         except Exception as e:                       # noqa: BLE001
             msg_q.put(("err", img_idx, repr(e)))
         msg_q.put(("img_done", img_idx, n_tiles))
+    try:
+        shm_view.release()
+        shm.close()
+    except Exception:                                # noqa: BLE001
+        pass

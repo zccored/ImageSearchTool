@@ -74,6 +74,7 @@ def build_tiles_mp(engine, prefix: str, paths, *, progress=None,
     for i in range(slots):
         slot_q.put(i)
     shm = shared_memory.SharedMemory(create=True, size=slots * slot_bytes)
+    shm_view = shm.buf          # 单例 memoryview：close 前显式 release
 
     procs = []
     t0 = time.time()
@@ -125,8 +126,8 @@ def build_tiles_mp(engine, prefix: str, paths, *, progress=None,
                 LOGGER.warning("瓦片多进程解码失败 %s: %s", msg[1], msg[2])
                 continue
             img_idx, ti, path, box, md5, hu, fp, slot, shape, nbytes = msg
-            arr = np.frombuffer(shm.buf, dtype=np.uint8, count=nbytes,
-                                offset=slot * slot_bytes).reshape(shape)
+            arr = np.frombuffer(shm_view, dtype=np.uint8, count=nbytes,
+                                offset=slot * slot_bytes).reshape(shape).copy()
             rec = CoarseRecord(path=path, md5=md5, hu=hu, fp=fp, box=box)
             rec_map[(img_idx, ti)] = rec
             pending.append((img_idx, ti, rec, arr, slot))
@@ -137,7 +138,7 @@ def build_tiles_mp(engine, prefix: str, paths, *, progress=None,
         flush()
     finally:
         try:
-            pending.clear()          # 释放共享内存视图后再 close（否则 BufferError）
+            pending.clear()          # 释放共享内存视图后再 close
         except NameError:
             pass
         for _ in procs:
@@ -149,10 +150,16 @@ def build_tiles_mp(engine, prefix: str, paths, *, progress=None,
             p.join(timeout=10)
             if p.is_alive():
                 p.terminate()
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.synchronize()
+        except Exception:                                # noqa: BLE001
+            pass
         gc.collect()
         try:
-            shm.buf.release()
-        except Exception:                            # noqa: BLE001
+            shm_view.release()       # 先释放唯一 memoryview，否则 mmap.close 报 BufferError
+        except Exception:                                # noqa: BLE001
             pass
         gc.collect()
         try:

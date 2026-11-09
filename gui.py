@@ -2649,4 +2649,6 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    import multiprocessing as _mp
+    _mp.freeze_support()          # PyInstaller 打包后多进程子进程需要
     sys.exit(main())
