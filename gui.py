@@ -1236,6 +1236,15 @@ class App:
         top.pack(fill="x")
         self._build_toolbar(top)
 
+        # 状态栏必须先于可扩展主体 pack 到底部，否则窗口缩小时会被 body 挤掉
+        bar = ttk.Frame(self.root, padding=(8, 2))
+        bar.pack(fill="x", side="bottom")
+        self.status_var = tk.StringVar(value="就绪：先选图库目录 → 扫描 → 建索引 → 查询")
+        ttk.Label(bar, textvariable=self.status_var, anchor="w").pack(
+            side="left", fill="x", expand=True)
+        self.progress = ttk.Progressbar(bar, length=220, mode="determinate")
+        self.progress.pack(side="right", padx=6)
+
         body = ttk.Panedwindow(self.root, orient="horizontal")
         body.pack(fill="both", expand=True, padx=8, pady=2)
 
@@ -1262,15 +1271,6 @@ class App:
                                background="#101014", foreground="#c8c8cc",
                                insertbackground="#c8c8cc")
         self.log_txt.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # 状态栏
-        bar = ttk.Frame(self.root, padding=(8, 2))
-        bar.pack(fill="x", side="bottom")
-        self.status_var = tk.StringVar(value="就绪：先选图库目录 → 扫描 → 建索引 → 查询")
-        ttk.Label(bar, textvariable=self.status_var, anchor="w").pack(
-            side="left", fill="x", expand=True)
-        self.progress = ttk.Progressbar(bar, length=220, mode="determinate")
-        self.progress.pack(side="right", padx=6)
 
     # ------------------------------------------------------------------
     # 顶部工具栏：图库目录 + 扫描/建索引动作
@@ -1485,6 +1485,8 @@ class App:
         nb.add(page_build, text="建库参数")
         page_search = ttk.Frame(nb, padding=8)
         nb.add(page_search, text="检索参数")
+        page_tile = ttk.Frame(nb, padding=8)
+        nb.add(page_tile, text="瓦片与性能")
 
         self._add_int(page_build, "指纹边长(像素,平方)", "coarse_size", 64, 8, 256,
                       tooltip="二值指纹尺寸：64 → 64×64=4096bit/张")
@@ -1536,13 +1538,25 @@ class App:
                               "16~20；\n数值越高 CPU 越满，但内存余量不足会触发"
                               "页回收反而变慢")
         self._add_int(page_build, "瓦片建库·同时解码图数", "tile_decode_slots",
-                      18, 1, 64,
+                      24, 1, 64,
                       tooltip="子图(瓦片)索引第一级同时解码的原图数上限，"
                               "配合上面的并发门使用")
         self._add_int(page_build, "瓦片建库·GPU批等待(ms)", "tile_flush_ms",
                       20, 2, 500,
                       tooltip="瓦片不足一批时的最长等待毫秒。\n小(如10)：批更碎"
                               "(1-2行小批唤醒多)；大(如30)：批更整、唤醒更少")
+        self._add_combo(page_tile, "瓦片后端(auto=自动)", "tile_backend",
+                        ["auto", "threads", "processes"])
+        self._add_int(page_tile, "瓦片多进程 worker 数(0=自动)", "tile_mp_workers",
+                      0, 0, 64,
+                      tooltip="0=自动（CPU//2，夹 4~12）。\n"
+                              "多进程适合 8 核以上且 GPU 预处理场景")
+        self._add_int(page_tile, "瓦片线程数(线程后端)", "tile_workers", 24, 1, 64,
+                      tooltip="线程后端的并发 worker；低配机由性能预算自动降档")
+        self._add_int(page_tile, "瓦片 GPU 前向批大小", "tile_fwd_batch", 64, 16, 512,
+                      tooltip="实测 64 最优；128/256 会让 flush 间隔变长、GPU 降频")
+        self._add_combo(page_tile, "GPU 性能预算", "gpu_governor",
+                        ["auto", "keepalive", "off"])
         self._add_int(page_build, "torch推理线程(0=默认)", "torch_threads", 0,
                       0, 128,
                       tooltip="CPU前向线程数。多数机型1线程最快\n"
