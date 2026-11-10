@@ -147,6 +147,8 @@ class Config:
     # （220 张：16→726、20→761、24→826、28→751 块/s）。
     # 瓦片后端：auto/threads/processes。auto 在 CUDA+CPU>=8 且非打包版时用多进程；
     # 打包版/可视化/非 torch 预处理自动回退线程。
+    # 性能预算：auto=预热+机器画像+进程优先级；keepalive=额外常驻小核（实测更慢）；off=关闭
+    gpu_governor: str = "auto"
     tile_backend: str = "auto"
     tile_mp_workers: int = 0          # 0=自动（cpu//2，夹在 4..12）
     tile_workers: int = 24

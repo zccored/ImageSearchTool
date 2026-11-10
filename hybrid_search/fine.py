@@ -337,6 +337,35 @@ class ResNetExtractor:
         self.last_times = (t1 - t0, t2 - t1, _t.perf_counter() - t2)
         return out
 
+    def forward_gpu(self, rgbs_dev) -> Optional[np.ndarray]:
+        """批量预处理：输入已是 GPU 上的 uint8 HWC 张量（父进程先 H2D）。
+
+        与 `forward_rgb` 同一套数学，但省掉从 numpy 再 H2D；用于多进程瓦片
+        收集端的“先入 GPU、立即释放共享槽”方案。
+        """
+        import torch
+        import torch.nn.functional as F
+        from .prep_torch import SIDE, CROP
+        if not rgbs_dev:
+            return None
+        out = []
+        for g in rgbs_dev:
+            h, w = int(g.shape[0]), int(g.shape[1])
+            t = g.permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+            sc = SIDE / float(min(h, w))
+            nh = max(SIDE, int(round(h * sc)))
+            nw = max(SIDE, int(round(w * sc)))
+            t = F.interpolate(t, size=(nh, nw), mode="bilinear",
+                              antialias=True, align_corners=False)
+            top = (nh - CROP) // 2
+            left = (nw - CROP) // 2
+            out.append(t[0, :, top:top + CROP, left:left + CROP])
+        batched = torch.empty((len(out), 3, CROP, CROP), device=out[0].device,
+                              dtype=torch.float32)
+        for i, t in enumerate(out):
+            batched[i].copy_(t)
+        return self._forward([batched])
+
     def _forward(self, tensors) -> Optional[np.ndarray]:
         """一组 CPU 张量 -> 归一化前特征矩阵（单次前向，autocast 可选）。
 

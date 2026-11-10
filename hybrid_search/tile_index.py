@@ -687,17 +687,19 @@ def build_tiles(engine, prefix: str, img_dir: Optional[str] = None,
     # 全新引擎实例（避免与其它已打开前缀混用）
     from .engine import HybridEngine
     eng = HybridEngine(engine.cfg) if engine.coarse.size else engine
+    from .perf_governor import PerfGovernor       # noqa: PLC0415
     from .tile_mp import build_tiles_mp, resolve_tile_backend  # noqa: PLC0415
-    if resolve_tile_backend(eng.cfg, frame_sink) == "processes":
-        try:
-            return build_tiles_mp(eng, prefix, paths, progress=progress,
-                                  tile=tile, overlap=overlap,
-                                  min_side=min_side, pre_max=pre_max)
-        except Exception as e:                   # noqa: BLE001 —— 自动回退
-            LOGGER.warning("瓦片多进程后端失败，回退线程：%r", e)
-    return _ingest_tiles(eng, prefix, paths, progress=progress,
-                         frame_sink=frame_sink, tile=tile, overlap=overlap,
-                         min_side=min_side, pre_max=pre_max, trace=trace)
+    with PerfGovernor(eng.cfg):
+        if resolve_tile_backend(eng.cfg, frame_sink) == "processes":
+            try:
+                return build_tiles_mp(eng, prefix, paths, progress=progress,
+                                      tile=tile, overlap=overlap,
+                                      min_side=min_side, pre_max=pre_max)
+            except Exception as e:               # noqa: BLE001 —— 自动回退
+                LOGGER.warning("瓦片多进程后端失败，回退线程：%r", e)
+        return _ingest_tiles(eng, prefix, paths, progress=progress,
+                             frame_sink=frame_sink, tile=tile, overlap=overlap,
+                             min_side=min_side, pre_max=pre_max, trace=trace)
 
 
 def add_tiles(engine, prefix: str, img_dir: Optional[str] = None,
@@ -725,17 +727,19 @@ def add_tiles(engine, prefix: str, img_dir: Optional[str] = None,
     todo = [p for p in paths
             if os.path.normcase(os.path.abspath(p)) not in known]
     LOGGER.info("瓦片增量：扫描到 %d 张，待处理 %d 张", len(paths), len(todo))
+    from .perf_governor import PerfGovernor       # noqa: PLC0415
     from .tile_mp import build_tiles_mp, resolve_tile_backend  # noqa: PLC0415
-    if resolve_tile_backend(engine.cfg, frame_sink) == "processes":
-        try:
-            return build_tiles_mp(engine, prefix, todo, progress=progress,
-                                  tile=tile, overlap=overlap,
-                                  min_side=min_side, pre_max=pre_max)
-        except Exception as e:                   # noqa: BLE001
-            LOGGER.warning("瓦片多进程增量失败，回退线程：%r", e)
-    return _ingest_tiles(engine, prefix, todo, progress=progress,
-                         frame_sink=frame_sink, tile=tile, overlap=overlap,
-                         min_side=min_side, pre_max=pre_max, trace=trace)
+    with PerfGovernor(engine.cfg):
+        if resolve_tile_backend(engine.cfg, frame_sink) == "processes":
+            try:
+                return build_tiles_mp(engine, prefix, todo, progress=progress,
+                                      tile=tile, overlap=overlap,
+                                      min_side=min_side, pre_max=pre_max)
+            except Exception as e:               # noqa: BLE001
+                LOGGER.warning("瓦片多进程增量失败，回退线程：%r", e)
+        return _ingest_tiles(engine, prefix, todo, progress=progress,
+                             frame_sink=frame_sink, tile=tile, overlap=overlap,
+                             min_side=min_side, pre_max=pre_max, trace=trace)
 
 
 # ---------------------------------------------------------------------------

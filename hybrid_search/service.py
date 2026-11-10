@@ -1123,6 +1123,7 @@ class SearchService:
         title = title or ("子图索引增量" if exists else "子图索引构建")
 
         def job() -> Dict:
+            use_viz = viz
             from . import tile_index as TI
             meta: Dict = {"图片数": len(paths)} if paths is not None else {}
             meta["模式"] = "增量" if exists else "全量"
@@ -1136,7 +1137,7 @@ class SearchService:
                 # 瓦片进度回调是 (done,total) 两参；带第三参时是阶段边界
                 # （save/done），必须原样透传，否则性能图看不到“结束状态”
                 cb = self._progress_cb(task_id, prof, default_phase=PHASE_TILES)
-                viz = self._frame_cb(task_id) if viz else None
+                viz_cb = self._frame_cb(task_id) if use_viz else None
                 if exists:
                     t0 = time.time()
                     eng.open(tp)
@@ -1146,12 +1147,12 @@ class SearchService:
                                   耗时=round(time.time() - t0, 2))
                         prof.mark("增量解码+特征提取")
                     n = TI.add_tiles(eng, tp, img_dir=img_dir, paths=paths,
-                                     progress=cb, frame_sink=viz)
+                                     progress=cb, frame_sink=viz_cb)
                 else:
                     if prof:
                         prof.mark("全量解码+特征提取")
                     n = TI.build_tiles(eng, tp, img_dir=img_dir, paths=paths,
-                                       progress=cb, frame_sink=viz)
+                                       progress=cb, frame_sink=viz_cb)
                 if prof:
                     prof.mark("写盘完成")
                 perf_path = self._perf_finish(

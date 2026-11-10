@@ -16,6 +16,7 @@ import time
 from multiprocessing import shared_memory
 
 import numpy as np
+import torch
 
 from .coarse import CoarseRecord
 from .io_utils import LOGGER
@@ -89,7 +90,8 @@ def build_tiles_mp(engine, prefix: str, paths, *, progress=None,
             job_q.put((i, path))
 
         ex = engine._get_extractor()
-        pending = []        # [(img, ti, rec, view, slot)]
+        dev = torch.device(ex.device)
+        pending = []        # [(img, ti, rec, gpu_uint8)]
         rows = []           # [(img, ti, feat)]
         rec_map = {}
         done_imgs = 0
@@ -101,15 +103,13 @@ def build_tiles_mp(engine, prefix: str, paths, *, progress=None,
             if not pending:
                 return
             ts = [p[3] for p in pending]
-            feats = ex.forward_rgb(ts)
-            for (img, ti, _rec, _arr, _slot), row in zip(pending, feats):
+            feats = ex.forward_gpu(ts)
+            for (img, ti, _rec, _gpu), row in zip(pending, feats):
                 vec = row.astype(np.float32)
                 nn = float(np.linalg.norm(vec))
                 if nn > 1e-8:
                     vec /= nn
                 rows.append((img, ti, vec))
-            for _img, _ti, _rec, _arr, slot in pending:
-                slot_q.put(slot)
             pending.clear()
             del ts
 
@@ -138,11 +138,14 @@ def build_tiles_mp(engine, prefix: str, paths, *, progress=None,
                     LOGGER.warning("瓦片多进程解码失败（已重试）%s: %s", bad_path, err)
                 continue
             img_idx, ti, path, box, md5, hu, fp, slot, shape, nbytes = msg
-            arr = np.frombuffer(shm_view, dtype=np.uint8, count=nbytes,
-                                offset=slot * slot_bytes).reshape(shape).copy()
+            view = np.frombuffer(shm_view, dtype=np.uint8, count=nbytes,
+                                 offset=slot * slot_bytes).reshape(shape)
+            gpu_t = torch.from_numpy(view).to(dev, non_blocking=False)
+            slot_q.put(slot)                 # 已入 GPU，立即还槽（不再父进程拷贝）
+            del view
             rec = CoarseRecord(path=path, md5=md5, hu=hu, fp=fp, box=box)
             rec_map[(img_idx, ti)] = rec
-            pending.append((img_idx, ti, rec, arr, slot))
+            pending.append((img_idx, ti, rec, gpu_t))
             tiles += 1
             if len(pending) >= _SLOT_BATCH:
                 flush()
