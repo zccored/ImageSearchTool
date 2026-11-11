@@ -1010,6 +1010,7 @@ class App:
 
         self._build_style()
         self._build_ui()
+        self._apply_recommended_defaults(notify=False)
         # 阶段进度渲染状态
         self._prog_phase = None
         self._prog_t0 = time.monotonic()
@@ -1313,8 +1314,11 @@ class App:
                                      command=self._whiten_sidecar)
         self.btn_refresh_idx = ttk.Button(row3, text="刷新已索引标记",
                                           command=self._refresh_indexed_state)
+        self.btn_reset_defaults = ttk.Button(
+            row3, text="恢复推荐默认", command=self._reset_build_defaults)
         for b in (self.btn_build_all, self.btn_build_sel, self.btn_add_new,
-                  self.btn_dedup, self.btn_whiten, self.btn_refresh_idx):
+                  self.btn_dedup, self.btn_whiten, self.btn_refresh_idx,
+                  self.btn_reset_defaults):
             b.pack(side="left", padx=(0, 8))
 
         # 第 3.5 行：子图(局部/瓦片)索引 —— 大图切 512px+25% 重叠瓦片入库
@@ -1538,7 +1542,7 @@ class App:
                               "16~20；\n数值越高 CPU 越满，但内存余量不足会触发"
                               "页回收反而变慢")
         self._add_int(page_build, "瓦片建库·同时解码图数", "tile_decode_slots",
-                      24, 1, 64,
+                      18, 1, 64,
                       tooltip="子图(瓦片)索引第一级同时解码的原图数上限，"
                               "配合上面的并发门使用")
         self._add_int(page_build, "瓦片建库·GPU批等待(ms)", "tile_flush_ms",
@@ -2591,6 +2595,48 @@ class App:
         self.log_txt.insert("end", text + "\n")
         self.log_txt.see("end")
         self.log_txt.configure(state="disabled")
+
+    def _recommended_defaults(self) -> dict:
+        """按 CUDA 可用性给出一组可用的建库默认值（无 GPU 时自动走 CPU）。"""
+        try:
+            import torch
+            cuda = bool(torch.cuda.is_available())
+        except Exception:                       # noqa: BLE001
+            cuda = False
+        return {
+            "device": "auto" if cuda else "cpu",
+            "prep": "torch" if cuda else "cpu",
+            "prep_batch": 8 if cuda else 0,
+            "batch": 64 if cuda else 0,
+            "prep_cache": True,
+            "dedup": True,
+            "tile_backend": "auto",
+            "tile_mp_workers": 0,
+            "tile_workers": 24,
+            "tile_fwd_batch": 64,
+            "gpu_governor": "auto" if cuda else "off",
+            "tile_decode_slots": 18,
+            "tile_flush_ms": 20,
+        }
+
+    def _reset_build_defaults(self):
+        self._apply_recommended_defaults(notify=True)
+
+    def _apply_recommended_defaults(self, notify: bool = True):
+        defaults = self._recommended_defaults()
+        for key, value in defaults.items():
+            item = self.entries.get(key)
+            if not item:
+                continue
+            var = item[0]
+            try:
+                var.set(value)
+            except Exception:                   # noqa: BLE001
+                var.set(str(value))
+        if notify:
+            gpu = "CUDA" if defaults["prep"] == "torch" else "CPU"
+            self._status(f"已恢复推荐默认（{gpu}）：device={defaults['device']}，"
+                         f"prep={defaults['prep']}，batch={defaults['batch']}")
 
     def _status(self, text: str):
         self.status_var.set(text)
