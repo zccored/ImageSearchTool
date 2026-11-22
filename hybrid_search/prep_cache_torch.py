@@ -23,6 +23,7 @@ from .io_utils import LOGGER
 MAGIC = b"ITC1"
 DIR_FP16 = "prep_cache_torch"
 DIR_FP32 = "prep_cache_torch_fp32"
+DIR_U16 = "prep_cache_torch_u16"
 
 
 def _sig_of(model: str, side: int, crop: int, dtype: str) -> str:
@@ -32,10 +33,11 @@ def _sig_of(model: str, side: int, crop: int, dtype: str) -> str:
 
 class TorchPrepCache:
     def __init__(self, prefix: str, model: str, side: int = 256,
-                 crop: int = 224, enabled: bool = True, dtype: str = "fp16"):
-        self.dtype = "fp32" if str(dtype).lower() == "fp32" else "fp16"
-        self.np_dtype = np.float32 if self.dtype == "fp32" else np.float16
-        dirname = DIR_FP32 if self.dtype == "fp32" else DIR_FP16
+                 crop: int = 224, enabled: bool = True, dtype: str = "u16"):
+        d = str(dtype).lower()
+        self.dtype = d if d in ("fp32", "fp16", "u16") else "fp32"
+        self.np_dtype = {"fp32": np.float32, "fp16": np.float16, "u16": np.uint16}[self.dtype]
+        dirname = {"fp32": DIR_FP32, "fp16": DIR_FP16, "u16": DIR_U16}[self.dtype]
         self.root = os.path.join(os.path.dirname(os.path.abspath(prefix)), dirname)
         self.enabled = bool(enabled)
         self.sig = _sig_of(model, side, crop, self.dtype)
@@ -89,8 +91,11 @@ class TorchPrepCache:
                     self.misses += 1
                     return None
                 payload = zlib.decompress(fh.read())
-            arr = torch.from_numpy(
-                np.frombuffer(payload, dtype=self.np_dtype).reshape(self.shape).astype(np.float32))
+            raw = np.frombuffer(payload, dtype=self.np_dtype).reshape(self.shape)
+            if self.dtype == "u16":
+                arr = torch.from_numpy(raw.astype(np.float32) / 65535.0)
+            else:
+                arr = torch.from_numpy(raw.astype(np.float32))
             fp = np.frombuffer(base64.b64decode(head["fp"]), dtype=np.uint8)
             hu = np.asarray(head["hu"], dtype=np.float32)
             rec = CoarseRecord(path=path, md5=head["md5"], hu=hu, fp=fp)
@@ -112,7 +117,10 @@ class TorchPrepCache:
             return
         try:
             t = tensor_cpu.detach().to("cpu")
-            arr = t.numpy().astype(self.np_dtype, copy=False)
+            if self.dtype == "u16":
+                arr = np.rint(t.numpy().astype(np.float32) * 65535.0).clip(0, 65535).astype(np.uint16)
+            else:
+                arr = t.numpy().astype(self.np_dtype, copy=False)
             if tuple(arr.shape) != self.shape:
                 return
             head = {

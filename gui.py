@@ -1525,11 +1525,11 @@ class App:
                         ["libdeflate", "libdeflate_compat",
                          "cv2", "imagecodecs", "pillow"])
         self._add_combo(page_build, "预处理缓存精度", "prep_cache_dtype",
-                        ["fp32", "fp16"])
+                        ["u16", "fp32", "fp16"])
         self._add_check(page_build, "启用预处理缓存(重复建库更快/占磁盘)",
                         "prep_cache", True,
-                        tooltip="torch 缓存独立池：fp32 余弦精确（3.7 万约 22.7 GB，重建约 5–10×）；\n"
-                                "fp16 省盘一半，但极近的 top1 可能翻转；首次建库约 +7%。")
+                        tooltip="torch 缓存独立池：u16 与 fp16 同体积（约 11 GB/3.7 万），\n"
+                                "近邻分数误差 3.6e-7、near-tie 0 翻转；fp32 精确但占 2×。")
         self._add_check(page_build, "MD5 内容去重", "dedup", True)
         self._add_int(page_build, "粗筛并行线程(0=自动≤8)", "workers", 0, 0, 64,
                       tooltip="0=自动(不超过8且不超过CPU核数)，1=串行最省内存；\n"
@@ -2615,7 +2615,7 @@ class App:
             "prep_batch": 8 if cuda else 0,
             "batch": 64 if cuda else 0,
             "prep_cache": True,
-            "prep_cache_dtype": "fp32",
+            "prep_cache_dtype": "u16",
             "dedup": True,
             "tile_backend": "auto",
             "tile_mp_workers": 0,
