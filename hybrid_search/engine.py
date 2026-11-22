@@ -303,7 +303,8 @@ class HybridEngine:
             cache = getattr(self, "_prep_cache", None)
             if not isinstance(cache, TorchPrepCache):
                 cache = TorchPrepCache(prefix, model=self.cfg.model,
-                                       side=256, crop=224, enabled=True)
+                                       side=256, crop=224, enabled=True,
+                                       dtype=getattr(self.cfg, "prep_cache_dtype", "fp32"))
             set_prep_cache(None)              # 查询路径仍用实时预处理，不读该缓存
             return cache
         root = default_cache_dir(prefix)
@@ -373,6 +374,7 @@ class HybridEngine:
         ex = self._get_extractor()
         _cache = getattr(self, "_prep_cache", None)
         ex.capture_prep = bool(_cache is not None and hasattr(_cache, "put_async"))
+        ex.capture_dtype = getattr(_cache, "dtype", "fp16") if _cache is not None else "fp16"
         # 内容去重预过滤：同内容文件只处理第一张（其余跳过解码+指纹+预处理；
         # 与“照常处理后被 add_results 按 md5 丢弃”结果等价，索引内容不变）
         if self.cfg.dedup and getattr(self.cfg, "dedup_prefilter", True):

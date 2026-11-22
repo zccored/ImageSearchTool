@@ -1,13 +1,5 @@
 # -*- coding: utf-8 -*-
-"""torch 预处理结果缓存（独立缓存池，fp16 精度）。
-
-与 `prep_cache.py`（PIL/uint8 缓存）**物理隔离**：
-  * 目录 `<prefix目录>/prep_cache_torch`；
-  * 签名含 model/resize/crop/prep=torch/fp16/v1，读到旧格式直接视为未命中；
-  * 条目 = 预处理后的 [3,224,224] float16（zlib）+ CoarseRecord（hu/fp/md5）。
-
-用途：`prep=torch` 的重复建库/增量不再读原图与解码，直接复用同源张量。
-"""
+"""torch 预处理缓存：支持 fp16 / fp32 两种精度（fp32 往返精确，余弦 1.0）。"""
 
 from __future__ import annotations
 
@@ -29,20 +21,24 @@ from .coarse import CoarseRecord
 from .io_utils import LOGGER
 
 MAGIC = b"ITC1"
-DIRNAME = "prep_cache_torch"
+DIR_FP16 = "prep_cache_torch"
+DIR_FP32 = "prep_cache_torch_fp32"
 
 
-def _sig_of(model: str, side: int, crop: int) -> str:
-    raw = f"{model}|resize{side}|crop{crop}|torch|fp16|v1".encode("utf-8")
+def _sig_of(model: str, side: int, crop: int, dtype: str) -> str:
+    raw = f"{model}|resize{side}|crop{crop}|torch|{dtype}|v1".encode("utf-8")
     return hashlib.sha1(raw).hexdigest()[:16]
 
 
 class TorchPrepCache:
     def __init__(self, prefix: str, model: str, side: int = 256,
-                 crop: int = 224, enabled: bool = True):
-        self.root = os.path.join(os.path.dirname(os.path.abspath(prefix)), DIRNAME)
+                 crop: int = 224, enabled: bool = True, dtype: str = "fp16"):
+        self.dtype = "fp32" if str(dtype).lower() == "fp32" else "fp16"
+        self.np_dtype = np.float32 if self.dtype == "fp32" else np.float16
+        dirname = DIR_FP32 if self.dtype == "fp32" else DIR_FP16
+        self.root = os.path.join(os.path.dirname(os.path.abspath(prefix)), dirname)
         self.enabled = bool(enabled)
-        self.sig = _sig_of(model, side, crop)
+        self.sig = _sig_of(model, side, crop, self.dtype)
         self.shape = (3, crop, crop)
         self.hits = 0
         self.misses = 0
@@ -62,7 +58,6 @@ class TorchPrepCache:
                 LOGGER.warning("torch 预处理缓存不可用：%r", e)
                 self.enabled = False
 
-    # ---- 键与路径 ----------------------------------------------------
     @staticmethod
     def key_for(path: str) -> Optional[str]:
         try:
@@ -75,8 +70,7 @@ class TorchPrepCache:
     def file_of(self, key: str) -> str:
         return os.path.join(self.root, key[:2], key + ".bin")
 
-    # ---- 读 ----------------------------------------------------------
-    def get(self, path: str) -> Optional[Tuple[object, CoarseRecord]]:
+    def get(self, path: str) -> Optional[Tuple[torch.Tensor, CoarseRecord]]:
         if not self.enabled:
             return None
         key = self.key_for(path)
@@ -96,7 +90,7 @@ class TorchPrepCache:
                     return None
                 payload = zlib.decompress(fh.read())
             arr = torch.from_numpy(
-                np.frombuffer(payload, dtype="<f2").reshape(self.shape).astype(np.float32))
+                np.frombuffer(payload, dtype=self.np_dtype).reshape(self.shape).astype(np.float32))
             fp = np.frombuffer(base64.b64decode(head["fp"]), dtype=np.uint8)
             hu = np.asarray(head["hu"], dtype=np.float32)
             rec = CoarseRecord(path=path, md5=head["md5"], hu=hu, fp=fp)
@@ -110,17 +104,15 @@ class TorchPrepCache:
             LOGGER.debug("torch 缓存读取失败 %s: %r", fn, e)
             return None
 
-    # ---- 写 ----------------------------------------------------------
     def put_async(self, path: str, tensor_cpu, rec: CoarseRecord) -> None:
-        """tensor_cpu: [3,H,W] CPU float（通常 fp16）。写入失败不影响建库。"""
         if not self.enabled:
             return
         key = self.key_for(path)
         if key is None:
             return
         try:
-            t = tensor_cpu.detach().to("cpu", dtype=None)
-            arr = t.numpy().astype("<f2", copy=False)
+            t = tensor_cpu.detach().to("cpu")
+            arr = t.numpy().astype(self.np_dtype, copy=False)
             if tuple(arr.shape) != self.shape:
                 return
             head = {
@@ -130,7 +122,7 @@ class TorchPrepCache:
                 "fp": base64.b64encode(np.asarray(rec.fp, dtype=np.uint8).tobytes()).decode("ascii"),
             }
             blob = json.dumps(head, separators=(",", ":")).encode("utf-8")
-            self._q.put_nowait((key, blob, arr))          # 压缩交给写线程，避免卡 GPU 消费
+            self._q.put_nowait((key, blob, arr))
         except queue.Full:
             self.errors += 1
         except Exception as e:                           # noqa: BLE001
@@ -144,7 +136,7 @@ class TorchPrepCache:
                 if item is None:
                     return
                 key, blob, arr = item
-                body = zlib.compress(arr.tobytes(), 0)   # 存储档：压缩不是瓶颈，写入更快
+                body = zlib.compress(arr.tobytes(), 0)   # 存储档：换速度，不换精度
                 fn = self.file_of(key)
                 os.makedirs(os.path.dirname(fn), exist_ok=True)
                 tmp = fn + ".tmp"
@@ -179,6 +171,6 @@ class TorchPrepCache:
             pass
 
     def summary(self) -> str:
-        return ("torch预处理缓存：命中 %d / 未命中 %d / 写入 %d（%.1f MB）/ 错误 %d"
-                % (self.hits, self.misses, self.writes,
+        return ("torch预处理缓存[%s]：命中 %d / 未命中 %d / 写入 %d（%.1f MB）/ 错误 %d"
+                % (self.dtype, self.hits, self.misses, self.writes,
                    self.bytes_written / 1e6, self.errors))

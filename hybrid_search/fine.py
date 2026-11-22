@@ -334,8 +334,9 @@ class ResNetExtractor:
             batched[i].copy_(t)
         t2 = _t.perf_counter()
         if getattr(self, "capture_prep", False):
-            # 仅首次建库/缓存未命中时抓一份 fp16 CPU 张量写缓存；不参与前向
-            self.last_prepared_cpu = batched.detach().to(dtype=torch.float16, device="cpu")
+            # 仅首次建库/缓存未命中时抓一份 CPU 张量写缓存；精度随缓存格式
+            _dt = torch.float32 if getattr(self, "capture_dtype", "fp16") == "fp32" else torch.float16
+            self.last_prepared_cpu = batched.detach().to(dtype=_dt, device="cpu")
         else:
             self.last_prepared_cpu = None
         out = self._forward([batched])
