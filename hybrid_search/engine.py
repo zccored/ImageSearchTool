@@ -297,6 +297,15 @@ class HybridEngine:
             return None
         from .fine import _PRE_DOWNSCALE_SIDE, set_prep_cache
         from .prep_cache import PrepCache, default_cache_dir
+        if str(getattr(self.cfg, "prep", "cpu")) == "torch":
+            # torch 预处理缓存：独立目录/签名，存 fp16 张量 + 粗筛，避免与 PIL 缓存混用
+            from .prep_cache_torch import TorchPrepCache
+            cache = getattr(self, "_prep_cache", None)
+            if not isinstance(cache, TorchPrepCache):
+                cache = TorchPrepCache(prefix, model=self.cfg.model,
+                                       side=256, crop=224, enabled=True)
+            set_prep_cache(None)              # 查询路径仍用实时预处理，不读该缓存
+            return cache
         root = default_cache_dir(prefix)
         if getattr(self.cfg, "prep", "cpu") != "cpu":
             # 换实现后旧缓存张量不可复用：直接禁用，避免按路径命中旧 PIL 结果
@@ -333,6 +342,11 @@ class HybridEngine:
     def _log_prep_cache(self) -> None:
         cache = getattr(self, "_prep_cache", None)
         if cache is not None:
+            try:
+                if hasattr(cache, "flush"):
+                    cache.flush()
+            except Exception:                            # noqa: BLE001
+                pass
             LOGGER.info("%s", cache.summary())
 
     # ------------------------------------------------------------------
@@ -357,6 +371,8 @@ class HybridEngine:
         期间 CPU 解码与 GPU 前向双缓冲并行，硬件不空等。
         """
         ex = self._get_extractor()
+        _cache = getattr(self, "_prep_cache", None)
+        ex.capture_prep = bool(_cache is not None and hasattr(_cache, "put_async"))
         # 内容去重预过滤：同内容文件只处理第一张（其余跳过解码+指纹+预处理；
         # 与“照常处理后被 add_results 按 md5 丢弃”结果等价，索引内容不变）
         if self.cfg.dedup and getattr(self.cfg, "dedup_prefilter", True):
@@ -378,16 +394,37 @@ class HybridEngine:
                     return [], None
                 sub_ok = [ok_paths[i] for i in keep]
                 sub_ts = [tensors[i] for i in keep]
-                if sub_ts and isinstance(sub_ts[0], np.ndarray):
-                    feats = ex.forward_rgb(sub_ts)  # 批量 GPU 预处理 + 一次前向
+                sub_pl = [payloads[i] for i in keep]
+                raw_idx = [i for i, t in enumerate(sub_ts) if isinstance(t, np.ndarray)]
+                pre_idx = [i for i in range(len(sub_ts)) if i not in set(raw_idx)]
+                dim = 512
+                rows = np.empty((len(sub_ts), dim), dtype=np.float32)
+                if raw_idx:
+                    raw_ts = [sub_ts[i] for i in raw_idx]
+                    fr = ex.forward_rgb(raw_ts)  # 批量 GPU 预处理 + 一次前向
+                    if fr is None or len(fr) != len(raw_ts):
+                        raise RuntimeError("融合精排返回空结果或行数不匹配")
+                    dim = fr.shape[1]
+                    rows = np.empty((len(sub_ts), dim), dtype=np.float32)
+                    rows[raw_idx] = fr
                     if tr is not None:
                         lt = getattr(ex, "last_times", (0.0, 0.0, 0.0))
-                        tr.append(("batch", t_f0, lt[0], lt[-1], len(sub_ts)))
-                else:
-                    feats = ex._forward(sub_ts)     # noqa: SLF001 同模块协作
-                if feats is None or feats.ndim != 2 or len(feats) != len(keep):
-                    raise RuntimeError("融合精排返回空结果或特征行数不匹配")
-                rows = feats.astype(np.float32)
+                        tr.append(("batch", t_f0, lt[0], lt[-1], len(raw_ts)))
+                    cache = getattr(self, "_prep_cache", None)
+                    prep_cpu = getattr(ex, "last_prepared_cpu", None)
+                    if (cache is not None and hasattr(cache, "put_async")
+                            and prep_cpu is not None and len(prep_cpu) == len(raw_ts)):
+                        for j, i in enumerate(raw_idx):
+                            cache.put_async(sub_ok[i], prep_cpu[j], sub_pl[i])
+                if pre_idx:
+                    fp_ = ex._forward([sub_ts[i] for i in pre_idx])  # noqa: SLF001
+                    if fp_ is None or len(fp_) != len(pre_idx):
+                        raise RuntimeError("融合精排返回空结果或行数不匹配")
+                    dim = fp_.shape[1]
+                    if rows.shape[1] != dim:
+                        rows = np.empty((len(sub_ts), dim), dtype=np.float32)
+                    rows[pre_idx] = fp_
+                rows = rows.astype(np.float32)
                 norms = np.linalg.norm(rows, axis=1, keepdims=True)
                 norms[norms < 1e-8] = 1.0
                 rows /= norms
@@ -420,6 +457,7 @@ class HybridEngine:
         # “读原图(数 MB) + md5 + 解码(18~600ms) + 粗筛特征 + PIL 预处理”，
         # 只需 ~1.5ms 重建张量，且与全新建库**逐位一致**（PNG 无损）。
         cache = getattr(self, "_prep_cache", None)
+        torch_cache = bool(cache is not None and hasattr(cache, "put_async"))
 
         def prep(path):
             tr = getattr(self, "_trace", None)
@@ -427,6 +465,12 @@ class HybridEngine:
             if cache is not None:
                 hit = cache.get(path)
                 if hit is not None:
+                    _t, _rec = hit if isinstance(hit, tuple) else (hit, None)
+                    if (_rec is not None and seen is not None and _rec.md5):
+                        with seen_lock:
+                            if _rec.md5 in seen:
+                                return None, None
+                            seen.add(_rec.md5)
                     return hit
             data = read_bytes(path)
             if data is None:
@@ -487,8 +531,11 @@ class HybridEngine:
                 if seen is not None and md5:
                     with seen_lock:
                         seen.add(md5)        # 成功产出后才登记，失败不污染
-                if cache is not None:
+                if cache is not None and not torch_cache:
                     cache.put(path, tensor, rec, ex._mean, ex._std)
+                elif torch_cache and not isinstance(tensor, np.ndarray):
+                    # 逐张 torch 预处理路径：张量已是 [3,224,224]，直接入队
+                    cache.put_async(path, tensor, rec)
                 return tensor, rec
             except Exception as e:  # noqa: BLE001 —— 单张失败不影响整体
                 LOGGER.debug("融合解码失败 %s: %r", path, e)

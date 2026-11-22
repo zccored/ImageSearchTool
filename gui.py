@@ -1525,7 +1525,9 @@ class App:
                         ["libdeflate", "libdeflate_compat",
                          "cv2", "imagecodecs", "pillow"])
         self._add_check(page_build, "启用预处理缓存(重复建库更快/占磁盘)",
-                        "prep_cache", True)
+                        "prep_cache", True,
+                        tooltip="torch 路径使用独立 prep_cache_torch：首次建库约 +7%，\n"
+                                "重建约 10×；3.7 万张约占 11 GB。")
         self._add_check(page_build, "MD5 内容去重", "dedup", True)
         self._add_int(page_build, "粗筛并行线程(0=自动≤8)", "workers", 0, 0, 64,
                       tooltip="0=自动(不超过8且不超过CPU核数)，1=串行最省内存；\n"

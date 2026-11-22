@@ -333,6 +333,11 @@ class ResNetExtractor:
         for i, t in enumerate(tensors):
             batched[i].copy_(t)
         t2 = _t.perf_counter()
+        if getattr(self, "capture_prep", False):
+            # 仅首次建库/缓存未命中时抓一份 fp16 CPU 张量写缓存；不参与前向
+            self.last_prepared_cpu = batched.detach().to(dtype=torch.float16, device="cpu")
+        else:
+            self.last_prepared_cpu = None
         out = self._forward([batched])
         self.last_times = (t1 - t0, t2 - t1, _t.perf_counter() - t2)
         return out
