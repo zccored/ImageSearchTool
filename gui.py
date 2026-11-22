@@ -1642,10 +1642,12 @@ class App:
         if tooltip:
             self._tip(e, tooltip)
 
-    def _add_check(self, page, label, key, default):
+    def _add_check(self, page, label, key, default, tooltip=None):
         var = tk.BooleanVar(value=default)
-        ttk.Checkbutton(page, text=label, variable=var).pack(
-            anchor="w", pady=1)
+        cb = ttk.Checkbutton(page, text=label, variable=var)
+        cb.pack(anchor="w", pady=1)
+        if tooltip:
+            self._tip(cb, tooltip)
         self.entries[key] = (var, "bool", None)
 
     def _add_perf_flag(self, page, label, key, var, tooltip=None):
