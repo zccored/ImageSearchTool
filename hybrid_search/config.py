@@ -172,6 +172,12 @@ class Config:
     # md5”，重复建库时**完全跳过读原图与解码**（命中约 1.5ms/张，且逐位一致）。
     # 实测 CPU 侧 85ms/张 vs GPU 0.41ms/张 —— 这是把 GPU 真正喂饱的关键。
     # torch 预处理缓存精度：fp32=余弦精确（约 602 KB/张）；fp16=省盘（约 301 KB/张）
+    # 全量建库断点特征检查点：中断后复用已完成图片的 512 维特征，跳过 decode/forward。
+    # 预留：未来多盘性能天平（disk balance）会在此扩展按盘调度；当前只做单盘。
+    feature_checkpoint: bool = True
+    # 语义抽样条数；strict=True 时要求全部抽样通过且至少抽到 1 条
+    feature_checkpoint_sample: int = 64
+    feature_checkpoint_strict: bool = False
     prep_cache_dtype: str = "u16"
     prep_cache: bool = True
     # torch 推理线程数（0=保持 torch 默认；CPU 单线程前向通常最优，

@@ -167,6 +167,7 @@ class HybridEngine:
         elif limit is not None and limit > 0:
             paths = paths[:limit]
 
+        self._active_prefix = prefix
         self._prep_cache = self._make_prep_cache(prefix)
         has_fine = False
         feat_dim = None
@@ -202,6 +203,7 @@ class HybridEngine:
             _phase(progress, n, n, "save")
 
         self._save_all(files, has_fine=has_fine, feature_dim=feat_dim)
+        self._close_checkpoint()
         _phase(progress, self.coarse.size, self.coarse.size, "done")
         self._log_prep_cache()
         LOGGER.info("索引构建完成：%d 张，耗时 %.1f s，输出前缀 %s.*",
@@ -221,6 +223,7 @@ class HybridEngine:
             paths = collect_images(img_dir, self.cfg.extensions, limit=limit)
         elif limit is not None and limit > 0:
             paths = paths[:limit]
+        self._active_prefix = prefix
         self._prep_cache = self._make_prep_cache(prefix)
         old_n = self.coarse.size
         old_has_fine = self._fine_feats is not None
@@ -277,6 +280,7 @@ class HybridEngine:
                 return 0
             _phase(progress, added, added, "save")
             self._save_all(IndexFiles(prefix), has_fine=False)
+        self._close_checkpoint()
         _phase(progress, self.coarse.size, self.coarse.size, "done")
         self._log_prep_cache()
         LOGGER.info("增量入库完成：+%d 张（总计 %d），耗时 %.1f s",
@@ -340,6 +344,15 @@ class HybridEngine:
         finally:
             self._trace = None
 
+    def _close_checkpoint(self) -> None:
+        ck = getattr(self, "_checkpoint", None)
+        if ck is not None:
+            try:
+                ck.close()
+            except Exception:                            # noqa: BLE001
+                pass
+            self._checkpoint = None
+
     def _log_prep_cache(self) -> None:
         cache = getattr(self, "_prep_cache", None)
         if cache is not None:
@@ -372,6 +385,34 @@ class HybridEngine:
         期间 CPU 解码与 GPU 前向双缓冲并行，硬件不空等。
         """
         ex = self._get_extractor()
+        self._checkpoint = None
+        self._feature_cache = {}
+        _active = getattr(self, "_active_prefix", "")
+        if (getattr(self.cfg, "feature_checkpoint", False) and _active
+                and getattr(self.cfg, "store_fine", True)):
+            try:
+                from .feature_checkpoint import FeatureCheckpoint
+                ck = FeatureCheckpoint(_active, self.cfg, ex.feature_dim, enabled=True)
+                loaded = ck.load(paths)
+                if loaded is None:
+                    ck.reset()
+                else:
+                    sem = ck.verify_semantic(
+                        loaded, ex, getattr(self, "_prep_cache", None),
+                        sample=int(getattr(self.cfg, "feature_checkpoint_sample", 64) or 64))
+                    strict = bool(getattr(self.cfg, "feature_checkpoint_strict", False))
+                    if (not sem.get("ok", False)) or (strict and int(sem.get("checked", 0)) <= 0):
+                        LOGGER.warning("断点特征检查点语义校验失败，拒绝使用：%r", sem)
+                        ck.reset()
+                        self._feature_cache = {}
+                    else:
+                        self._feature_cache = {p: (e.feature, e.rec()) for p, e in loaded.items()}
+                        LOGGER.info("断点特征检查点可用：%d 条（语义抽样 %d 条，cos_min=%s）",
+                                    len(loaded), sem.get("checked", 0), sem.get("cos_min"))
+                self._checkpoint = ck
+            except Exception as e:                        # noqa: BLE001
+                LOGGER.warning("断点特征检查点不可用：%r", e)
+                self._checkpoint = None
         _cache = getattr(self, "_prep_cache", None)
         ex.capture_prep = bool(_cache is not None and hasattr(_cache, "put_async"))
         _cd = getattr(_cache, "dtype", "fp16") if _cache is not None else "fp16"
@@ -398,10 +439,19 @@ class HybridEngine:
                 sub_ok = [ok_paths[i] for i in keep]
                 sub_ts = [tensors[i] for i in keep]
                 sub_pl = [payloads[i] for i in keep]
-                raw_idx = [i for i, t in enumerate(sub_ts) if isinstance(t, np.ndarray)]
-                pre_idx = [i for i in range(len(sub_ts)) if i not in set(raw_idx)]
+                feat_idx = [i for i, t in enumerate(sub_ts)
+                            if isinstance(t, np.ndarray) and t.ndim == 1]
+                raw_idx = [i for i, t in enumerate(sub_ts)
+                           if isinstance(t, np.ndarray) and t.ndim >= 2]
+                pre_idx = [i for i in range(len(sub_ts))
+                           if i not in set(feat_idx) and i not in set(raw_idx)]
                 dim = 512
                 rows = np.empty((len(sub_ts), dim), dtype=np.float32)
+                if feat_idx:
+                    fv = np.stack([np.asarray(sub_ts[i], dtype=np.float32) for i in feat_idx])
+                    dim = fv.shape[1]
+                    rows = np.empty((len(sub_ts), dim), dtype=np.float32)
+                    rows[feat_idx] = fv
                 if raw_idx:
                     raw_ts = [sub_ts[i] for i in raw_idx]
                     fr = ex.forward_rgb(raw_ts)  # 批量 GPU 预处理 + 一次前向
@@ -431,6 +481,12 @@ class HybridEngine:
                 norms = np.linalg.norm(rows, axis=1, keepdims=True)
                 norms[norms < 1e-8] = 1.0
                 rows /= norms
+                ck = getattr(self, "_checkpoint", None)
+                if ck is not None:
+                    try:
+                        ck.append(sub_ok, rows, sub_pl)
+                    except Exception as e:                # noqa: BLE001
+                        LOGGER.warning("断点特征检查点追加失败：%r", e)
                 if tr is not None:
                     tr.append(("fwd", t_f0, time.perf_counter() - t_f0, wait,
                                len(sub_ok)))
@@ -465,6 +521,17 @@ class HybridEngine:
         def prep(path):
             tr = getattr(self, "_trace", None)
             t_start = time.perf_counter() if tr is not None else 0.0
+            fc = getattr(self, "_feature_cache", None)
+            if fc:
+                item = fc.get(path)
+                if item is not None:
+                    feat, rec = item
+                    if rec is not None and rec.md5 and seen is not None:
+                        with seen_lock:
+                            if rec.md5 in seen:
+                                return None, None
+                            seen.add(rec.md5)
+                    return np.asarray(feat, dtype=np.float32), rec
             if cache is not None:
                 hit = cache.get(path)
                 if hit is not None:

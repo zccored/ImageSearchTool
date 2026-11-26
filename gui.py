@@ -1526,6 +1526,10 @@ class App:
                          "cv2", "imagecodecs", "pillow"])
         self._add_combo(page_build, "预处理缓存精度", "prep_cache_dtype",
                         ["u16", "fp32", "fp16"])
+        self._add_check(page_build, "断点特征检查点(中断后可跳过已完成特征)",
+                        "feature_checkpoint", True,
+                        tooltip="全量建库中断后，下一次同路径重建可直接复用已完成的\n"
+                                "512 维特征，跳过解码与 GPU 前向；约 2 KB/张。")
         self._add_check(page_build, "启用预处理缓存(重复建库更快/占磁盘)",
                         "prep_cache", True,
                         tooltip="torch 缓存独立池：u16 与 fp16 同体积（约 11 GB/3.7 万），\n"
@@ -2616,6 +2620,7 @@ class App:
             "batch": 64 if cuda else 0,
             "prep_cache": True,
             "prep_cache_dtype": "u16",
+            "feature_checkpoint": True,
             "dedup": True,
             "tile_backend": "auto",
             "tile_mp_workers": 0,
