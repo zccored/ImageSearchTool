@@ -159,3 +159,29 @@ resume 后的最终索引由两部分组成：
 - 性能天平目标：各盘有效吞吐 × 权重接近，而不是简单平均分配线程。
 
 本版本只做单盘路径，不引入调度逻辑。
+
+## 8. 当前实现与实测（2026-11-26）
+
+已实现：
+
+- `hybrid_search/feature_checkpoint.py`：path-keyed 记录、CRC32、manifest 原子提交、签名校验、结构校验、64 条语义抽样；
+- `engine.build/add` 自动写入/复用；GUI「断点特征检查点」开关（默认开）；
+- `devtools/validate_feature_index.py`：完整索引结构校验；
+- `devtools/validate_feature_checkpoint.py`：检查点结构校验；
+- `devtools/seed_feature_checkpoint.py`：从现有完整索引迁移，无需重算。
+
+实测（F: 生产索引 37,782 条）：
+
+| 项 | 结果 |
+|---|---:|
+| 迁移检查点 | 37,782 条 / 2.7 s / 104.4 MB |
+| 全量热构建 | 6.31 s（对照冷构建 337.64 s） |
+| 语义抽样 | 64 条，cos_min 0.9999997616 |
+| 结构校验 | ok，0 条变更/缺失 |
+
+尚未实现：
+
+- `strict-audit`：对全部 N 条用 u16 张量缓存重算比对；
+- 多盘性能天平：仅 `disk_hint` 字段 + 本文第 7 节占位。
+
+报告：`perf_reports/feature_checkpoint_full.md`
