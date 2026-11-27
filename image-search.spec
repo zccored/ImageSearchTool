@@ -50,11 +50,39 @@ WEIGHTS_DIR = os.path.join(os.environ.get("USERPROFILE", ""),
 hiddenimports = [
     "torch", "torchvision", "torchvision.models",
     "cv2", "PIL", "numpy", "psutil",
+    # 运行期按需 import 的本地模块（PyInstaller 静态分析可能漏收）
+    "hybrid_search.distribution",
+    "hybrid_search.feature_checkpoint",
+    "hybrid_search.prep_cache_torch",
 ]
 
 datas = [
     (os.path.join(SRC, "peer_manifest.json"), "."),
 ]
+
+# ---- 原生 PNG 加速模块与 VC/OpenMP 运行库 --------------------------------
+# PyInstaller 不会自动收 hybrid_search/native 下的运行期 pyd/dll；
+# torch_cpu.dll 还依赖 System32 的 libomp140.x86_64.dll（干净 Windows 上不一定有）。
+NATIVE_DIR = os.path.join(SRC, "hybrid_search", "native")
+_SYS32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+extra_binaries = []
+def _add_binary(src, dest):
+    if os.path.isfile(src):
+        extra_binaries.append((src, dest))
+    else:
+        print("[spec] 警告：缺少打包依赖 %s" % src)
+_add_binary(os.path.join(NATIVE_DIR, "_pngfast.cp312-win_amd64.pyd"),
+            "hybrid_search/native")
+_add_binary(os.path.join(NATIVE_DIR, "libdeflate.dll"),
+            "hybrid_search/native")
+for _name in ("libomp140.x86_64.dll",):
+    _add_binary(os.path.join(_SYS32, _name), "torch/lib")
+    _add_binary(os.path.join(_SYS32, _name), ".")
+for _name in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll",
+              "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll",
+              "concrt140.dll", "vcomp140.dll"):
+    _add_binary(os.path.join(_SYS32, _name), ".")
+print("[spec] 额外运行库/原生模块：%d 个" % len(extra_binaries))
 if os.path.isdir(WEIGHTS_DIR):
     datas.append((WEIGHTS_DIR, "torch_home/hub/checkpoints"))
 
@@ -92,7 +120,7 @@ runtime_hooks = [
 a_gui = Analysis(
     [os.path.join(SRC, "gui.py")],
     pathex=[SRC],
-    binaries=[],
+    binaries=extra_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
