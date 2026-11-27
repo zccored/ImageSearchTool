@@ -1076,6 +1076,10 @@ class SearchService:
                 # 建库前先释放缓存引擎：把内存让给解码流水线（瓦片库可占 1GB+）
                 self._drop_engines("建库前腾内存")
                 self._check_cancel(task_id)
+                if action == "build" and getattr(cfg, "distribute", False):
+                    from .distribution import parse_targets
+                    if not parse_targets(getattr(cfg, "distribute_targets", "")):
+                        raise ValueError("已启用分发，但没有填写分发目标（路径=权重;...）")
                 t0 = time.time()
                 eng = HybridEngine(cfg)
                 if prof:
@@ -1087,6 +1091,26 @@ class SearchService:
                 if action == "build":
                     kw["force"] = force
                 n = (eng.build if action == "build" else eng.add)(prefix, **kw)
+                dist_report = None
+                if action == "build" and getattr(cfg, "distribute", False):
+                    from .distribution import parse_targets, distribute
+                    targets = parse_targets(getattr(cfg, "distribute_targets", ""))
+                    if not targets:
+                        raise ValueError("已启用分发，但没有填写分发目标（路径=权重;...）")
+                    src_root = (getattr(cfg, "distribute_source", "") or img_dir or "").strip()
+                    if not src_root and paths:
+                        src_root = os.path.commonpath([os.path.abspath(p) for p in paths])
+                    if not src_root:
+                        raise ValueError("无法确定临时图库根目录，请设置 distribute_source")
+                    if prof:
+                        prof.mark("分发文件到目标盘", 目标数=len(targets))
+                    dist_report = distribute(
+                        prefix, src_root, targets,
+                        progress=self._progress_cb(task_id, prof),
+                        verify_hash=bool(getattr(cfg, "distribute_verify_hash", False)))
+                    if prof:
+                        prof.mark("分发完成", 文件=dist_report.get("files", 0),
+                                  目标=len(dist_report.get("targets", [])))
                 if prof:
                     # op 返回即代表“特征提取 + 落盘”全部结束（engine 内部有
                     # save/done 阶段边界事件，这里再补一条终结打点）
@@ -1095,7 +1119,7 @@ class SearchService:
                     prof, task_id=task_id, modal=True, note=f"{n} 张",
                     extra=[("结果", [("入库张数", n)])])
                 return {"n": n, "prefix": prefix, "title": title,
-                        "perf": perf_path}
+                        "perf": perf_path, "distribute": dist_report}
             except Exception as e:                           # noqa: BLE001
                 self._perf_finish(prof, task_id=task_id, status="error",
                                   note=str(e)[:120])

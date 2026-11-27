@@ -174,6 +174,11 @@ class Config:
     # torch 预处理缓存精度：fp32=余弦精确（约 602 KB/张）；fp16=省盘（约 301 KB/张）
     # 全量建库断点特征检查点：中断后复用已完成图片的 512 维特征，跳过 decode/forward。
     # 预留：未来多盘性能天平（disk balance）会在此扩展按盘调度；当前只做单盘。
+    # 分发插件（默认关闭）：建库完成后把临时图库文件迁移到多个目标盘，并重写索引路径。
+    distribute: bool = False
+    distribute_targets: str = ""       # "path=weight;path2=weight"
+    distribute_source: str = ""        # 临时图库根；空则用 img_dir/commonpath
+    distribute_verify_hash: bool = False
     feature_checkpoint: bool = True
     # 语义抽样条数；strict=True 时要求全部抽样通过且至少抽到 1 条
     feature_checkpoint_sample: int = 64

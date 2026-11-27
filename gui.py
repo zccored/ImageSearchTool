@@ -1526,6 +1526,14 @@ class App:
                          "cv2", "imagecodecs", "pillow"])
         self._add_combo(page_build, "预处理缓存精度", "prep_cache_dtype",
                         ["u16", "fp32", "fp16"])
+        self._add_check(page_build, "构建后分发图库（默认关闭）",
+                        "distribute", False,
+                        tooltip="建库完成后把临时图库图片迁移到下面填写的目标盘；\n"
+                                "所有文件移动成功后才重写索引路径，失败会回滚。")
+        self._add_text(page_build, "分发目标(路径=权重;多个用;分隔)",
+                       "distribute_targets", "",
+                       tooltip="示例：Z:\\gallery_a=1;Y:\\gallery_b=1\n"
+                               "权重越大分到越多文件；留空则不分发。")
         self._add_check(page_build, "断点特征检查点(中断后可跳过已完成特征)",
                         "feature_checkpoint", True,
                         tooltip="全量建库中断后，下一次同路径重建可直接复用已完成的\n"
@@ -1759,6 +1767,7 @@ class App:
                     elif key == "prefix":
                         prefix = raw.strip()
                         self.prefix = prefix if prefix else self._auto_prefix()
+            cfg.distribute_source = self.dir_var.get().strip()
             if require_prefix and not self.prefix:
                 raise ValueError("请先填写“索引前缀”或选择图库目录后自动生成")
             return cfg
@@ -2621,6 +2630,8 @@ class App:
             "prep_cache": True,
             "prep_cache_dtype": "u16",
             "feature_checkpoint": True,
+            "distribute": False,
+            "distribute_targets": "",
             "dedup": True,
             "tile_backend": "auto",
             "tile_mp_workers": 0,

@@ -197,6 +197,15 @@ def _mk_progress(a: argparse.Namespace, total_phases: int):
 
 
 def cmd_build(cfg: Config, a: argparse.Namespace) -> int:
+    cfg.distribute = bool(getattr(a, "distribute", False))
+    cfg.distribute_targets = ";".join(getattr(a, "distribute_target", None) or [])
+    cfg.distribute_source = getattr(a, "distribute_source", None) or a.img_dir
+    cfg.distribute_verify_hash = bool(getattr(a, "distribute_verify_hash", False))
+    if cfg.distribute:
+        from .distribution import parse_targets
+        if not parse_targets(cfg.distribute_targets):
+            LOGGER.error("已启用分发，但没有 --distribute-target")
+            return 2
     eng = HybridEngine(cfg)
     # 需 ResNet 时融合建库（fused），否则纯粗筛 —— 均为单阶段进度
     phases = 1
@@ -204,11 +213,25 @@ def cmd_build(cfg: Config, a: argparse.Namespace) -> int:
     try:
         n = eng.build(a.prefix, a.img_dir, limit=_val(a, "limit"),
                       force=a.force, progress=p)
+        if cfg.distribute:
+            from .distribution import parse_targets, distribute
+            LOGGER.info("开始分发：%s", cfg.distribute_targets)
+            rep = distribute(
+                a.prefix, cfg.distribute_source, parse_targets(cfg.distribute_targets),
+                progress=(lambda d, t: p(d, t, "distribute")) if p else None,
+                verify_hash=cfg.distribute_verify_hash)
+            LOGGER.info("分发完成：%s 个文件 -> %s", rep.get("files"),
+                        [x.get("path") for x in rep.get("targets", [])])
     except FileExistsError as e:
         LOGGER.error("%s", e)
         if p:
             p.finish()
         return 2
+    except Exception as e:                                  # noqa: BLE001
+        LOGGER.error("build/分发失败：%r", e)
+        if p:
+            p.finish()
+        return 1
     finally:
         if p:
             p.finish()
@@ -727,6 +750,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("img_dir", help="图库目录（递归扫描）")
     sp.add_argument("--force", action="store_true", help="索引已存在时覆盖重建")
     sp.add_argument("--limit", type=int, default=None, help="只处理前 N 张（测试）")
+    sp.add_argument("--distribute", action="store_true",
+                    help="建库完成后分发图库到目标盘（默认关闭）")
+    sp.add_argument("--distribute-target", action="append", default=[],
+                    help="分发目标 path=weight，可重复；例如 Z:\\gallery=1")
+    sp.add_argument("--distribute-source", default=None,
+                    help="临时图库根（默认 img_dir）")
+    sp.add_argument("--distribute-verify-hash", action="store_true",
+                    help="分发时对每个文件做 SHA256 校验（慢）")
     sp.set_defaults(func=cmd_build)
 
     # ---- add
