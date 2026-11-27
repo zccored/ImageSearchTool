@@ -971,12 +971,29 @@ class SearchService:
 
         def job() -> Dict:
             t0 = time.time()
-            paths = collect_images(root, cfg.extensions, sort=True)
+            # 联邦插件：从一个分发节点/总索引目录自动展开同链的全部根
+            roots = [root]
+            if getattr(cfg, "federation", False):
+                try:
+                    from .federation import scan_roots
+                    roots = scan_roots(root)
+                    LOGGER.info("联邦扫描根：%s", roots)
+                except Exception as e:                           # noqa: BLE001
+                    LOGGER.warning("联邦扫描展开失败，回退单目录：%r", e)
+                    roots = [root]
+            paths = []
+            seen = set()
+            for r in roots:
+                for p in collect_images(r, cfg.extensions, sort=True):
+                    k = os.path.normcase(os.path.abspath(p))
+                    if k not in seen:
+                        seen.add(k)
+                        paths.append(p)
             if not recursive:
-                base = os.path.normcase(os.path.abspath(root)) + os.sep
+                bases = [os.path.normcase(os.path.abspath(r)) + os.sep for r in roots]
                 paths = [p for p in paths
-                         if os.path.sep not in
-                         os.path.normcase(os.path.abspath(p))[len(base):]]
+                         if any(os.path.sep not in os.path.normcase(os.path.abspath(p))[len(b):]
+                                for b in bases)]
             cnt = Counter(os.path.splitext(p)[1].lower() for p in paths)
             broken = 0
             if verify and paths:
@@ -1111,6 +1128,41 @@ class SearchService:
                     if prof:
                         prof.mark("分发完成", 文件=dist_report.get("files", 0),
                                   目标=len(dist_report.get("targets", [])))
+                fed_report = None
+                if action == "build" and getattr(cfg, "federation", False):
+                    try:
+                        from .federation import (publish_after_distribution,
+                                                  write_node_marker, write_total,
+                                                  discover)
+                        total_dir = (getattr(cfg, "federation_total_dir", "") or
+                                     os.path.dirname(os.path.abspath(prefix)))
+                        total_dir = os.path.abspath(total_dir)
+                        node_id = getattr(cfg, "federation_node_id", "") or ""
+                        if dist_report:
+                            fed_report = publish_after_distribution(
+                                prefix, total_dir, dist_report, node_id=node_id)
+                        else:
+                            src = (getattr(cfg, "distribute_source", "") or img_dir or "").strip()
+                            if not src and paths:
+                                src = os.path.commonpath([os.path.abspath(p) for p in paths])
+                            if src:
+                                root_id = "fed-single"
+                                raw = write_node_marker(
+                                    src, prefix, root_id=root_id,
+                                    node_id=node_id or "single",
+                                    resume={"kind": "build",
+                                            "breakpoint": {"done": int(n),
+                                                           "total": int(n),
+                                                           "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}})
+                                nodes = discover(src)
+                                total = write_total(total_dir, prefix, nodes, root_id=root_id)
+                                fed_report = {"ok": True, "total": total,
+                                              "nodes": [x.as_dict() for x in nodes]}
+                        if prof and fed_report:
+                            prof.mark("联邦 manifest 写入", 节点=len(fed_report.get("nodes", [])))
+                    except Exception as e:                       # noqa: BLE001
+                        LOGGER.warning("联邦 manifest 写入失败（不影响索引）：%r", e)
+                        fed_report = {"ok": False, "error": repr(e)}
                 if prof:
                     # op 返回即代表“特征提取 + 落盘”全部结束（engine 内部有
                     # save/done 阶段边界事件，这里再补一条终结打点）
@@ -1119,7 +1171,8 @@ class SearchService:
                     prof, task_id=task_id, modal=True, note=f"{n} 张",
                     extra=[("结果", [("入库张数", n)])])
                 return {"n": n, "prefix": prefix, "title": title,
-                        "perf": perf_path, "distribute": dist_report}
+                        "perf": perf_path, "distribute": dist_report,
+                        "federation": fed_report}
             except Exception as e:                           # noqa: BLE001
                 self._perf_finish(prof, task_id=task_id, status="error",
                                   note=str(e)[:120])
@@ -1364,6 +1417,17 @@ class SearchService:
                                      f"（可选 {'/'.join(SEARCH_MODES)}）")
                 hits = [(h.rank, h.path, h.fine_score, h.coarse_score, h.d_fp,
                          h.box, h.match_kind) for h in out.hits]
+                fed_dropped = 0
+                if getattr(cfg, "federation", False):
+                    try:
+                        from .federation import filter_hits
+                        td = (getattr(cfg, "federation_total_dir", "") or
+                              os.path.dirname(os.path.abspath(prefix)))
+                        hits, fed_dropped = filter_hits(td, prefix, hits)
+                        if fed_dropped:
+                            LOGGER.info("联邦检索：断开 %d 条不可读区域命中", fed_dropped)
+                    except Exception as e:                       # noqa: BLE001
+                        LOGGER.warning("联邦检索过滤失败（忽略）：%r", e)
                 perf_path = self._perf_finish(
                     prof, task_id=task_id, note=f"命中 {len(hits)} 条",
                     extra=[("检索耗时明细(s)", list(out.times.items())),
@@ -1374,6 +1438,7 @@ class SearchService:
                 return {"hits": hits, "db": out.db_size, "kept": out.coarse_kept,
                         "coarse_only": out.coarse_only,
                         "self_excluded": out.self_excluded,
+                        "federation_dropped": fed_dropped,
                         "times": dict(out.times), "method": mode,
                         "perf": perf_path}
             except Exception as e:                           # noqa: BLE001

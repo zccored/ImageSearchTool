@@ -52,6 +52,7 @@ hiddenimports = [
     "cv2", "PIL", "numpy", "psutil",
     # 运行期按需 import 的本地模块（PyInstaller 静态分析可能漏收）
     "hybrid_search.distribution",
+    "hybrid_search.federation",
     "hybrid_search.feature_checkpoint",
     "hybrid_search.prep_cache_torch",
 ]

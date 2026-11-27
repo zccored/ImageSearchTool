@@ -1534,6 +1534,16 @@ class App:
                        "distribute_targets", "",
                        tooltip="示例：Z:\\gallery_a=1;Y:\\gallery_b=1\n"
                                "权重越大分到越多文件；留空则不分发。")
+        self._add_check(page_build, "启用图库联邦/链式索引（插件，默认关闭）",
+                        "federation", False,
+                        tooltip="分发盘根目录写 node marker；从任一节点可发现同链图库；\n"
+                                "总索引目录写 federation.json，可一次校验/断开缺失盘区域。")
+        self._add_text(page_build, "总索引目录(联邦插件，可空)",
+                       "federation_total_dir", "",
+                       tooltip="留空=索引前缀所在目录；建议放在 C 的 .gallery_index 下。")
+        self._add_text(page_build, "联邦节点 ID(可选)",
+                       "federation_node_id", "",
+                       tooltip="例如 disk-D-kemono；留空自动生成。")
         self._add_check(page_build, "断点特征检查点(中断后可跳过已完成特征)",
                         "feature_checkpoint", True,
                         tooltip="全量建库中断后，下一次同路径重建可直接复用已完成的\n"
@@ -1767,6 +1777,8 @@ class App:
                     elif key == "prefix":
                         prefix = raw.strip()
                         self.prefix = prefix if prefix else self._auto_prefix()
+                    else:
+                        setattr(cfg, target, raw)
             cfg.distribute_source = self.dir_var.get().strip()
             if require_prefix and not self.prefix:
                 raise ValueError("请先填写“索引前缀”或选择图库目录后自动生成")
@@ -2632,6 +2644,9 @@ class App:
             "feature_checkpoint": True,
             "distribute": False,
             "distribute_targets": "",
+            "federation": False,
+            "federation_total_dir": "",
+            "federation_node_id": "",
             "dedup": True,
             "tile_backend": "auto",
             "tile_mp_workers": 0,

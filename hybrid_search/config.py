@@ -175,6 +175,10 @@ class Config:
     # 全量建库断点特征检查点：中断后复用已完成图片的 512 维特征，跳过 decode/forward。
     # 预留：未来多盘性能天平（disk balance）会在此扩展按盘调度；当前只做单盘。
     # 分发插件（默认关闭）：建库完成后把临时图库文件迁移到多个目标盘，并重写索引路径。
+    # 联邦/链式索引插件（默认关闭）；只读写 manifest，不改核心特征格式。
+    federation: bool = False
+    federation_total_dir: str = ""     # 总索引目录；空则用索引前缀所在目录
+    federation_node_id: str = ""       # 可选节点名
     distribute: bool = False
     distribute_targets: str = ""       # "path=weight;path2=weight"
     distribute_source: str = ""        # 临时图库根；空则用 img_dir/commonpath

@@ -201,6 +201,9 @@ def cmd_build(cfg: Config, a: argparse.Namespace) -> int:
     cfg.distribute_targets = ";".join(getattr(a, "distribute_target", None) or [])
     cfg.distribute_source = getattr(a, "distribute_source", None) or a.img_dir
     cfg.distribute_verify_hash = bool(getattr(a, "distribute_verify_hash", False))
+    cfg.federation = bool(getattr(a, "federation", False))
+    cfg.federation_total_dir = getattr(a, "federation_total", None) or ""
+    cfg.federation_node_id = getattr(a, "federation_node_id", "") or ""
     if cfg.distribute:
         from .distribution import parse_targets
         if not parse_targets(cfg.distribute_targets):
@@ -213,15 +216,32 @@ def cmd_build(cfg: Config, a: argparse.Namespace) -> int:
     try:
         n = eng.build(a.prefix, a.img_dir, limit=_val(a, "limit"),
                       force=a.force, progress=p)
+        dist_report = None
         if cfg.distribute:
             from .distribution import parse_targets, distribute
             LOGGER.info("开始分发：%s", cfg.distribute_targets)
-            rep = distribute(
+            dist_report = distribute(
                 a.prefix, cfg.distribute_source, parse_targets(cfg.distribute_targets),
                 progress=(lambda d, t: p(d, t, "distribute")) if p else None,
                 verify_hash=cfg.distribute_verify_hash)
-            LOGGER.info("分发完成：%s 个文件 -> %s", rep.get("files"),
-                        [x.get("path") for x in rep.get("targets", [])])
+            LOGGER.info("分发完成：%s 个文件 -> %s", dist_report.get("files"),
+                        [x.get("path") for x in dist_report.get("targets", [])])
+        if cfg.federation:
+            from .federation import (publish_after_distribution, write_node_marker,
+                                     write_total, discover)
+            total_dir = cfg.federation_total_dir or os.path.dirname(os.path.abspath(a.prefix))
+            if dist_report:
+                fed = publish_after_distribution(a.prefix, total_dir, dist_report,
+                                                 node_id=cfg.federation_node_id)
+            else:
+                rid = "fed-single"
+                write_node_marker(a.img_dir, a.prefix, root_id=rid,
+                                  node_id=cfg.federation_node_id or "single",
+                                  resume={"kind": "build",
+                                          "breakpoint": {"done": int(n), "total": int(n)}})
+                fed = {"ok": True, "total": write_total(total_dir, a.prefix,
+                                                        discover(a.img_dir), root_id=rid)}
+            LOGGER.info("联邦 manifest：%s", fed.get("total_dir", total_dir))
     except FileExistsError as e:
         LOGGER.error("%s", e)
         if p:
@@ -758,6 +778,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="临时图库根（默认 img_dir）")
     sp.add_argument("--distribute-verify-hash", action="store_true",
                     help="分发时对每个文件做 SHA256 校验（慢）")
+    sp.add_argument("--federation", action="store_true",
+                    help="写图库联邦/链式 manifest（插件，默认关闭）")
+    sp.add_argument("--federation-total", default=None,
+                    help="总索引目录（默认索引前缀所在目录）")
+    sp.add_argument("--federation-node-id", default="",
+                    help="可选的联邦节点 ID")
     sp.set_defaults(func=cmd_build)
 
     # ---- add
