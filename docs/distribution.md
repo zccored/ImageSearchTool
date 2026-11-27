@@ -52,3 +52,14 @@ python main.py build "C:\NAS-Share\ImageGalleryTemp" `
 - 目标盘可用空间不足会在移动阶段失败并回滚；
 - 索引分盘适配的“性能天平”后续会基于每个目标的实测吞吐/权重扩展，当前
   `path=weight` 是简单字节/权重天平。
+
+## 回滚
+
+分发 manifest 在索引目录：`distribution_manifest_*.jsonl`，路径数组备份在同目录
+`distribution_backup_*`。回滚：
+
+```powershell
+python devtools/rollback_distribution.py --manifest "W:\ImageGalleryTemp\.gallery_index\distribution_manifest_....jsonl"
+```
+
+会按 manifest 逆序把文件搬回临时图库，并恢复 `*.paths.npy`/`*.fine_paths.npy`。
