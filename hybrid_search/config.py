@@ -179,6 +179,10 @@ class Config:
     federation: bool = False
     federation_total_dir: str = ""     # 总索引目录；空则用索引前缀所在目录
     federation_node_id: str = ""       # 可选节点名
+    # 推理后端：auto=有 CUDA 先 torch，否则 OpenVINO iGPU/CPU；也可强制 torch/openvino。
+    backend: str = "auto"
+    openvino_device: str = "auto"     # auto/GPU/GPU.0/CPU
+    openvino_model: str = ""          # 空=包内 model/resnet18.xml
     distribute: bool = False
     distribute_targets: str = ""       # "path=weight;path2=weight"
     distribute_source: str = ""        # 临时图库根；空则用 img_dir/commonpath

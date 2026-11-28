@@ -56,6 +56,9 @@ def make_signature(cfg, feature_dim: int) -> dict:
     return {
         "v": VERSION,
         "model": str(getattr(cfg, "model", "")),
+        "backend": str(getattr(cfg, "backend", "auto")),
+        "openvino_device": str(getattr(cfg, "openvino_device", "auto")),
+        "openvino_model": str(getattr(cfg, "openvino_model", "")),
         "prep": str(getattr(cfg, "prep", "cpu")),
         "resize": int(SIDE),
         "crop": int(CROP),

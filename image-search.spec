@@ -47,12 +47,23 @@ SRC = os.environ.get("ISE_SRC") or os.path.abspath(SPECPATH)
 WEIGHTS_DIR = os.path.join(os.environ.get("USERPROFILE", ""),
                            ".cache", "torch", "hub", "checkpoints")
 
+# OpenVINO 可选后端：运行时 DLL + plugins.xml；找不到时 spec 仍可打 torch-only 包
+try:
+    from PyInstaller.utils.hooks import collect_all as _collect_all
+    _ov_datas, _ov_binaries, _ov_hidden = _collect_all("openvino")
+    print("[spec] OpenVINO: datas=%d binaries=%d hidden=%d" % (
+        len(_ov_datas), len(_ov_binaries), len(_ov_hidden)))
+except Exception as _e:
+    print("[spec] OpenVINO 未收集：%r" % (_e,))
+    _ov_datas, _ov_binaries, _ov_hidden = [], [], []
+
 hiddenimports = [
     "torch", "torchvision", "torchvision.models",
     "cv2", "PIL", "numpy", "psutil",
     # 运行期按需 import 的本地模块（PyInstaller 静态分析可能漏收）
     "hybrid_search.distribution",
     "hybrid_search.federation",
+    "hybrid_search.openvino_backend",
     "hybrid_search.feature_checkpoint",
     "hybrid_search.prep_cache_torch",
 ]
@@ -60,6 +71,11 @@ hiddenimports = [
 datas = [
     (os.path.join(SRC, "peer_manifest.json"), "."),
 ]
+_model_dir = os.path.join(SRC, "model")
+if os.path.isfile(os.path.join(_model_dir, "resnet18.xml")):
+    datas.append((_model_dir, "model"))
+datas += _ov_datas
+hiddenimports += _ov_hidden
 
 # ---- 原生 PNG 加速模块与 VC/OpenMP 运行库 --------------------------------
 # PyInstaller 不会自动收 hybrid_search/native 下的运行期 pyd/dll；
@@ -121,7 +137,7 @@ runtime_hooks = [
 a_gui = Analysis(
     [os.path.join(SRC, "gui.py")],
     pathex=[SRC],
-    binaries=extra_binaries,
+    binaries=extra_binaries + _ov_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

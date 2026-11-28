@@ -1526,6 +1526,12 @@ class App:
                          "cv2", "imagecodecs", "pillow"])
         self._add_combo(page_build, "预处理缓存精度", "prep_cache_dtype",
                         ["u16", "fp32", "fp16"])
+        self._add_combo(page_build, "推理后端", "backend",
+                        ["auto", "torch", "openvino"])
+        self._add_text(page_build, "OpenVINO 设备(auto/GPU/CPU)",
+                       "openvino_device", "auto",
+                       tooltip="auto：NAS 的 Intel iGPU 用 GPU，找不到则 CPU；\n"
+                               "本机有 CUDA 时 auto 仍优先 torch，不会误选 UHD 核显。")
         self._add_check(page_build, "构建后分发图库（默认关闭）",
                         "distribute", False,
                         tooltip="建库完成后把临时图库图片迁移到下面填写的目标盘；\n"
@@ -2644,6 +2650,8 @@ class App:
             "feature_checkpoint": True,
             "distribute": False,
             "distribute_targets": "",
+            "backend": "auto",
+            "openvino_device": "auto",
             "federation": False,
             "federation_total_dir": "",
             "federation_node_id": "",

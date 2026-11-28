@@ -74,6 +74,12 @@ def _add_feature_args(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--model", default="resnet18",
                     help="ResNet 型号：resnet18/34/50/101/152")
     sp.add_argument("--device", default="auto", help="auto / cuda / cpu")
+    sp.add_argument("--backend", choices=["auto", "torch", "openvino"], default=None,
+                    help="推理后端；auto=有 CUDA 先 torch，否则 OpenVINO iGPU/CPU")
+    sp.add_argument("--openvino-device", default=None,
+                    help="auto/GPU/GPU.0/CPU（仅 backend=openvino）")
+    sp.add_argument("--openvino-model", default=None,
+                    help="OpenVINO IR 路径（默认包内 model/resnet18.xml）")
     sp.add_argument("--no-fp16", action="store_true", help="GPU 上禁用 FP16")
     sp.add_argument("--batch", type=int, default=0, help="精排批大小（0=自动）")
     sp.add_argument("--prep", choices=["cpu", "torch"], default=None,
@@ -149,6 +155,12 @@ def _apply_feature_args(cfg: Config, a: argparse.Namespace) -> None:
         cfg.binarize_norm = str(a.binarize_norm)
     cfg.model = _val(a, "model", cfg.model)
     cfg.device = _val(a, "device", cfg.device)
+    if getattr(a, "backend", None):
+        cfg.backend = str(a.backend)
+    if getattr(a, "openvino_device", None):
+        cfg.openvino_device = str(a.openvino_device)
+    if getattr(a, "openvino_model", None):
+        cfg.openvino_model = str(a.openvino_model)
     cfg.fp16 = not _flag(a, "no_fp16")
     cfg.batch = int(_val(a, "batch", cfg.batch))
     if _val(a, "prep", None) is not None:

@@ -902,7 +902,8 @@ class HybridEngine:
     def _get_extractor(self) -> ResNetExtractor:
         if self._extractor is None:
             try:
-                self._extractor = ResNetExtractor(self.cfg)
+                from .openvino_backend import create_extractor
+                self._extractor = create_extractor(self.cfg)
             except Exception as e:  # noqa: BLE001
                 hint = ""
                 if self.cfg.device == "cuda":
